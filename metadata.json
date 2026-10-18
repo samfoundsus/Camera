@@ -1,0 +1,6 @@
+{
+  "name": "Pixel Camera",
+  "description": "Universal Pixel-inspired camera application foundation with adaptive Material 3 theme and Pixel UI preview.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

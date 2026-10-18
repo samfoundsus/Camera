@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Camera Body Outline / Fill -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M34,35h8l3,-5h18l3,5h8c3.31,0 6,2.69 6,6v28c0,3.31 -2.69,6 -6,6H34c-3.31,0 -6,-2.69 -6,-6V41c0,-3.31 2.69,-6 6,-6z" />
+    <!-- Outer Lens Ring (Accent / Darker) -->
+    <path
+        android:fillColor="#FF202124"
+        android:pathData="M54,44c-6.63,0 -12,5.37 -12,12s5.37,12 12,12 12,-5.37 12,-12 -5.37,-12 -12,-12z" />
+    <!-- Inner Lens Aperture (Cyan / Pixel Accent) -->
+    <path
+        android:fillColor="#FF8AB4F8"
+        android:pathData="M54,49c-3.87,0 -7,3.13 -7,7s3.13,7 7,7 7,-3.13 7,-7 -3.13,-7 -7,-7z" />
+    <!-- Glass Specular Reflection Highlight -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M51.5,51.5c-1.38,0 -2.5,1.12 -2.5,2.5s1.12,2.5 2.5,2.5 2.5,-1.12 2.5,-2.5 -1.12,-2.5 -2.5,-2.5z" />
+    <!-- Lens Indicator / Sensor Dot (Coral / Pixel Warm Accent) -->
+    <path
+        android:fillColor="#FFF28B82"
+        android:pathData="M67,42c0.83,0 1.5,-0.67 1.5,-1.5s-0.67,-1.5 -1.5,-1.5 -1.5,0.67 -1.5,1.5 0.67,1.5 1.5,1.5z" />
+</vector>
