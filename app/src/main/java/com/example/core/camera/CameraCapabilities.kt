@@ -2,6 +2,7 @@ package com.example.core.camera
 
 import android.hardware.camera2.CaptureRequest
 import androidx.camera.camera2.interop.CaptureRequestOptions
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import com.example.core.preferences.AstroFocusMode
 import com.example.core.preferences.AstroStrategy
 import com.example.core.preferences.FlashMode
@@ -1188,6 +1189,7 @@ fun kelvinToRggbChannelVector(kelvin: Int): android.hardware.camera2.params.Rggb
  * Builds real Camera2 [CaptureRequestOptions] for Pro Mode manual sensor controls.
  * Deeply integrates ISO, Shutter Speed, Focus Mode & Distance, White Balance, and EV brightness scaling.
  */
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 fun buildProCamera2CaptureRequestOptions(
     manualIso: String,
     manualShutterSpeed: String,
@@ -1271,6 +1273,7 @@ fun buildProCamera2CaptureRequestOptions(
  * Dynamically configures long exposure / sensor sensitivity boost, focus mode (Auto vs Infinity),
  * and locks focus & exposure for multi-frame astrophotography consistency.
  */
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 fun buildAstroCamera2CaptureRequestOptions(
     astroFocus: AstroFocusMode,
     astroStrategy: AstroStrategy,
@@ -1349,6 +1352,7 @@ fun isCamera2HardwareNightSceneModeSupported(
  *   applies Camera2 `CONTROL_EXTENDED_SCENE_MODE_BOKEH_CONTINUOUS` or `CONTROL_EXTENDED_SCENE_MODE_BOKEH_STILL_CAPTURE`
  *   and hardware face detection (`STATISTICS_FACE_DETECT_MODE_SIMPLE`) when supported.
  */
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 fun buildNonProResetCamera2CaptureRequestOptions(
     isVideoMode: Boolean,
     isHardwareAfLockActive: Boolean,

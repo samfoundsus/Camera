@@ -1,6 +1,7 @@
 package com.example.ui.theme
 
 import android.os.Build
+import androidx.annotation.RequiresApi
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
@@ -89,6 +90,15 @@ data class ResolvedTheme(
  *
  * Respects user's [themePreference] (System default, Light, or Dark).
  */
+@RequiresApi(Build.VERSION_CODES.S)
+private fun getDynamicColorScheme(context: android.content.Context, isDark: Boolean): ColorScheme {
+    return if (isDark) {
+        dynamicDarkColorScheme(context)
+    } else {
+        dynamicLightColorScheme(context)
+    }
+}
+
 fun resolveThemeColors(
     context: android.content.Context,
     themePreference: AppThemePreference,
@@ -102,14 +112,10 @@ fun resolveThemeColors(
         AppThemePreference.DARK -> true
     }
 
-    val canUseDynamic = dynamicColor && sdkInt >= Build.VERSION_CODES.S
-    return if (canUseDynamic) {
+    val canUseDynamic = dynamicColor && sdkInt >= Build.VERSION_CODES.S && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    return if (canUseDynamic && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         try {
-            val scheme = if (isDark) {
-                dynamicDarkColorScheme(context)
-            } else {
-                dynamicLightColorScheme(context)
-            }
+            val scheme = getDynamicColorScheme(context, isDark)
             ResolvedTheme(
                 colorScheme = scheme,
                 strategy = ThemeStrategy.DYNAMIC_MONET,

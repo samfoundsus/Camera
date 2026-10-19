@@ -3190,20 +3190,6 @@ fun queryDeviceCameraCapabilities(
                         val qualities = videoCaps.getSupportedQualities(DynamicRange.SDR)
                         val resolvedSet = mutableSetOf<VideoResolution>()
                         for (q in qualities) {
-                            val profile = try {
-                                videoCaps.getProfiles(q, DynamicRange.SDR)?.defaultVideoProfile
-                            } catch (_: Exception) {
-                                null
-                            }
-                            if (profile != null) {
-                                val matchedByDim = VideoResolution.VIDEO_MODE_OPTIONS.firstOrNull { res ->
-                                    (profile.width == res.width && profile.height == res.height) ||
-                                        (profile.width == res.height && profile.height == res.width)
-                                }
-                                if (matchedByDim != null) {
-                                    resolvedSet.add(matchedByDim)
-                                }
-                            }
                             q.toVideoResolution()?.let { resolvedSet.add(it) }
                         }
                         resolvedSet
