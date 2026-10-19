@@ -47,7 +47,7 @@ import com.example.core.preferences.HdrMode
 import com.example.ui.theme.CameraMotionTokens
 
 /**
- * Minimal camera top bar inspired by Google Pixel Camera.
+ * Minimal camera top bar inspired by Pixel design.
  * Contains active camera controls (Flash, Quick Controls drawer, Filters, Settings).
  */
 @Composable

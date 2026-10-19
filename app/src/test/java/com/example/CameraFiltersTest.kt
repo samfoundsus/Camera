@@ -221,7 +221,7 @@ class CameraFiltersTest {
         composeTestRule.onNodeWithTag("shutter_button").assertIsDisplayed()
 
         // 3. Select Warm preset in Natural category
-        composeTestRule.onNodeWithTag("filter_preset_warm").performClick()
+        composeTestRule.onNodeWithTag("filter_item_warm").performClick()
         composeTestRule.waitForIdle()
         assertEquals(CameraFilterPreset.WARM, repository.preferences.value.selectedFilter)
         composeTestRule.onNodeWithTag("preview_active_filter_badge").assertIsDisplayed()
@@ -231,9 +231,9 @@ class CameraFiltersTest {
         composeTestRule.onNodeWithTag("filter_category_creative").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("filter_presets_lazy_row")
-            .performScrollToNode(hasTestTag("filter_preset_noir"))
+            .performScrollToNode(hasTestTag("filter_item_noir"))
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("filter_preset_noir").performClick()
+        composeTestRule.onNodeWithTag("filter_item_noir").performClick()
         composeTestRule.waitForIdle()
         assertEquals(CameraFilterPreset.NOIR, repository.preferences.value.selectedFilter)
 

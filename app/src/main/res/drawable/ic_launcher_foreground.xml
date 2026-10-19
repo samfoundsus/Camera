@@ -4,24 +4,24 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Camera Body Outline / Fill -->
+    <!-- Camera Body & Top Notch -->
     <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M34,35h8l3,-5h18l3,5h8c3.31,0 6,2.69 6,6v28c0,3.31 -2.69,6 -6,6H34c-3.31,0 -6,-2.69 -6,-6V41c0,-3.31 2.69,-6 6,-6z" />
-    <!-- Outer Lens Ring (Accent / Darker) -->
+        android:fillColor="#FFF1F3F4"
+        android:pathData="M48,33h12a2,2 0 0,1 2,2v2h11a6,6 0 0,1 6,6v22a6,6 0 0,1 -6,6h-38a6,6 0 0,1 -6,-6v-22a6,6 0 0,1 6,-6h11v-2a2,2 0 0,1 2,-2z" />
+    <!-- Outer Lens Ring (Dark Graphite) -->
     <path
-        android:fillColor="#FF202124"
-        android:pathData="M54,44c-6.63,0 -12,5.37 -12,12s5.37,12 12,12 12,-5.37 12,-12 -5.37,-12 -12,-12z" />
-    <!-- Inner Lens Aperture (Cyan / Pixel Accent) -->
+        android:fillColor="#FF1F2024"
+        android:pathData="M54,52m-11,0a11,11 0 1,1 22,0a11,11 0 1,1 -22,0" />
+    <!-- Inner Lens Aperture (Deep Black) -->
     <path
-        android:fillColor="#FF8AB4F8"
-        android:pathData="M54,49c-3.87,0 -7,3.13 -7,7s3.13,7 7,7 7,-3.13 7,-7 -3.13,-7 -7,-7z" />
-    <!-- Glass Specular Reflection Highlight -->
+        android:fillColor="#FF111316"
+        android:pathData="M54,52m-5.5,0a5.5,5.5 0 1,1 11,0a5.5,5.5 0 1,1 -11,0" />
+    <!-- Specular Lens Highlight -->
     <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M51.5,51.5c-1.38,0 -2.5,1.12 -2.5,2.5s1.12,2.5 2.5,2.5 2.5,-1.12 2.5,-2.5 -1.12,-2.5 -2.5,-2.5z" />
-    <!-- Lens Indicator / Sensor Dot (Coral / Pixel Warm Accent) -->
+        android:fillColor="#FFE8EAED"
+        android:pathData="M51.5,49.5m-1.5,0a1.5,1.5 0 1,1 3,0a1.5,1.5 0 1,1 -3,0" />
+    <!-- Flash Indicator Dot -->
     <path
-        android:fillColor="#FFF28B82"
-        android:pathData="M67,42c0.83,0 1.5,-0.67 1.5,-1.5s-0.67,-1.5 -1.5,-1.5 -1.5,0.67 -1.5,1.5 0.67,1.5 1.5,1.5z" />
+        android:fillColor="#FF3C4043"
+        android:pathData="M69,42m-1.75,0a1.75,1.75 0 1,1 3.5,0a1.75,1.75 0 1,1 -3.5,0" />
 </vector>

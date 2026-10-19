@@ -630,7 +630,7 @@ fun CameraFoundationScreen(
                     .padding(vertical = 6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Compact, horizontally browsable Pixel Camera Filter Selector Tray (PHOTO & VIDEO modes only)
+                // Compact, horizontally browsable Filter Selector Tray (PHOTO & VIDEO modes only)
                 androidx.compose.animation.AnimatedVisibility(
                     visible = selectedMode.supportsFilters && showFilterTray,
                     enter = androidx.compose.animation.fadeIn(

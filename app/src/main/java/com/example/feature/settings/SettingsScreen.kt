@@ -549,7 +549,7 @@ fun SettingsScreen(
 
                 SettingsCard {
                     SettingsRow(
-                        title = "Pixel Camera",
+                        title = "Camera",
                         subtitle = "Phase 1: UI, Monet Theme, 10 Modes & Pro Camera Engine",
                         trailingText = "v1.0.0",
                         onClick = {}

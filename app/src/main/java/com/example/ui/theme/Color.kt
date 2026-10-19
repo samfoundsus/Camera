@@ -2,7 +2,7 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// Pixel Camera Static Palette - Dark
+// Camera Static Palette - Dark
 val PixelDarkBackground = Color(0xFF0F1115)
 val PixelDarkSurface = Color(0xFF191C20)
 val PixelDarkSurfaceVariant = Color(0xFF23262B)
@@ -22,7 +22,7 @@ val PixelDarkOnSurfaceVariant = Color(0xFFC4C6D0)
 val PixelDarkOutline = Color(0xFF8E9099)
 val PixelDarkOutlineVariant = Color(0xFF44474E)
 
-// Pixel Camera Static Palette - Light
+// Camera Static Palette - Light
 val PixelLightBackground = Color(0xFFF8F9FA)
 val PixelLightSurface = Color(0xFFFFFFFF)
 val PixelLightSurfaceVariant = Color(0xFFE1E2EC)

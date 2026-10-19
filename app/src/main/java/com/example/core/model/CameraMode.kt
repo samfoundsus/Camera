@@ -1,7 +1,7 @@
 package com.example.core.model
 
 /**
- * Representation of camera capture modes for the Pixel Camera app.
+ * Representation of camera capture modes for the Camera app.
  *
  * Exact modes:
  * 1. Camera (PHOTO)

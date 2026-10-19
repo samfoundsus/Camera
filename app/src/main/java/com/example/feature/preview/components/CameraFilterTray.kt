@@ -68,7 +68,7 @@ import com.example.core.processing.CameraFilterProcessor
 import com.example.ui.theme.CameraMotionTokens
 
 /**
- * Pixel Camera-style compact, horizontally browsable Filter Selector Tray.
+ * Compact, horizontally browsable Filter Selector Tray.
  *
  * Groups presets into Natural (Pixel-inspired) and Creative categories, displays
  * cached thumbnails processed through [CameraFilterProcessor], highlights the active

@@ -134,7 +134,7 @@ fun resolveThemeColors(
 }
 
 /**
- * Pixel Camera Theme
+ * Camera Theme
  *
  * Android 10 and Android 11 (API 29–30):
  * - Uses predefined static dark and light color palettes.

@@ -49,10 +49,10 @@ class ExampleRobolectricTest {
     val composeTestRule = createComposeRule()
 
     @Test
-    fun appName_isPixelCamera() {
+    fun appName_isCamera() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val appName = context.getString(R.string.app_name)
-        assertEquals("Pixel Camera", appName)
+        assertEquals("Camera", appName)
     }
 
     @Test

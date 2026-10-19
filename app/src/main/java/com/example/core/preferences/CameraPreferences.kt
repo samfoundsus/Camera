@@ -362,7 +362,7 @@ enum class CameraFilterPreset(
 }
 
 /**
- * Immutable camera settings state for Pixel Camera UI and engine integration.
+ * Immutable camera settings state for Camera UI and engine integration.
  */
 data class CameraPreferences(
     val themePreference: AppThemePreference = AppThemePreference.SYSTEM,

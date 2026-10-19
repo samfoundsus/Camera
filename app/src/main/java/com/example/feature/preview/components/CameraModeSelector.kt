@@ -47,7 +47,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 
 /**
- * Pixel Camera horizontal mode selector with customizable modes and More menu support.
+ * Horizontal mode selector with customizable modes and More menu support.
  *
  * Ensures the currently selected camera mode is always horizontally centered in the screen viewport.
  * Uses LazyRow with content padding equal to half of the available viewport width so that

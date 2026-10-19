@@ -1773,7 +1773,7 @@ fun CameraPreviewPlaceholder(
                 }
             }
 
-            // Pixel Camera Zoom Shortcuts & Long-Press Continuous Zoom Slider Overlay
+            // Zoom Shortcuts & Long-Press Continuous Zoom Slider Overlay
             if (activeMode != CameraMode.PANORAMA) {
                 val effectiveShortcuts = remember(zoomShortcuts, effectiveMin, effectiveMax) {
                     val filtered = zoomShortcuts

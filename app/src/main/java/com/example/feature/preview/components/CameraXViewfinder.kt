@@ -3000,7 +3000,7 @@ fun CameraXViewfinder(
             }
         }
 
-        // Subtle Pixel Camera shutter flash feedback
+        // Subtle shutter flash feedback
         AnimatedVisibility(
             visible = showShutterFlashOverlay,
             enter = fadeIn(),

@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "Pixel Camera"
+rootProject.name = "Camera"
 
 include(":app")

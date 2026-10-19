@@ -73,7 +73,7 @@ enum class ProTab(val key: String, val title: String, val icon: ImageVector) {
 }
 
 /**
- * Pixel Camera professional manual sensor controls bar.
+ * Professional manual sensor controls bar.
  * Provides fine-grained ISO, Shutter Speed, Focus, White Balance, EV, Lens/Zoom, and RAW toggles.
  * Distinguishes user intent from verified hardware capabilities.
  */

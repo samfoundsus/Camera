@@ -20,7 +20,7 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.animation.core.animateFloatAsState
 
 /**
- * Centralized Google Pixel Camera-inspired motion tokens and animation specifications.
+ * Centralized Camera-inspired motion tokens and animation specifications.
  * Defines standard durations, easing curves, spring physics, and interaction modifiers
  * aligned with Material 3 Expressive Motion guidelines.
  */
@@ -75,7 +75,7 @@ object CameraMotionTokens {
 
 /**
  * Reusable modifier adding subtle touch-scale feedback (approx 0.95–1.0)
- * without making controls feel overly bouncy, adhering to Pixel Camera micro-interactions.
+ * without making controls feel overly bouncy, adhering to camera micro-interactions.
  */
 fun Modifier.pressFeedback(
     pressedScale: Float = 0.96f,
