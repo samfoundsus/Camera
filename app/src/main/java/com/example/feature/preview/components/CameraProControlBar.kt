@@ -1,8 +1,13 @@
 package com.example.feature.preview.components
 
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.scale
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.material3.ripple
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -118,6 +123,7 @@ fun CameraProControlBar(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .animateContentSize(com.example.ui.theme.CameraMotionTokens.panelTween())
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
@@ -707,11 +713,33 @@ fun CameraProControlBar(
                         ProTab.ASSIST -> "Assist"
                     }
 
+                    val animatedTabBg by androidx.compose.animation.animateColorAsState(
+                        targetValue = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
+                        animationSpec = com.example.ui.theme.CameraMotionTokens.controlTween(),
+                        label = "pro_tab_bg"
+                    )
+                    val animatedTabContentColor by androidx.compose.animation.animateColorAsState(
+                        targetValue = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                        animationSpec = com.example.ui.theme.CameraMotionTokens.controlTween(),
+                        label = "pro_tab_content_color"
+                    )
+                    val tabInteractionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+                    val isTabPressed by tabInteractionSource.collectIsPressedAsState()
+                    val tabScale by androidx.compose.animation.core.animateFloatAsState(
+                        targetValue = if (isTabPressed) 0.94f else 1.0f,
+                        animationSpec = com.example.ui.theme.CameraMotionTokens.touchSpring(),
+                        label = "pro_tab_scale"
+                    )
+
                     Surface(
-                        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
+                        color = animatedTabBg,
                         shape = CircleShape,
                         modifier = Modifier
-                            .clickable {
+                            .scale(tabScale)
+                            .clickable(
+                                interactionSource = tabInteractionSource,
+                                indication = ripple(bounded = true, radius = 22.dp)
+                            ) {
                                 updateControlKey(tab.key)
                             }
                             .testTag("pro_tab_${tab.name.lowercase()}")
@@ -724,13 +752,13 @@ fun CameraProControlBar(
                             Icon(
                                 imageVector = tab.icon,
                                 contentDescription = tab.title,
-                                tint = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                tint = animatedTabContentColor,
                                 modifier = Modifier.size(14.dp)
                             )
                             Text(
                                 text = label,
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium),
-                                color = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+                                color = animatedTabContentColor
                             )
                         }
                     }
@@ -749,19 +777,43 @@ private fun ProValuePill(
     enabled: Boolean = true
 ) {
     val alpha = if (enabled) 1.0f else 0.4f
+    val animatedPillBg by androidx.compose.animation.animateColorAsState(
+        targetValue = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh,
+        animationSpec = com.example.ui.theme.CameraMotionTokens.controlTween(),
+        label = "pro_pill_bg"
+    )
+    val animatedPillText by androidx.compose.animation.animateColorAsState(
+        targetValue = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+        animationSpec = com.example.ui.theme.CameraMotionTokens.controlTween(),
+        label = "pro_pill_text"
+    )
+    val pillInteractionSource = remember { MutableInteractionSource() }
+    val isPillPressed by pillInteractionSource.collectIsPressedAsState()
+    val pillScale by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (isPillPressed && enabled) 0.94f else 1.0f,
+        animationSpec = com.example.ui.theme.CameraMotionTokens.touchSpring(),
+        label = "pro_pill_scale"
+    )
+
     Surface(
-        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh,
+        color = animatedPillBg,
         shape = RoundedCornerShape(12.dp),
         modifier = modifier
             .alpha(alpha)
-            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier)
+            .scale(pillScale)
+            .clickable(
+                interactionSource = pillInteractionSource,
+                indication = ripple(bounded = true, radius = 24.dp),
+                enabled = enabled,
+                onClick = onClick
+            )
     ) {
         Text(
             text = text,
             style = MaterialTheme.typography.labelMedium.copy(
                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
             ),
-            color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+            color = animatedPillText,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
         )
     }

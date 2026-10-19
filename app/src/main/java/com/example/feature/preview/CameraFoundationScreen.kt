@@ -35,11 +35,18 @@ import com.example.core.model.CameraMode
 import com.example.core.model.SystemDeviceInfo
 import com.example.core.preferences.CameraPreferences
 import com.example.core.preferences.CameraPreferencesRepository
+import com.example.core.preferences.AstroDuration
+import com.example.core.preferences.AstroFocusMode
+import com.example.core.preferences.AstroStrategy
 import com.example.feature.preview.components.CameraModeSelector
 import com.example.feature.preview.components.CameraPreviewPlaceholder
 import com.example.feature.preview.components.CameraProControlBar
 import com.example.feature.preview.components.CameraShutterBar
 import com.example.feature.preview.components.CameraTopBar
+import com.example.core.processing.PanoramaCapturePhase
+import com.example.core.processing.PanoramaGuidanceStatus
+import com.example.core.processing.PanoramaLiveState
+import com.example.core.processing.PanoramaProcessor
 import com.example.ui.components.CameraQuickControlsSheet
 import kotlinx.coroutines.launch
 
@@ -76,21 +83,160 @@ fun CameraFoundationScreen(
     var recordingDurationSeconds by remember { mutableLongStateOf(0L) }
     var photoCaptureTrigger by remember { mutableIntStateOf(0) }
     var lastCapturedPhotoUri by remember { mutableStateOf<Uri?>(null) }
+    var captureConfirmationTrigger by remember { mutableIntStateOf(0) }
+    var inAppViewerUri by remember { mutableStateOf<Uri?>(null) }
+    var isCountingDown by remember { mutableStateOf(false) }
+    var countdownRemainingSeconds by remember { mutableIntStateOf(0) }
+    var panoramaLiveState by remember {
+        mutableStateOf(PanoramaLiveState(direction = preferences.panoramaDirection))
+    }
+    var isPanoramaCapturingRequested by remember { mutableStateOf(false) }
+    var panoramaFinishTrigger by remember { mutableIntStateOf(0) }
+    var panoramaCancelTrigger by remember { mutableIntStateOf(0) }
+    var panoramaStepTrigger by remember { mutableIntStateOf(0) }
     var showQuickControlsSheet by remember { mutableStateOf(false) }
     var showMoreModesSheet by remember { mutableStateOf(false) }
+    var showFilterTray by rememberSaveable { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+    BackHandler(enabled = showFilterTray) {
+        showFilterTray = false
+    }
 
     val context = LocalContext.current
 
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
+
+    fun startPanoramaCaptureSession() {
+        if (panoramaLiveState.phase != PanoramaCapturePhase.IDLE) return
+        snackbarHostState.currentSnackbarData?.dismiss()
+        isPanoramaCapturingRequested = true
+        panoramaLiveState = PanoramaLiveState(
+            phase = PanoramaCapturePhase.CAPTURING,
+            direction = panoramaLiveState.direction,
+            progress = 0f,
+            capturedCoverage = 0f,
+            capturedFrameCount = 1,
+            targetFrameCount = PanoramaProcessor.DEFAULT_TARGET_FRAMES,
+            alignmentDriftNormalized = 0f,
+            normalizedSpeed = 0f,
+            guidanceStatus = PanoramaGuidanceStatus.READY,
+            isCaptureLagging = false
+        )
+    }
+
+    fun cancelPanoramaCaptureSession() {
+        snackbarHostState.currentSnackbarData?.dismiss()
+        isPanoramaCapturingRequested = false
+        panoramaCancelTrigger++
+        panoramaLiveState = PanoramaLiveState(
+            phase = PanoramaCapturePhase.IDLE,
+            direction = panoramaLiveState.direction,
+            progress = 0f,
+            capturedCoverage = 0f,
+            capturedFrameCount = 0,
+            targetFrameCount = PanoramaProcessor.DEFAULT_TARGET_FRAMES,
+            alignmentDriftNormalized = 0f,
+            normalizedSpeed = 0f,
+            guidanceStatus = PanoramaGuidanceStatus.READY,
+            isCaptureLagging = false
+        )
+    }
+
+    fun finishPanoramaCaptureSession() {
+        if (panoramaLiveState.phase != PanoramaCapturePhase.CAPTURING) return
+        if (panoramaLiveState.capturedFrameCount < PanoramaProcessor.MIN_REQUIRED_FRAMES) {
+            cancelPanoramaCaptureSession()
+            coroutineScope.launch {
+                snackbarHostState.showSnackbar(
+                    "Panorama not saved: move your phone in the selected direction to capture overlapping frames."
+                )
+            }
+            return
+        }
+        isPanoramaCapturingRequested = false
+        panoramaLiveState = panoramaLiveState.copy(
+            phase = PanoramaCapturePhase.PROCESSING,
+            progress = 1.0f,
+            capturedCoverage = 1.0f,
+            guidanceStatus = PanoramaGuidanceStatus.STITCHING,
+            isCaptureLagging = false
+        )
+        panoramaFinishTrigger++
+    }
+
+    fun stepPanoramaCaptureSession() {
+        if (panoramaLiveState.phase != PanoramaCapturePhase.CAPTURING) return
+        val nextCount = (panoramaLiveState.capturedFrameCount + 1)
+            .coerceAtMost(panoramaLiveState.targetFrameCount)
+        val nextCoverage = ((nextCount - 1).coerceAtLeast(0).toFloat() /
+            (panoramaLiveState.targetFrameCount - 1).coerceAtLeast(1).toFloat())
+            .coerceIn(0f, 1.0f)
+        val nextProgress = maxOf(panoramaLiveState.progress, nextCoverage).coerceIn(0f, 1.0f)
+        panoramaLiveState = panoramaLiveState.copy(
+            capturedFrameCount = nextCount,
+            capturedCoverage = nextCoverage,
+            progress = nextProgress,
+            guidanceStatus = PanoramaGuidanceStatus.MOVING_STEADY,
+            isCaptureLagging = false
+        )
+        panoramaStepTrigger++
+    }
+
+    fun updatePanoramaDirectionWhileIdle(dir: com.example.core.preferences.PanoramaDirection) {
+        if (panoramaLiveState.phase != PanoramaCapturePhase.IDLE) return
+        preferencesRepository.setPanoramaDirection(dir)
+        panoramaLiveState = PanoramaLiveState(
+            phase = PanoramaCapturePhase.IDLE,
+            direction = dir,
+            progress = 0f,
+            capturedCoverage = 0f,
+            capturedFrameCount = 0,
+            targetFrameCount = PanoramaProcessor.DEFAULT_TARGET_FRAMES,
+            alignmentDriftNormalized = 0f,
+            normalizedSpeed = 0f,
+            guidanceStatus = PanoramaGuidanceStatus.READY,
+            isCaptureLagging = false
+        )
+    }
+
+    LaunchedEffect(preferences.panoramaDirection) {
+        if (panoramaLiveState.phase == PanoramaCapturePhase.IDLE &&
+            panoramaLiveState.direction != preferences.panoramaDirection
+        ) {
+            panoramaLiveState = panoramaLiveState.copy(direction = preferences.panoramaDirection)
+        }
+    }
+
+    LaunchedEffect(selectedMode) {
+        if (!selectedMode.supportsFilters && showFilterTray) {
+            showFilterTray = false
+        }
+        if (selectedMode != CameraMode.PANORAMA && panoramaLiveState.phase != PanoramaCapturePhase.IDLE) {
+            cancelPanoramaCaptureSession()
+        }
+    }
+
     LaunchedEffect(hardwareShutterTrigger) {
         if (hardwareShutterTrigger > 0) {
-            if (selectedMode.isVideo) {
-                isRecordingState = !isRecordingState
-                if (!isRecordingState) {
-                    recordingDurationSeconds = 0L
+            when {
+                selectedMode.isVideo -> {
+                    isRecordingState = !isRecordingState
+                    if (!isRecordingState) {
+                        recordingDurationSeconds = 0L
+                    }
                 }
-            } else {
-                photoCaptureTrigger++
+                selectedMode == CameraMode.PANORAMA -> {
+                    when (panoramaLiveState.phase) {
+                        PanoramaCapturePhase.IDLE -> startPanoramaCaptureSession()
+                        PanoramaCapturePhase.CAPTURING -> finishPanoramaCaptureSession()
+                        PanoramaCapturePhase.PROCESSING -> {}
+                    }
+                }
+                else -> {
+                    photoCaptureTrigger++
+                }
             }
         }
     }
@@ -125,25 +271,56 @@ fun CameraFoundationScreen(
         }
     }
 
-    // Reset recording state when switching modes and ensure Pro mode has active control tab
-    LaunchedEffect(selectedMode) {
-        isRecordingState = false
-        recordingDurationSeconds = 0L
-        if (selectedMode == CameraMode.PRO && selectedProControl == null) {
-            selectedProControl = "ISO"
+    // Back button closes open Pro control panel if active, or cancels active Panorama capture
+    BackHandler(
+        enabled = (selectedMode == CameraMode.PRO && selectedProControl != null) ||
+            (selectedMode == CameraMode.PANORAMA && panoramaLiveState.phase == PanoramaCapturePhase.CAPTURING)
+    ) {
+        if (selectedMode == CameraMode.PANORAMA && panoramaLiveState.phase == PanoramaCapturePhase.CAPTURING) {
+            cancelPanoramaCaptureSession()
+        } else {
+            selectedProControl = null
         }
-        if (selectedMode.isVideo && !hasAudioPermission) {
-            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        }
-    }
-
-    // Back button closes open Pro control panel if active
-    BackHandler(enabled = selectedMode == CameraMode.PRO && selectedProControl != null) {
-        selectedProControl = null
     }
 
     val capabilitiesState by capabilitiesRepository.capabilitiesState.collectAsState()
     val activeLens by capabilitiesRepository.activeLens.collectAsState()
+
+    var lastResetMode by remember { mutableStateOf<CameraMode?>(null) }
+    var lastResetLens by remember { mutableStateOf<CameraLens?>(null) }
+
+    LaunchedEffect(selectedMode) {
+        if (selectedMode != CameraMode.PANORAMA && panoramaLiveState.phase != PanoramaCapturePhase.IDLE) {
+            cancelPanoramaCaptureSession()
+        }
+    }
+
+    // Reset recording state and zoom when switching modes or active lens
+    LaunchedEffect(selectedMode, activeLens, capabilitiesState) {
+        if (selectedMode != lastResetMode || activeLens != lastResetLens) {
+            lastResetMode = selectedMode
+            lastResetLens = activeLens
+            isRecordingState = false
+            recordingDurationSeconds = 0L
+            if (isPanoramaCapturingRequested || panoramaLiveState.phase != PanoramaCapturePhase.IDLE) {
+                cancelPanoramaCaptureSession()
+            }
+            if (selectedMode == CameraMode.PRO && selectedProControl == null) {
+                selectedProControl = "ISO"
+            }
+            if (selectedMode.isVideo && !hasAudioPermission) {
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+
+            val caps = (capabilitiesState as? com.example.core.camera.CameraCapabilitiesState.Verified)?.currentLensCapabilities
+            val minZ = caps?.minZoomRatio ?: 1.0f
+            val maxZ = caps?.maxZoomRatio ?: 4.0f
+            val defaultZoom = 1.0f.coerceIn(minZ, maxZ)
+            if (kotlin.math.abs(preferences.proZoomRatio - defaultZoom) > 0.01f) {
+                preferencesRepository.setProZoomRatio(defaultZoom)
+            }
+        }
+    }
 
     val verifiedLensCaps = (capabilitiesState as? com.example.core.camera.CameraCapabilitiesState.Verified)?.currentLensCapabilities
     val isFlashSupportedOnActiveLens = when (capabilitiesState) {
@@ -173,6 +350,11 @@ fun CameraFoundationScreen(
     val evStep = verifiedLensCaps?.evStep ?: (1f / 3f)
     val portraitDepthSupportPath = verifiedLensCaps?.portraitDepthSupportPath
         ?: com.example.core.camera.PortraitDepthSupportPath.ON_DEVICE_SEGMENTATION_ONLY
+    val nightSightSupportPath = verifiedLensCaps?.nightSightSupportPath
+        ?: com.example.core.camera.NightSightDeviceSupport.resolveNightSightSupportPath(
+            isHardwareNightSceneSupported = false,
+            context = context
+        )
 
     // Reconcile video resolution, frame rate, stabilization, torch/flash, and zoom whenever active camera, mode, or capabilities change
     LaunchedEffect(
@@ -184,7 +366,8 @@ fun CameraFoundationScreen(
         preferences.videoFrameRate,
         preferences.videoStabilization,
         preferences.flashMode,
-        preferences.proZoomRatio
+        preferences.proZoomRatio,
+        preferences.slowMoSpeed
     ) {
         val caps = (capabilitiesState as? com.example.core.camera.CameraCapabilitiesState.Verified)?.currentLensCapabilities
         if (caps != null) {
@@ -213,6 +396,21 @@ fun CameraFoundationScreen(
             if (reconciled.flashMode != preferences.flashMode) {
                 preferencesRepository.setFlashMode(reconciled.flashMode)
             }
+            val requestedSlowMoFr = com.example.core.camera.VideoFrameRate.entries.firstOrNull {
+                it.fps == preferences.slowMoSpeed.expectedFps
+            }
+            if (caps.supportedSlowMoRates.isNotEmpty() &&
+                requestedSlowMoFr != null &&
+                requestedSlowMoFr !in caps.supportedSlowMoRates
+            ) {
+                val fallbackFr = caps.supportedSlowMoRates.first()
+                val fallbackSpeed = com.example.core.preferences.SlowMoSpeed.entries.firstOrNull {
+                    it.expectedFps == fallbackFr.fps
+                } ?: com.example.core.preferences.SlowMoSpeed.SPEED_1_4X
+                if (fallbackSpeed != preferences.slowMoSpeed) {
+                    preferencesRepository.setSlowMoSpeed(fallbackSpeed)
+                }
+            }
         } else if (activeLens.facing == com.example.core.camera.LensFacing.FRONT &&
             preferences.flashMode != com.example.core.preferences.FlashMode.OFF
         ) {
@@ -220,14 +418,16 @@ fun CameraFoundationScreen(
         }
     }
 
-    val snackbarHostState = remember { SnackbarHostState() }
-    val coroutineScope = rememberCoroutineScope()
-
     Scaffold(
         modifier = modifier
             .fillMaxSize()
             .testTag("camera_foundation_screen"),
-        snackbarHost = { SnackbarHost(snackbarHostState) },
+        snackbarHost = {
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier.padding(bottom = 260.dp)
+            )
+        },
         containerColor = MaterialTheme.colorScheme.background,
         contentWindowInsets = WindowInsets.systemBars
     ) { innerPadding ->
@@ -253,10 +453,22 @@ fun CameraFoundationScreen(
                         preferencesRepository.setFlashMode(com.example.core.preferences.FlashMode.OFF)
                     }
                 },
+                hdrMode = preferences.hdrMode,
+                onCycleHdr = { preferencesRepository.cycleHdrMode() },
                 onQuickControlsClick = { showQuickControlsSheet = true },
                 onSettingsClick = onNavigateToSettings,
                 isFlashSupported = isFlashSupportedOnActiveLens,
                 isVideoMode = selectedMode.isVideo,
+                selectedFilter = if (selectedMode.supportsFilters) preferences.selectedFilter else com.example.core.preferences.CameraFilterPreset.ORIGINAL,
+                isFilterTrayOpen = selectedMode.supportsFilters && showFilterTray,
+                isFiltersSupported = selectedMode.supportsFilters,
+                onFiltersClick = {
+                    if (selectedMode.supportsFilters) {
+                        showFilterTray = !showFilterTray
+                    } else {
+                        showFilterTray = false
+                    }
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 6.dp)
@@ -269,9 +481,45 @@ fun CameraFoundationScreen(
                 gridMode = preferences.gridMode,
                 timerMode = preferences.timerMode,
                 flashMode = preferences.flashMode,
+                hdrMode = preferences.hdrMode,
+                selectedFilter = if (selectedMode.supportsFilters) preferences.selectedFilter else com.example.core.preferences.CameraFilterPreset.ORIGINAL,
+                onFilterBadgeClick = {
+                    if (selectedMode.supportsFilters) {
+                        showFilterTray = !showFilterTray
+                    } else {
+                        showFilterTray = false
+                    }
+                },
                 videoResolution = preferences.videoResolution,
                 videoFrameRate = preferences.videoFrameRate,
                 videoStabilization = preferences.videoStabilization,
+                slowMoSpeed = preferences.slowMoSpeed,
+                timeLapseSpeed = preferences.timeLapseSpeed,
+                onTimeLapseSpeedChanged = { preferencesRepository.setTimeLapseSpeed(it) },
+                panoramaDirection = panoramaLiveState.direction,
+                onPanoramaDirectionChanged = { dir ->
+                    updatePanoramaDirectionWhileIdle(dir)
+                },
+                panoramaLiveState = panoramaLiveState,
+                isPanoramaCapturingRequested = isPanoramaCapturingRequested,
+                panoramaFinishTrigger = panoramaFinishTrigger,
+                panoramaCancelTrigger = panoramaCancelTrigger,
+                panoramaStepTrigger = panoramaStepTrigger,
+                onPanoramaStateChanged = { updatedState ->
+                    if (selectedMode == CameraMode.PANORAMA && isPanoramaCapturingRequested) {
+                        panoramaLiveState = updatedState
+                        if (updatedState.phase == PanoramaCapturePhase.IDLE) {
+                            isPanoramaCapturingRequested = false
+                        }
+                    } else if (updatedState.phase == PanoramaCapturePhase.IDLE) {
+                        panoramaLiveState = updatedState
+                        isPanoramaCapturingRequested = false
+                    }
+                },
+                onStartPanoramaCapture = { startPanoramaCaptureSession() },
+                onFinishPanoramaCapture = { finishPanoramaCaptureSession() },
+                onCancelPanoramaCapture = { cancelPanoramaCaptureSession() },
+                onStepPanoramaCapture = { stepPanoramaCaptureSession() },
                 zoomRatio = clampedZoomRatio,
                 minZoomRatio = minZoomRatio,
                 maxZoomRatio = maxZoomRatio,
@@ -304,6 +552,13 @@ fun CameraFoundationScreen(
                 portraitDepthSupportPath = portraitDepthSupportPath,
                 onPortraitBlurLevelChanged = { preferencesRepository.setPortraitBlurLevel(it) },
                 onPortraitBlurStrengthChanged = { preferencesRepository.setPortraitBlurStrength(it) },
+                nightSightExposure = preferences.nightSightExposure,
+                astroDuration = preferences.astroDuration,
+                astroFocus = preferences.astroFocus,
+                astroStrategy = preferences.astroStrategy,
+                hdOutputOption = preferences.hdOutputOption,
+                nightSightSupportPath = nightSightSupportPath,
+                onNightSightExposureChanged = { preferencesRepository.setNightSightExposure(it) },
                 photoCaptureTrigger = photoCaptureTrigger,
                 onCapabilitiesDiscovered = { discovered ->
                     capabilitiesRepository.setDiscoveredCapabilities(discovered)
@@ -330,6 +585,7 @@ fun CameraFoundationScreen(
                 },
                 onCaptureSuccess = { uri ->
                     lastCapturedPhotoUri = uri
+                    captureConfirmationTrigger++
                 },
                 onCaptureError = { errorMsg ->
                     coroutineScope.launch {
@@ -358,6 +614,10 @@ fun CameraFoundationScreen(
                         selectedProControl = null
                     }
                 },
+                onCountdownStateChanged = { counting, remaining ->
+                    isCountingDown = counting
+                    countdownRemainingSeconds = remaining
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
@@ -370,6 +630,34 @@ fun CameraFoundationScreen(
                     .padding(vertical = 6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                // Compact, horizontally browsable Pixel Camera Filter Selector Tray (PHOTO & VIDEO modes only)
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = selectedMode.supportsFilters && showFilterTray,
+                    enter = androidx.compose.animation.fadeIn(
+                        animationSpec = com.example.ui.theme.CameraMotionTokens.panelTween()
+                    ) + androidx.compose.animation.expandVertically(
+                        animationSpec = com.example.ui.theme.CameraMotionTokens.panelTween()
+                    ),
+                    exit = androidx.compose.animation.fadeOut(
+                        animationSpec = com.example.ui.theme.CameraMotionTokens.panelTween()
+                    ) + androidx.compose.animation.shrinkVertically(
+                        animationSpec = com.example.ui.theme.CameraMotionTokens.panelTween()
+                    )
+                ) {
+                    com.example.feature.preview.components.CameraFilterTray(
+                        selectedFilter = preferences.selectedFilter,
+                        onFilterSelected = { preset ->
+                            preferencesRepository.setSelectedFilter(preset)
+                        },
+                        onResetFilter = {
+                            preferencesRepository.resetFilter()
+                        },
+                        onDismiss = {
+                            showFilterTray = false
+                        }
+                    )
+                }
+
                 // Interactive Pro Mode Control Bar
                 if (selectedMode == CameraMode.PRO) {
                     CameraProControlBar(
@@ -397,6 +685,9 @@ fun CameraFoundationScreen(
                     visibleModes = preferences.visibleModes,
                     hiddenModes = preferences.hiddenModes,
                     onModeSelected = { mode ->
+                        if (selectedMode == CameraMode.PANORAMA && mode != CameraMode.PANORAMA) {
+                            cancelPanoramaCaptureSession()
+                        }
                         selectedMode = mode
                     },
                     onMoreClick = {
@@ -408,37 +699,63 @@ fun CameraFoundationScreen(
 
                 CameraShutterBar(
                     activeMode = selectedMode,
-                    isRecording = isRecordingState,
+                    isRecording = if (selectedMode == CameraMode.PANORAMA) {
+                        panoramaLiveState.phase == PanoramaCapturePhase.CAPTURING
+                    } else {
+                        isRecordingState
+                    },
+                    isCountingDown = isCountingDown,
+                    countdownSeconds = countdownRemainingSeconds,
                     lastCapturedPhotoUri = lastCapturedPhotoUri,
+                    captureConfirmationTrigger = captureConfirmationTrigger,
                     onShutterClick = {
-                        if (selectedMode.isVideo) {
-                            if (!isRecordingState && !hasAudioPermission) {
-                                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        when {
+                            selectedMode.isVideo -> {
+                                if (!isRecordingState && !hasAudioPermission) {
+                                    audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                }
+                                isRecordingState = !isRecordingState
                             }
-                            isRecordingState = !isRecordingState
-                        } else {
-                            // Photo, Portrait, Night Sight, HD, Pro, Panorama modes execute real image capture
-                            photoCaptureTrigger++
+                            selectedMode == CameraMode.PANORAMA -> {
+                                when (panoramaLiveState.phase) {
+                                    PanoramaCapturePhase.IDLE -> startPanoramaCaptureSession()
+                                    PanoramaCapturePhase.CAPTURING -> finishPanoramaCaptureSession()
+                                    PanoramaCapturePhase.PROCESSING -> {
+                                        // Ignore duplicate taps while panorama stitching is in flight
+                                    }
+                                }
+                            }
+                            else -> {
+                                // Photo, Portrait, Night Sight, HD, Pro, Astro modes execute real image capture
+                                photoCaptureTrigger++
+                            }
                         }
                     },
                     onGalleryClick = {
                         val uri = lastCapturedPhotoUri
                         if (uri != null) {
-                            try {
-                                val intent = Intent(Intent.ACTION_VIEW).apply {
-                                    setDataAndType(uri, "image/*")
-                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            when (openCapturedMediaUri(context, uri)) {
+                                MediaOpenResult.Opened -> {}
+                                MediaOpenResult.NoCompatibleViewer -> {
+                                    inAppViewerUri = uri
                                 }
-                                context.startActivity(intent)
-                            } catch (e: Exception) {
-                                coroutineScope.launch {
-                                    snackbarHostState.showSnackbar("Failed to open gallery")
+                                MediaOpenResult.MissingOrInvalidUri -> {
+                                    lastCapturedPhotoUri = null
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar("Saved media file is no longer available")
+                                    }
+                                }
+                                MediaOpenResult.Error -> {
+                                    inAppViewerUri = uri
                                 }
                             }
                         } else {
                             try {
                                 val intent = Intent(Intent.ACTION_VIEW).apply {
-                                    type = "image/*"
+                                    type = if (selectedMode.isVideo) "video/*" else "image/*"
+                                    if (context !is android.app.Activity) {
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
                                 }
                                 context.startActivity(intent)
                             } catch (e: Exception) {
@@ -486,11 +803,15 @@ fun CameraFoundationScreen(
             onVideoFpsChanged = { preferencesRepository.setVideoFrameRate(it) },
             onVideoStabilizationChanged = { preferencesRepository.setVideoStabilization(it) },
             onHdOptionChanged = { preferencesRepository.setHdOutputOption(it) },
+            onHdrModeChanged = { preferencesRepository.setHdrMode(it) },
             onPortraitRetouchChanged = { preferencesRepository.setPortraitRetouch(it) },
             onPortraitBlurLevelChanged = { preferencesRepository.setPortraitBlurLevel(it) },
             onNightSightExposureChanged = { preferencesRepository.setNightSightExposure(it) },
             onTimeLapseSpeedChanged = { preferencesRepository.setTimeLapseSpeed(it) },
             onSlowMoSpeedChanged = { preferencesRepository.setSlowMoSpeed(it) },
+            onPanoramaDirectionChanged = { dir ->
+                updatePanoramaDirectionWhileIdle(dir)
+            },
             onProIsoChanged = { preferencesRepository.setProIso(it) },
             onProShutterChanged = { preferencesRepository.setProShutterSpeed(it) },
             onProFocusModeChanged = { preferencesRepository.setProFocusMode(it) },
@@ -500,6 +821,9 @@ fun CameraFoundationScreen(
             onProRawFormatChanged = { preferencesRepository.setProRawFormat(it) },
             onProHistogramToggled = { preferencesRepository.setProHistogramEnabled(it) },
             onProFocusPeakingToggled = { preferencesRepository.setProFocusPeakingEnabled(it) },
+            onAstroDurationChanged = { preferencesRepository.setAstroDuration(it) },
+            onAstroFocusChanged = { preferencesRepository.setAstroFocus(it) },
+            onAstroStrategyChanged = { preferencesRepository.setAstroStrategy(it) },
             onOpenFullSettings = onNavigateToSettings,
             onDismissRequest = { showQuickControlsSheet = false },
             sheetState = sheetState
@@ -516,4 +840,178 @@ fun CameraFoundationScreen(
             sheetState = moreSheetState
         )
     }
+
+    val activeViewerUri = inAppViewerUri
+    if (activeViewerUri != null) {
+        InAppMediaViewerDialog(
+            uri = activeViewerUri,
+            onDismiss = { inAppViewerUri = null }
+        )
+    }
 }
+
+enum class MediaOpenResult {
+    Opened,
+    NoCompatibleViewer,
+    MissingOrInvalidUri,
+    Error
+}
+
+internal fun isMediaUriVideo(context: android.content.Context, uri: Uri): Boolean {
+    val resolverType = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+    val uriString = uri.toString()
+    return resolverType?.startsWith("video/", ignoreCase = true) == true ||
+        uriString.contains("video", ignoreCase = true) ||
+        uri.lastPathSegment?.endsWith(".mp4", ignoreCase = true) == true
+}
+
+internal fun openCapturedMediaUri(context: android.content.Context, uri: Uri): MediaOpenResult {
+    if (uri == Uri.EMPTY) return MediaOpenResult.MissingOrInvalidUri
+    val scheme = uri.scheme?.lowercase(java.util.Locale.US)
+    if (scheme == "file") {
+        // file:// URIs cannot be shared externally on Android N+; verify file exists
+        val path = uri.path ?: return MediaOpenResult.MissingOrInvalidUri
+        val f = java.io.File(path)
+        if (!f.exists() || f.length() == 0L) return MediaOpenResult.MissingOrInvalidUri
+        return MediaOpenResult.NoCompatibleViewer
+    }
+    if (scheme == "content") {
+        val isReadable = runCatching {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                pfd.statSize != 0L
+            } ?: (context.contentResolver.openInputStream(uri)?.use { stream ->
+                stream.read() != -1
+            } ?: false)
+        }.getOrDefault(false)
+        if (!isReadable) return MediaOpenResult.MissingOrInvalidUri
+    }
+
+    val isVideo = isMediaUriVideo(context, uri)
+    val resolvedType = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+    val primaryMimeType = when {
+        isVideo -> resolvedType?.takeIf { it.startsWith("video/", ignoreCase = true) } ?: "video/mp4"
+        else -> resolvedType?.takeIf { it.startsWith("image/", ignoreCase = true) } ?: "image/*"
+    }
+
+    val primaryIntent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, primaryMimeType)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (context !is android.app.Activity) {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+    }
+
+    return try {
+        context.startActivity(primaryIntent)
+        MediaOpenResult.Opened
+    } catch (_: android.content.ActivityNotFoundException) {
+        val fallbackMimeType = if (isVideo) "video/*" else "image/*"
+        val fallbackIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, fallbackMimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            if (context !is android.app.Activity) {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        }
+        try {
+            context.startActivity(fallbackIntent)
+            MediaOpenResult.Opened
+        } catch (_: android.content.ActivityNotFoundException) {
+            MediaOpenResult.NoCompatibleViewer
+        } catch (_: Exception) {
+            MediaOpenResult.Error
+        }
+    } catch (_: Exception) {
+        MediaOpenResult.Error
+    }
+}
+
+@Composable
+private fun InAppMediaViewerDialog(
+    uri: Uri,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val isVideo = remember(uri) { isMediaUriVideo(context, uri) }
+    var durationLabel by remember(uri) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(uri, isVideo) {
+        if (isVideo) {
+            val retriever = android.media.MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(context, uri)
+                val durationMs = retriever.extractMetadata(
+                    android.media.MediaMetadataRetriever.METADATA_KEY_DURATION
+                )?.toLongOrNull() ?: 0L
+                val width = retriever.extractMetadata(
+                    android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH
+                )?.toIntOrNull() ?: 0
+                val height = retriever.extractMetadata(
+                    android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT
+                )?.toIntOrNull() ?: 0
+                if (durationMs > 0L) {
+                    val totalSecs = (durationMs + 500L) / 1000L
+                    val mins = totalSecs / 60L
+                    val secs = totalSecs % 60L
+                    val resPart = if (width > 0 && height > 0) " • ${width}×${height}" else ""
+                    durationLabel = String.format(java.util.Locale.US, "%02d:%02d%s", mins, secs, resPart)
+                }
+            } catch (_: Exception) {
+            } finally {
+                runCatching { retriever.release() }
+            }
+        }
+    }
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            androidx.compose.material3.Text(
+                text = if (isVideo) {
+                    if (durationLabel != null) "Recorded Video ($durationLabel)" else "Recorded Video"
+                } else {
+                    "Captured Photo"
+                }
+            )
+        },
+        text = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(320.dp)
+                    .testTag("in_app_media_viewer"),
+                contentAlignment = Alignment.Center
+            ) {
+                if (isVideo) {
+                    androidx.compose.ui.viewinterop.AndroidView(
+                        factory = { ctx ->
+                            android.widget.VideoView(ctx).apply {
+                                val controller = android.widget.MediaController(ctx)
+                                controller.setAnchorView(this)
+                                setMediaController(controller)
+                                setVideoURI(uri)
+                                setOnPreparedListener { mp ->
+                                    mp.isLooping = true
+                                    start()
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    coil.compose.AsyncImage(
+                        model = uri,
+                        contentDescription = "Captured photo preview",
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) {
+                androidx.compose.material3.Text("Close")
+            }
+        }
+    )
+}
+

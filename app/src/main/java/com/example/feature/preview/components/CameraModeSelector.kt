@@ -39,6 +39,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.core.model.CameraMode
+import androidx.compose.ui.draw.scale
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.material3.ripple
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 
@@ -157,7 +161,9 @@ fun CameraModeSelector(
 
         LazyRow(
             state = lazyListState,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("mode_selector_lazy_row"),
             contentPadding = PaddingValues(start = halfViewportWidth, end = halfViewportWidth),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -166,18 +172,45 @@ fun CameraModeSelector(
                 key = { _, mode -> mode.name }
             ) { _, mode ->
                 val isSelected = mode == selectedMode
-
-                Surface(
-                    color = if (isSelected) {
+                val animatedBgColor by androidx.compose.animation.animateColorAsState(
+                    targetValue = if (isSelected) {
                         MaterialTheme.colorScheme.primaryContainer
                     } else {
                         Color.Transparent
                     },
-                    shape = RoundedCornerShape(20.dp),
+                    animationSpec = com.example.ui.theme.CameraMotionTokens.controlTween(),
+                    label = "mode_bg_color"
+                )
+                val animatedTextColor by androidx.compose.animation.animateColorAsState(
+                    targetValue = if (isSelected) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    animationSpec = com.example.ui.theme.CameraMotionTokens.controlTween(),
+                    label = "mode_text_color"
+                )
+
+                val interactionSource = remember { MutableInteractionSource() }
+                val isPressed by interactionSource.collectIsPressedAsState()
+                val scale by androidx.compose.animation.core.animateFloatAsState(
+                    targetValue = if (isPressed) 0.94f else 1.0f,
+                    animationSpec = com.example.ui.theme.CameraMotionTokens.touchSpring(),
+                    label = "mode_item_scale"
+                )
+
+                Surface(
                     modifier = Modifier
                         .padding(horizontal = 4.dp)
-                        .clickable { onModeSelected(mode) }
+                        .scale(scale)
                         .testTag("mode_item_${mode.name.lowercase()}")
+                        .clickable(
+                            interactionSource = interactionSource,
+                            indication = ripple(bounded = true),
+                            onClick = { onModeSelected(mode) }
+                        ),
+                    shape = RoundedCornerShape(20.dp),
+                    color = animatedBgColor
                 ) {
                     Text(
                         text = mode.displayName,
@@ -185,11 +218,7 @@ fun CameraModeSelector(
                             fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                             letterSpacing = 0.2.sp
                         ),
-                        color = if (isSelected) {
-                            MaterialTheme.colorScheme.onPrimaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                        },
+                        color = animatedTextColor,
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
                     )
                 }
@@ -198,13 +227,23 @@ fun CameraModeSelector(
             // Render 'More' option button at the end if there are hidden modes
             if (hiddenModes.isNotEmpty()) {
                 item(key = "MORE_OPTION_KEY") {
+                    val moreInteractionSource = remember { MutableInteractionSource() }
+                    val isMorePressed by moreInteractionSource.collectIsPressedAsState()
+                    val moreScale by androidx.compose.animation.core.animateFloatAsState(
+                        targetValue = if (isMorePressed) 0.94f else 1.0f,
+                        animationSpec = com.example.ui.theme.CameraMotionTokens.touchSpring(),
+                        label = "more_item_scale"
+                    )
+
                     Surface(
-                        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.7f),
-                        shape = RoundedCornerShape(20.dp),
+                        onClick = onMoreClick,
                         modifier = Modifier
                             .padding(horizontal = 4.dp)
-                            .clickable { onMoreClick() }
-                            .testTag("mode_item_more")
+                            .scale(moreScale)
+                            .testTag("mode_item_more"),
+                        shape = RoundedCornerShape(20.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.7f),
+                        interactionSource = moreInteractionSource
                     ) {
                         Row(
                             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),

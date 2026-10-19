@@ -34,7 +34,7 @@ class ExampleUnitTest {
         assertEquals("HD", CameraMode.HD.displayName)
         assertEquals("Pro", CameraMode.PRO.displayName)
         assertEquals("Video", CameraMode.VIDEO.displayName)
-        assertEquals("Cinematic", CameraMode.CINEMATIC.displayName)
+        assertEquals("Astrophotography", CameraMode.ASTRO.displayName)
         assertEquals("Slow Motion", CameraMode.SLOW_MOTION.displayName)
         assertEquals("Time Lapse", CameraMode.TIME_LAPSE.displayName)
         assertEquals("Panorama", CameraMode.PANORAMA.displayName)

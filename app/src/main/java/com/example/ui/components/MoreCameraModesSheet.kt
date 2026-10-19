@@ -144,7 +144,7 @@ private fun getModeIcon(mode: CameraMode): ImageVector {
         CameraMode.HD -> Icons.Outlined.HighQuality
         CameraMode.PRO -> Icons.Outlined.CenterFocusStrong
         CameraMode.VIDEO -> Icons.Outlined.Videocam
-        CameraMode.CINEMATIC -> Icons.Outlined.AutoAwesome
+        CameraMode.ASTRO -> Icons.Outlined.AutoAwesome
         CameraMode.SLOW_MOTION -> Icons.Outlined.SlowMotionVideo
         CameraMode.TIME_LAPSE -> Icons.Outlined.Speed
         CameraMode.PANORAMA -> Icons.Outlined.PanoramaHorizontal
@@ -159,7 +159,7 @@ private fun getModeDescription(mode: CameraMode): String {
         CameraMode.HD -> "Full unbinned native sensor resolution photo"
         CameraMode.PRO -> "Manual ISO, shutter speed, focus, and RAW output"
         CameraMode.VIDEO -> "High-definition video recording with stabilization"
-        CameraMode.CINEMATIC -> "Cinematic depth video recording"
+        CameraMode.ASTRO -> "Adaptive multi-frame astrophotography and long-exposure night sky capture"
         CameraMode.SLOW_MOTION -> "High-frame-rate slow motion capture"
         CameraMode.TIME_LAPSE -> "Interval speed time-lapse recording"
         CameraMode.PANORAMA -> "Panoramic wide-angle sweep capture"

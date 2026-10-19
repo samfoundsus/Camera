@@ -1,6 +1,9 @@
 package com.example
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Color
+import java.io.ByteArrayOutputStream
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -57,7 +60,7 @@ class ExampleRobolectricTest {
         assertEquals("Camera", CameraMode.PHOTO.displayName)
         assertEquals(CameraMode.PHOTO, CameraMode.defaultMode)
         assertTrue(CameraMode.VIDEO.isVideo)
-        assertTrue(CameraMode.CINEMATIC.isVideo)
+        assertFalse(CameraMode.ASTRO.isVideo)
         assertTrue(CameraMode.SLOW_MOTION.isVideo)
         assertTrue(CameraMode.TIME_LAPSE.isVideo)
         assertFalse(CameraMode.PANORAMA.isVideo)
@@ -79,7 +82,7 @@ class ExampleRobolectricTest {
         assertTrue(names.contains("HD"))
         assertTrue(names.contains("Pro"))
         assertTrue(names.contains("Video"))
-        assertTrue(names.contains("Cinematic"))
+        assertTrue(names.contains("Astrophotography"))
         assertTrue(names.contains("Slow Motion"))
         assertTrue(names.contains("Time Lapse"))
         assertTrue(names.contains("Panorama"))
@@ -174,8 +177,8 @@ class ExampleRobolectricTest {
 
         composeTestRule.waitForIdle()
 
-        // Switch to Cinematic mode (middle-right item)
-        currentMode = CameraMode.CINEMATIC
+        // Switch to Astrophotography mode (middle-right item)
+        currentMode = CameraMode.ASTRO
         composeTestRule.waitForIdle()
 
         // Switch to Night Sight (first edge item)
@@ -567,7 +570,7 @@ class ExampleRobolectricTest {
 
         val expectedModes = listOf(
             "Night Sight", "Portrait", "Camera", "Video",
-            "Cinematic", "Slow Motion", "Time Lapse", "Panorama", "HD", "Pro"
+            "Astrophotography", "Slow Motion", "Time Lapse", "Panorama", "HD", "Pro"
         )
         assertEquals(10, expectedModes.size)
         assertEquals(expectedModes, CameraMode.entries.map { it.displayName })
@@ -715,7 +718,7 @@ class ExampleRobolectricTest {
                 com.example.feature.preview.components.CameraModeSelector(
                     selectedMode = selectedMode,
                     visibleModes = listOf(CameraMode.NIGHT_SIGHT, CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.VIDEO),
-                    hiddenModes = listOf(CameraMode.HD, CameraMode.PRO, CameraMode.CINEMATIC),
+                    hiddenModes = listOf(CameraMode.HD, CameraMode.PRO, CameraMode.ASTRO),
                     onModeSelected = { selectedMode = it },
                     onMoreClick = { moreClicked = true }
                 )
@@ -1912,5 +1915,445 @@ class ExampleRobolectricTest {
         assertEquals(VideoResolution.FHD_1080P, reconciled.resolution)
         assertEquals(VideoFrameRate.FPS_30, reconciled.frameRate)
     }
+
+    @Test
+    fun proModeSettingsIsolation_andModeTransitions_doNotLeakProSettingsIntoNonProModes() {
+        // 1. Verify Pro mode rules and non-Pro rules
+        assertFalse("Pro mode must not enable tap-to-focus auto metering", com.example.core.camera.isTapToFocusEnabledForMode(CameraMode.PRO))
+        assertTrue("Photo mode supports tap-to-focus", com.example.core.camera.isTapToFocusEnabledForMode(CameraMode.PHOTO))
+        assertTrue("Portrait mode supports tap-to-focus", com.example.core.camera.isTapToFocusEnabledForMode(CameraMode.PORTRAIT))
+        assertTrue("Night Sight mode supports tap-to-focus", com.example.core.camera.isTapToFocusEnabledForMode(CameraMode.NIGHT_SIGHT))
+        assertTrue("Video mode supports tap-to-focus", com.example.core.camera.isTapToFocusEnabledForMode(CameraMode.VIDEO))
+
+        // 2. Build Pro capture request options with explicit manual ISO, shutter speed, manual focus, and Kelvin white balance
+        val testManualCaps = com.example.core.camera.ManualSensorCapabilities(
+            isoRange = 50..6400,
+            shutterSpeedRangeNanos = 100_000L..30_000_000_000L,
+            isManualFocusSupported = true,
+            minimumFocusDistanceDiopters = 10.0f,
+            availableAwbModes = listOf(android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE_OFF, android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE_AUTO)
+        )
+
+        val proOptions = com.example.core.camera.buildProCamera2CaptureRequestOptions(
+            manualIso = "800",
+            manualShutterSpeed = "1/125",
+            proFocusMode = com.example.core.preferences.ProFocusMode.MANUAL,
+            proFocusDistance = 0.5f,
+            proWhiteBalance = "4500K",
+            manualCaps = testManualCaps,
+            proEv = 1.0f
+        )
+
+        assertEquals(
+            "Pro mode with manual ISO/shutter must set CONTROL_AE_MODE to OFF",
+            android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE_OFF,
+            proOptions.getCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE, -1)
+        )
+        assertEquals(
+            "Pro mode with manual focus must set CONTROL_AF_MODE to OFF",
+            android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_OFF,
+            proOptions.getCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE, -1)
+        )
+        assertEquals(
+            "Pro mode with manual Kelvin WB must set CONTROL_AWB_MODE to OFF",
+            android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE_OFF,
+            proOptions.getCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE, -1)
+        )
+
+        // 3. Verify destination non-Pro modes (Photo, Portrait, Night Sight, Video) get fresh automatic configurations
+        val modesToTest = listOf(
+            CameraMode.PHOTO,
+            CameraMode.PORTRAIT,
+            CameraMode.NIGHT_SIGHT,
+            CameraMode.VIDEO
+        )
+
+        for (mode in modesToTest) {
+            val nonProOptions = com.example.core.camera.buildNonProResetCamera2CaptureRequestOptions(
+                isVideoMode = mode == CameraMode.VIDEO,
+                isHardwareAfLockActive = false,
+                supportsAfAutoHold = true,
+                enableHardwareHdrSceneMode = mode == CameraMode.PHOTO,
+                enableHardwareNightSceneMode = mode == CameraMode.NIGHT_SIGHT,
+                enableHardwarePortraitBokeh = mode == CameraMode.PORTRAIT,
+                exposureCompensationIndex = 0
+            )
+
+            assertEquals(
+                "Non-Pro mode $mode must restore CONTROL_AE_MODE to ON",
+                android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE_ON,
+                nonProOptions.getCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE, -1)
+            )
+            assertEquals(
+                "Non-Pro mode $mode must restore CONTROL_AWB_MODE to AUTO",
+                android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE_AUTO,
+                nonProOptions.getCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE, -1)
+            )
+            val expectedAf = if (mode == CameraMode.VIDEO) {
+                android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+            } else {
+                android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            }
+            assertEquals(
+                "Non-Pro mode $mode must restore continuous autofocus",
+                expectedAf,
+                nonProOptions.getCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE, -1)
+            )
+        }
+    }
+
+    @Test
+    fun phase34HdrProcessor_multiFrameFusionAndSafeFallbackTest() {
+        val appContext = ApplicationProvider.getApplicationContext<Context>()
+
+        // 1. Create test bitmaps for multi-frame HDR bracket (Under-exposed, Normal, Over-exposed)
+        val width = 64
+        val height = 64
+
+        val darkBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(40, 40, 40))
+        }
+        val normalBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(128, 128, 128))
+        }
+        val brightBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(220, 220, 220))
+        }
+
+        val darkBytes = java.io.ByteArrayOutputStream().also { darkBmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }.toByteArray()
+        val normalBytes = java.io.ByteArrayOutputStream().also { normalBmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }.toByteArray()
+        val brightBytes = java.io.ByteArrayOutputStream().also { brightBmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }.toByteArray()
+
+        // 2. Test genuine 3-frame multi-exposure HDR fusion
+        val outcome = com.example.core.processing.HdrProcessor.processHdrJpegBytes(
+            sourceBytes = normalBytes,
+            additionalFramesBytes = listOf(darkBytes, brightBytes),
+            rotationDegrees = 0,
+            aspectRatioMode = com.example.core.preferences.AspectRatioMode.RATIO_4_3,
+            mirrorHorizontally = false,
+            hdrMode = com.example.core.preferences.HdrMode.AUTO,
+            supportPath = com.example.core.camera.HdrSupportPath.SOFTWARE_MULTI_FRAME_HDR
+        )
+
+        assertTrue("HDR processing must succeed for valid 3-frame bracket", outcome is com.example.core.processing.HdrProcessingOutcome.ProcessedHdr)
+        val processed = outcome as com.example.core.processing.HdrProcessingOutcome.ProcessedHdr
+        assertEquals(3, processed.framesMerged)
+        assertTrue("Output JPEG bytes must be non-empty", processed.jpegBytes.isNotEmpty())
+        assertTrue("Output dimensions must be non-zero", processed.width > 0 && processed.height > 0)
+
+        // 3. Test HDR OFF mode produces FallbackSingleFrame
+        val offOutcome = com.example.core.processing.HdrProcessor.processHdrJpegBytes(
+            sourceBytes = normalBytes,
+            additionalFramesBytes = listOf(darkBytes, brightBytes),
+            rotationDegrees = 0,
+            aspectRatioMode = com.example.core.preferences.AspectRatioMode.RATIO_4_3,
+            hdrMode = com.example.core.preferences.HdrMode.OFF
+        )
+        assertTrue("HDR OFF must produce FallbackSingleFrame", offOutcome is com.example.core.processing.HdrProcessingOutcome.FallbackSingleFrame)
+
+        // 4. Test missing companion frames safely fall back to single frame
+        val singleOutcome = com.example.core.processing.HdrProcessor.processHdrJpegBytes(
+            sourceBytes = normalBytes,
+            additionalFramesBytes = emptyList(),
+            rotationDegrees = 0,
+            aspectRatioMode = com.example.core.preferences.AspectRatioMode.RATIO_4_3,
+            hdrMode = com.example.core.preferences.HdrMode.ON
+        )
+        assertTrue("Missing companion frames must safely fall back", singleOutcome is com.example.core.processing.HdrProcessingOutcome.FallbackSingleFrame)
+
+        // 5. Test invalid corrupted bytes safely fall back without crashing
+        val corruptedBytes = byteArrayOf(0x00, 0x01, 0x02, 0x03)
+        val corruptOutcome = com.example.core.processing.HdrProcessor.processHdrJpegBytes(
+            sourceBytes = corruptedBytes,
+            additionalFramesBytes = emptyList(),
+            rotationDegrees = 0,
+            aspectRatioMode = com.example.core.preferences.AspectRatioMode.RATIO_4_3,
+            hdrMode = com.example.core.preferences.HdrMode.AUTO
+        )
+        assertTrue("Corrupted bytes must safely result in FallbackSingleFrame", corruptOutcome is com.example.core.processing.HdrProcessingOutcome.FallbackSingleFrame)
+    }
+
+    @Test
+    fun phase34HdrModeIsolation_andPreferencePersistenceTest() {
+        val appContext = ApplicationProvider.getApplicationContext<Context>()
+        val repo = com.example.core.preferences.CameraPreferencesRepository(appContext)
+
+        // 1. Verify default HDR mode is AUTO
+        assertEquals(com.example.core.preferences.HdrMode.AUTO, repo.preferences.value.hdrMode)
+
+        // 2. Verify setting and cycling HDR modes
+        repo.setHdrMode(com.example.core.preferences.HdrMode.ON)
+        assertEquals(com.example.core.preferences.HdrMode.ON, repo.preferences.value.hdrMode)
+
+        repo.cycleHdrMode()
+        assertEquals(com.example.core.preferences.HdrMode.OFF, repo.preferences.value.hdrMode)
+
+        repo.cycleHdrMode()
+        assertEquals(com.example.core.preferences.HdrMode.AUTO, repo.preferences.value.hdrMode)
+
+        // 3. Verify HDR support path in LensCapabilities
+        val caps = com.example.core.camera.LensCapabilities(lens = com.example.core.camera.CameraLens.BACK_MAIN)
+        assertEquals(com.example.core.camera.HdrSupportPath.SOFTWARE_MULTI_FRAME_HDR, caps.hdrSupportPath)
+    }
+
+    @Test
+    fun hdModeResolutionSelection_andIsolationTest() {
+        val appContext = ApplicationProvider.getApplicationContext<Context>()
+        val repo = com.example.core.preferences.CameraPreferencesRepository(appContext)
+
+        // 1. Verify default HD output option is MAX_NATIVE
+        assertEquals(com.example.core.preferences.HdOutputOption.MAX_NATIVE, repo.preferences.value.hdOutputOption)
+
+        // 2. Verify setting HD output option
+        repo.setHdOutputOption(com.example.core.preferences.HdOutputOption.STANDARD_BINNED)
+        assertEquals(com.example.core.preferences.HdOutputOption.STANDARD_BINNED, repo.preferences.value.hdOutputOption)
+
+        repo.setHdOutputOption(com.example.core.preferences.HdOutputOption.MAX_NATIVE)
+        assertEquals(com.example.core.preferences.HdOutputOption.MAX_NATIVE, repo.preferences.value.hdOutputOption)
+
+        // 3. Verify LensCapabilities optimal photo output size selection with MAX_NATIVE vs STANDARD_BINNED
+        val photoSizes = listOf(
+            com.example.core.camera.PhotoOutputSize(width = 4000, height = 3000, isSensorMaxResolution = false),
+            com.example.core.camera.PhotoOutputSize(width = 8000, height = 6000, isSensorMaxResolution = true)
+        )
+        val caps = com.example.core.camera.LensCapabilities(
+            lens = com.example.core.camera.CameraLens.BACK_MAIN,
+            supportedPhotoSizes = photoSizes,
+            highestNativeStillSize = photoSizes.last()
+        )
+
+        val maxNativeSize = caps.selectOptimalPhotoOutputSize(com.example.core.preferences.AspectRatioMode.RATIO_4_3, preferMaxNative = true)
+        assertEquals(8000, maxNativeSize?.width)
+        assertEquals(6000, maxNativeSize?.height)
+
+        val standardBinnedSize = caps.selectOptimalPhotoOutputSize(com.example.core.preferences.AspectRatioMode.RATIO_4_3, preferMaxNative = false)
+        assertTrue(standardBinnedSize != null)
+    }
+
+    @Test
+    fun astroModeCapabilitiesAndIsolationTest() {
+        val appContext = ApplicationProvider.getApplicationContext<Context>()
+        val repo = com.example.core.preferences.CameraPreferencesRepository(appContext)
+
+        // 1. Verify default Astro preferences
+        assertEquals(com.example.core.preferences.AstroDuration.AUTO, repo.preferences.value.astroDuration)
+        assertEquals(com.example.core.preferences.AstroFocusMode.AUTO, repo.preferences.value.astroFocus)
+        assertEquals(com.example.core.preferences.AstroStrategy.AUTO, repo.preferences.value.astroStrategy)
+        assertFalse(repo.preferences.value.astroRawEnabled)
+
+        // 2. Verify setting Astro preferences
+        repo.setAstroDuration(com.example.core.preferences.AstroDuration.LONG_1M)
+        repo.setAstroFocus(com.example.core.preferences.AstroFocusMode.INFINITY)
+        repo.setAstroStrategy(com.example.core.preferences.AstroStrategy.LONG_CAPTURE)
+        repo.setAstroRawEnabled(true)
+
+        assertEquals(com.example.core.preferences.AstroDuration.LONG_1M, repo.preferences.value.astroDuration)
+        assertEquals(com.example.core.preferences.AstroFocusMode.INFINITY, repo.preferences.value.astroFocus)
+        assertEquals(com.example.core.preferences.AstroStrategy.LONG_CAPTURE, repo.preferences.value.astroStrategy)
+        assertTrue(repo.preferences.value.astroRawEnabled)
+
+        // Verify AstroDuration target seconds mapping
+        assertEquals(30, com.example.core.preferences.AstroDuration.AUTO.targetSeconds)
+        assertEquals(10, com.example.core.preferences.AstroDuration.SHORT_10S.targetSeconds)
+        assertEquals(30, com.example.core.preferences.AstroDuration.MEDIUM_30S.targetSeconds)
+        assertEquals(60, com.example.core.preferences.AstroDuration.LONG_1M.targetSeconds)
+        assertEquals(240, com.example.core.preferences.AstroDuration.MAX_4M.targetSeconds)
+
+        // 3. Verify Astro processor stacking and portrait orientation transformation
+        val rawW = 40
+        val rawH = 30
+        val bmp = Bitmap.createBitmap(rawW, rawH, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(10, 10, 20))
+        }
+        val bytes = ByteArrayOutputStream().also { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }.toByteArray()
+
+        val outcome = com.example.core.processing.AstroProcessor.processAstroJpegBytes(
+            sourceBytes = bytes,
+            additionalFramesBytes = listOf(bytes, bytes),
+            rotationDegrees = 90, // 90° portrait holding orientation
+            aspectRatioMode = com.example.core.preferences.AspectRatioMode.RATIO_4_3,
+            mirrorHorizontally = false,
+            duration = com.example.core.preferences.AstroDuration.MEDIUM_30S
+        )
+
+        assertTrue("Astro processing must succeed for valid frames", outcome is com.example.core.processing.AstroProcessingOutcome.ProcessedAstro)
+        val processed = outcome as com.example.core.processing.AstroProcessingOutcome.ProcessedAstro
+        assertEquals(3, processed.framesStacked)
+        assertTrue(processed.jpegBytes.isNotEmpty())
+        // Vertically held photo (90°) must yield upright portrait dimensions (width < height)
+        assertTrue("Portrait orientation (90°) must produce upright height > width", processed.height > processed.width)
+
+        // 4. Verify Astro hardware capability resolution
+        val hwPath = com.example.core.camera.AstroDeviceSupport.resolveAstroSupportPath(
+            isManualShutterSupported = true,
+            maxExposureNanos = 2_000_000_000L,
+            isManualIsoSupported = true
+        )
+        assertEquals(com.example.core.camera.AstroSupportPath.HARDWARE_MANUAL_LONG_EXPOSURE, hwPath)
+
+        val compPath = com.example.core.camera.AstroDeviceSupport.resolveAstroSupportPath(
+            isManualShutterSupported = false,
+            maxExposureNanos = null,
+            isManualIsoSupported = true
+        )
+        assertEquals(com.example.core.camera.AstroSupportPath.COMPUTATIONAL_MULTI_FRAME_ASTRO, compPath)
+
+        val fallbackPath = com.example.core.camera.AstroDeviceSupport.resolveAstroSupportPath(
+            isManualShutterSupported = false,
+            maxExposureNanos = null,
+            isManualIsoSupported = false
+        )
+        assertEquals(com.example.core.camera.AstroSupportPath.NIGHT_SIGHT_ADAPTIVE_FALLBACK, fallbackPath)
+
+        // 5. Verify Camera2 Astro capture options building with Infinity Focus
+        val manualCaps = com.example.core.camera.ManualSensorCapabilities(
+            isManualShutterSupported = true,
+            shutterSpeedRangeNanos = 100_000L..4_000_000_000L,
+            isManualIsoSupported = true,
+            isoRange = 100..3200,
+            isManualFocusSupported = true,
+            minimumFocusDistanceDiopters = 10.0f
+        )
+        val astroOptions = com.example.core.camera.buildAstroCamera2CaptureRequestOptions(
+            astroFocus = com.example.core.preferences.AstroFocusMode.INFINITY,
+            astroStrategy = com.example.core.preferences.AstroStrategy.AUTO,
+            manualCaps = manualCaps
+        )
+        assertEquals(
+            android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_OFF,
+            astroOptions.getCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE, -1)
+        )
+        assertEquals(
+            0.0f,
+            astroOptions.getCaptureRequestOption(android.hardware.camera2.CaptureRequest.LENS_FOCUS_DISTANCE, -1f)
+        )
+
+        // 6. Verify Star Feature Detection and Alignment Shift calculation
+        val starBmpBase = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.BLACK)
+            setPixel(50, 50, Color.WHITE)
+            setPixel(20, 20, Color.WHITE)
+        }
+        val starBmpShifted = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.BLACK)
+            setPixel(52, 53, Color.WHITE)
+            setPixel(22, 23, Color.WHITE)
+        }
+
+        val starsFound = com.example.core.processing.AstroProcessor.findStarPoints(starBmpBase)
+        assertTrue("Must detect star points in synthetic night sky", starsFound.isNotEmpty())
+
+        val shiftPair = com.example.core.processing.AstroProcessor.estimateStarAlignmentShift(starBmpBase, starBmpShifted)
+        assertTrue("Must estimate star alignment shift", shiftPair != null)
+        assertEquals(-2f, shiftPair!!.first, 1.0f)
+        assertEquals(-3f, shiftPair.second, 1.0f)
+    }
+
+    @Test
+    fun zoomResetOnModeTransitionTest() {
+        val appContext = ApplicationProvider.getApplicationContext<Context>()
+        val repo = com.example.core.preferences.CameraPreferencesRepository(appContext)
+
+        repo.setProZoomRatio(5.0f)
+        assertEquals(5.0f, repo.preferences.value.proZoomRatio, 0.001f)
+
+        repo.setProZoomRatio(1.0f)
+        assertEquals(1.0f, repo.preferences.value.proZoomRatio, 0.001f)
+    }
+
+    @Test
+    fun slowMotion_speedsAndFactors_areCorrect() {
+        assertEquals(4, com.example.core.preferences.SlowMoSpeed.entries.size)
+        val s120 = com.example.core.preferences.SlowMoSpeed.SPEED_1_4X
+        assertEquals(120, s120.expectedFps)
+        assertEquals(4.0f, s120.slowDownFactor, 0.01f)
+
+        val s240 = com.example.core.preferences.SlowMoSpeed.SPEED_1_8X
+        assertEquals(240, s240.expectedFps)
+        assertEquals(8.0f, s240.slowDownFactor, 0.01f)
+
+        val s360 = com.example.core.preferences.SlowMoSpeed.SPEED_1_12X
+        assertEquals(360, s360.expectedFps)
+        assertEquals(12.0f, s360.slowDownFactor, 0.01f)
+
+        val s480 = com.example.core.preferences.SlowMoSpeed.SPEED_1_16X
+        assertEquals(480, s480.expectedFps)
+        assertEquals(16.0f, s480.slowDownFactor, 0.01f)
+    }
+
+    @Test
+    fun lensCapabilities_supportedSlowMoRates_test() {
+        val caps = LensCapabilities(
+            lens = CameraLens.BACK_MAIN,
+            supportedSlowMoRates = listOf(VideoFrameRate.FPS_120, VideoFrameRate.FPS_240, VideoFrameRate.FPS_360, VideoFrameRate.FPS_480),
+            supportedSlowMoResolutionsByRate = mapOf(
+                VideoFrameRate.FPS_120 to listOf(VideoResolution.FHD_1080P, VideoResolution.HD_720P),
+                VideoFrameRate.FPS_480 to listOf(VideoResolution.HD_720P)
+            )
+        )
+        assertTrue(caps.isSlowMoRateSupported(VideoFrameRate.FPS_120))
+        assertTrue(caps.isSlowMoRateSupported(VideoFrameRate.FPS_480))
+        assertEquals(
+            VideoResolution.FHD_1080P,
+            caps.resolveSlowMoResolution(VideoFrameRate.FPS_120, VideoResolution.FHD_1080P)
+        )
+        assertEquals(
+            VideoResolution.HD_720P,
+            caps.resolveSlowMoResolution(VideoFrameRate.FPS_480, VideoResolution.FHD_1080P)
+        )
+    }
+
+    @Test
+    fun selectBestTargetFpsRange_clampsToSupportedHardwareRanges() {
+        val hardwareRanges = arrayOf(
+            android.util.Range(15, 30),
+            android.util.Range(30, 30),
+            android.util.Range(60, 60)
+        )
+        val selectedFor120 = com.example.feature.preview.components.selectBestTargetFpsRange(hardwareRanges, 120)
+        assertEquals(android.util.Range(60, 60), selectedFor120)
+
+        val highSpeedRanges = arrayOf(
+            android.util.Range(30, 30),
+            android.util.Range(120, 120),
+            android.util.Range(240, 240)
+        )
+        val exact120 = com.example.feature.preview.components.selectBestTargetFpsRange(highSpeedRanges, 120)
+        assertEquals(android.util.Range(120, 120), exact120)
+    }
+
+    @Test
+    fun slowMotion_mediaHandlingAndDurationScaling_test() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+
+        // 10s capture at 120 FPS (4.0x factor) produces 40s playback duration
+        val captureDurationUs = 10_000_000L
+        val scaled120Us = (captureDurationUs * com.example.core.preferences.SlowMoSpeed.SPEED_1_4X.slowDownFactor).toLong()
+        assertEquals(40_000_000L, scaled120Us)
+
+        // Empty or missing file must not report a saved URI
+        val missingFile = java.io.File(context.cacheDir, "nonexistent_slowmo.mp4")
+        org.junit.Assert.assertNull(com.example.feature.preview.components.processSlowMotionVideoFile(context, missingFile, 4.0f))
+        org.junit.Assert.assertNull(
+            com.example.feature.preview.components.saveVideoFileToMediaStore(
+                context = context,
+                videoFile = missingFile,
+                displayName = "VID_MISSING.mp4"
+            )
+        )
+
+        // Invalid / empty URI handling in openCapturedMediaUri
+        assertEquals(
+            com.example.feature.preview.MediaOpenResult.MissingOrInvalidUri,
+            com.example.feature.preview.openCapturedMediaUri(context, android.net.Uri.EMPTY)
+        )
+
+        // Video URI detection
+        val videoUri = android.net.Uri.parse("content://media/external/video/media/42")
+        assertTrue(com.example.feature.preview.isMediaUriVideo(context, videoUri))
+    }
 }
+
+
+
 

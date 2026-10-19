@@ -12,6 +12,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.core.camera.CameraLens
 import com.example.core.camera.LensCapabilities
 import com.example.core.camera.ManualSensorCapabilities
+import com.example.core.camera.PortraitBlurDeviceSupport
 import com.example.core.camera.PortraitDepthSupportPath
 import com.example.core.camera.buildNonProResetCamera2CaptureRequestOptions
 import com.example.core.preferences.AspectRatioMode
@@ -27,8 +28,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.longClick
 import androidx.compose.ui.test.onNodeWithTag
@@ -37,6 +40,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -666,7 +670,7 @@ class PortraitModePhase32Test {
         composeTestRule.onNodeWithTag("portrait_blur_slider").assertDoesNotExist()
 
         // 7. Tap outside on the preview dismisses the expanded slider and returns to compact shortcuts without resetting values
-        composeTestRule.onNodeWithTag("preview_placeholder").performClick()
+        composeTestRule.onNodeWithTag("preview_placeholder").performTouchInput { click(Offset(20f, 20f)) }
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("zoom_continuous_slider").assertDoesNotExist()
         composeTestRule.onNodeWithTag("portrait_blur_slider").assertDoesNotExist()

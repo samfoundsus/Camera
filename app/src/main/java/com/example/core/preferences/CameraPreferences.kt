@@ -69,6 +69,38 @@ enum class HdOutputOption(val displayName: String, val subtitle: String) {
 }
 
 /**
+ * Astrophotography capture duration options.
+ */
+enum class AstroDuration(
+    val displayName: String,
+    val targetSeconds: Int,
+    val targetFrames: Int
+) {
+    AUTO("Auto", 30, 6),
+    SHORT_10S("10s", 10, 3),
+    MEDIUM_30S("30s", 30, 6),
+    LONG_1M("1 min", 60, 10),
+    MAX_4M("4 min", 240, 16)
+}
+
+/**
+ * Astrophotography focus mode options.
+ */
+enum class AstroFocusMode(val displayName: String) {
+    AUTO("Auto"),
+    INFINITY("Infinity (\u221e)"),
+    MANUAL("Manual")
+}
+
+/**
+ * Astrophotography capture strategy options.
+ */
+enum class AstroStrategy(val displayName: String) {
+    AUTO("Auto Adaptive"),
+    LONG_CAPTURE("Exposure Stacking")
+}
+
+/**
  * Portrait retouch effect options.
  */
 enum class PortraitRetouch(val displayName: String) {
@@ -144,6 +176,15 @@ enum class PortraitBlurLevel(
 }
 
 /**
+ * HDR computational modes.
+ */
+enum class HdrMode(val displayName: String) {
+    AUTO("HDR Auto"),
+    ON("HDR On"),
+    OFF("HDR Off")
+}
+
+/**
  * Night sight exposure duration modes.
  */
 enum class NightSightExposure(val displayName: String) {
@@ -153,21 +194,91 @@ enum class NightSightExposure(val displayName: String) {
 }
 
 /**
- * Time lapse capture speed options.
+ * Time lapse capture speed options (30 FPS output timeline).
+ *
+ * Capture interval math for 30 FPS output:
+ * intervalSeconds = multiplier / 30.0f
+ * - 30x   -> 1 frame every 1.0s   (30s real time = 1s playback)
+ * - 60x   -> 1 frame every 2.0s   (60s real time = 1s playback)
+ * - 120x  -> 1 frame every 4.0s   (120s real time = 1s playback)
+ * - 300x  -> 1 frame every 10.0s  (300s real time = 1s playback)
+ * - 600x  -> 1 frame every 20.0s  (600s real time = 1s playback)
+ * - 1200x -> 1 frame every 40.0s  (1200s real time = 1s playback)
+ * - 2400x -> 1 frame every 80.0s  (2400s real time = 1s playback)
+ * - 6000x -> 1 frame every 200.0s (6000s real time = 1s playback)
  */
-enum class TimeLapseSpeed(val displayName: String, val intervalSeconds: Float) {
-    SPEED_5X("5× (Fast walk)", 0.5f),
-    SPEED_10X("10× (Busy street)", 1.0f),
-    SPEED_30X("30× (Moving clouds)", 3.0f),
-    SPEED_120X("120× (Sunset)", 12.0f)
+enum class TimeLapseSpeed(
+    val multiplier: Int,
+    val shortLabel: String,
+    val displayName: String,
+    val description: String,
+    val intervalSeconds: Float
+) {
+    SPEED_30X(30, "30x", "30x", "Moving clouds & street traffic", 1.0f),
+    SPEED_60X(60, "60x", "60x", "Sunsets & shadows", 2.0f),
+    SPEED_120X(120, "120x", "120x", "Fast clouds & twilight", 4.0f),
+    SPEED_300X(300, "300x", "300x", "Sun & moon arc", 10.0f),
+    SPEED_600X(600, "600x", "600x", "Tides & slow sky motion", 20.0f),
+    SPEED_1200X(1200, "1200x", "1200x", "Plant growth & long scenes", 40.0f),
+    SPEED_2400X(2400, "2400x", "2400x", "Star trails & multi-hour sky", 80.0f),
+    SPEED_6000X(6000, "6000x", "6000x", "Ultra-long duration capture", 200.0f);
+
+    /** Capture interval in milliseconds for a 30 FPS time-lapse output timeline. */
+    val captureIntervalMs: Long
+        get() = (multiplier.toLong() * 1000L) / TARGET_OUTPUT_FPS.toLong()
+
+    /** Computes the expected output playback duration in milliseconds for a given real recording duration. */
+    fun expectedOutputDurationMs(realDurationMs: Long): Long {
+        if (realDurationMs <= 0L) return 0L
+        return (realDurationMs.toDouble() / multiplier.toDouble()).toLong()
+    }
+
+    companion object {
+        const val TARGET_OUTPUT_FPS = 30
+
+        fun fromStoredName(stored: String?): TimeLapseSpeed {
+            if (stored.isNullOrBlank()) return SPEED_30X
+            return entries.firstOrNull {
+                it.name.equals(stored, ignoreCase = true) ||
+                    it.shortLabel.equals(stored, ignoreCase = true)
+            } ?: SPEED_30X
+        }
+    }
 }
 
 /**
  * Slow motion playback speed options.
  */
-enum class SlowMoSpeed(val displayName: String, val expectedFps: Int) {
-    SPEED_1_4X("1/4× (120 FPS)", 120),
-    SPEED_1_8X("1/8× (240 FPS)", 240)
+enum class SlowMoSpeed(val displayName: String, val expectedFps: Int, val slowDownFactor: Float) {
+    SPEED_1_4X("1/4× (120 FPS)", 120, 4.0f),
+    SPEED_1_8X("1/8× (240 FPS)", 240, 8.0f),
+    SPEED_1_12X("1/12× (360 FPS)", 360, 12.0f),
+    SPEED_1_16X("1/16× (480 FPS)", 480, 16.0f)
+}
+
+/**
+ * Panorama sweep direction options.
+ */
+enum class PanoramaDirection(
+    val displayName: String,
+    val shortLabel: String,
+    val arrowSymbol: String,
+    val arrowDirectionName: String,
+    val isHorizontal: Boolean,
+    val sign: Int,
+    val initialTrackOffset: Float
+) {
+    LEFT_TO_RIGHT("Left to Right", "Left → Right", "→", "RIGHT", true, 1, 0.0f),
+    RIGHT_TO_LEFT("Right to Left", "Right → Left", "←", "LEFT", true, -1, 1.0f),
+    TOP_TO_BOTTOM("Top to Bottom", "Top ↓ Bottom", "↓", "DOWN", false, 1, 0.0f),
+    BOTTOM_TO_TOP("Bottom to Top", "Bottom ↑ Top", "↑", "UP", false, -1, 1.0f);
+
+    companion object {
+        fun fromStoredName(storedName: String?): PanoramaDirection {
+            if (storedName.isNullOrBlank()) return LEFT_TO_RIGHT
+            return entries.firstOrNull { it.name.equals(storedName, ignoreCase = true) } ?: LEFT_TO_RIGHT
+        }
+    }
 }
 
 /**
@@ -197,6 +308,60 @@ enum class VolumeButtonAction(val displayName: String) {
 }
 
 /**
+ * Filter preset categories.
+ */
+enum class CameraFilterCategory(val displayName: String) {
+    NATURAL("Natural"),
+    CREATIVE("Creative")
+}
+
+/**
+ * Selectable Pixel-inspired natural and creative color filter presets for photos and videos.
+ */
+enum class CameraFilterPreset(
+    val id: String,
+    val displayName: String,
+    val category: CameraFilterCategory,
+    val description: String
+) {
+    // A. Natural / Pixel-Inspired Presets
+    ORIGINAL("original", "Original", CameraFilterCategory.NATURAL, "No additional filter effect"),
+    NATURAL("natural", "Natural", CameraFilterCategory.NATURAL, "Subtle color and contrast refinement while preserving realistic colors"),
+    WARM("warm", "Warm", CameraFilterCategory.NATURAL, "Gentle warm white balance and golden highlights"),
+    COOL("cool", "Cool", CameraFilterCategory.NATURAL, "Restrained cool color balance"),
+    RICH("rich", "Rich", CameraFilterCategory.NATURAL, "Slightly richer color and controlled contrast"),
+    SOFT("soft", "Soft", CameraFilterCategory.NATURAL, "Gentle contrast and highlights"),
+    PORTRAIT_NATURAL("portrait_natural", "Portrait Natural", CameraFilterCategory.NATURAL, "Restrained color refinement suitable for people"),
+    MATTE("matte", "Matte", CameraFilterCategory.NATURAL, "Lifted shadows and a softer contrast curve"),
+
+    // B. Creative Presets
+    VIVID("vivid", "Vivid", CameraFilterCategory.CREATIVE, "Stronger but controlled saturation"),
+    CINEMATIC("cinematic", "Cinematic", CameraFilterCategory.CREATIVE, "Cinematic contrast with carefully balanced shadows and highlights"),
+    GOLDEN_HOUR("golden_hour", "Golden Hour", CameraFilterCategory.CREATIVE, "Warm, golden color treatment"),
+    VINTAGE("vintage", "Vintage", CameraFilterCategory.CREATIVE, "Muted tones and a subtle film-like color curve"),
+    CLASSIC_FILM("classic_film", "Classic Film", CameraFilterCategory.CREATIVE, "Restrained film-inspired colors and contrast"),
+    MONO("mono", "Mono", CameraFilterCategory.CREATIVE, "Black and white"),
+    NOIR("noir", "Noir", CameraFilterCategory.CREATIVE, "Dramatic monochrome contrast"),
+    FADE("fade", "Fade", CameraFilterCategory.CREATIVE, "Low-contrast, faded aesthetic"),
+    DRAMATIC("dramatic", "Dramatic", CameraFilterCategory.CREATIVE, "Stronger local-looking contrast using a lightweight global tone treatment"),
+    MOODY("moody", "Moody", CameraFilterCategory.CREATIVE, "Darker, subdued colors with controlled highlights");
+
+    val isOriginal: Boolean
+        get() = this == ORIGINAL
+
+    companion object {
+        fun fromStoredName(stored: String?): CameraFilterPreset {
+            if (stored.isNullOrBlank()) return ORIGINAL
+            return entries.firstOrNull {
+                it.name.equals(stored, ignoreCase = true) ||
+                    it.id.equals(stored, ignoreCase = true) ||
+                    it.displayName.equals(stored, ignoreCase = true)
+            } ?: ORIGINAL
+        }
+    }
+}
+
+/**
  * Immutable camera settings state for Pixel Camera UI and engine integration.
  */
 data class CameraPreferences(
@@ -210,19 +375,28 @@ data class CameraPreferences(
     val saveLocation: Boolean = false,
     val selfieMirror: Boolean = true,
     val volumeButtonAction: VolumeButtonAction = VolumeButtonAction.VOLUME,
+    // Shared photo & video filter preset
+    val selectedFilter: CameraFilterPreset = CameraFilterPreset.ORIGINAL,
     // Video quality & frame rate settings
     val videoResolution: VideoResolution = VideoResolution.FHD_1080P,
     val videoFrameRate: VideoFrameRate = VideoFrameRate.FPS_30,
     val videoStabilization: VideoStabilizationMode = VideoStabilizationMode.STANDARD,
     // HD mode preferences
     val hdOutputOption: HdOutputOption = HdOutputOption.MAX_NATIVE,
+    // HDR computational mode
+    val hdrMode: HdrMode = HdrMode.AUTO,
     // Mode-specific options
     val portraitRetouch: PortraitRetouch = PortraitRetouch.NATURAL,
     val portraitBlurLevel: PortraitBlurLevel = PortraitBlurLevel.MEDIUM,
     val portraitBlurStrength: Float = portraitBlurLevel.blurStrength,
     val nightSightExposure: NightSightExposure = NightSightExposure.AUTO,
-    val timeLapseSpeed: TimeLapseSpeed = TimeLapseSpeed.SPEED_10X,
+    val astroDuration: AstroDuration = AstroDuration.AUTO,
+    val astroFocus: AstroFocusMode = AstroFocusMode.AUTO,
+    val astroStrategy: AstroStrategy = AstroStrategy.AUTO,
+    val astroRawEnabled: Boolean = false,
+    val timeLapseSpeed: TimeLapseSpeed = TimeLapseSpeed.SPEED_30X,
     val slowMoSpeed: SlowMoSpeed = SlowMoSpeed.SPEED_1_4X,
+    val panoramaDirection: PanoramaDirection = PanoramaDirection.LEFT_TO_RIGHT,
     // Pro mode manual preferences
     val proIso: String = "AUTO",
     val proShutterSpeed: String = "AUTO",
@@ -250,6 +424,6 @@ data class CameraPreferences(
 
     companion object {
         val DEFAULT_VISIBLE_MODE_NAMES = listOf("NIGHT_SIGHT", "PORTRAIT", "PHOTO", "VIDEO", "HD", "PRO")
-        val DEFAULT_HIDDEN_MODE_NAMES = listOf("CINEMATIC", "SLOW_MOTION", "TIME_LAPSE", "PANORAMA")
+        val DEFAULT_HIDDEN_MODE_NAMES = listOf("ASTRO", "SLOW_MOTION", "TIME_LAPSE", "PANORAMA")
     }
 }

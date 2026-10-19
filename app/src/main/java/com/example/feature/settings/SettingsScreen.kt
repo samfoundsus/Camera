@@ -44,6 +44,7 @@ import com.example.core.preferences.CameraPreferences
 import com.example.core.preferences.FlashMode
 import com.example.core.preferences.GridMode
 import com.example.core.preferences.HdOutputOption
+import com.example.core.preferences.HdrMode
 import com.example.core.preferences.NightSightExposure
 import com.example.core.preferences.PortraitBlurLevel
 import com.example.core.preferences.PortraitRetouch
@@ -92,6 +93,7 @@ fun SettingsScreen(
     onVideoFpsChanged: (VideoFrameRate) -> Unit = {},
     onVideoStabilizationChanged: (VideoStabilizationMode) -> Unit = {},
     onHdOptionChanged: (HdOutputOption) -> Unit = {},
+    onHdrModeChanged: (HdrMode) -> Unit = {},
     onPortraitRetouchChanged: (PortraitRetouch) -> Unit = {},
     onPortraitBlurLevelChanged: (PortraitBlurLevel) -> Unit = {},
     onNightSightExposureChanged: (NightSightExposure) -> Unit = {},
@@ -132,6 +134,7 @@ fun SettingsScreen(
     var showVideoFpsDialog by remember { mutableStateOf(false) }
     var showStabilizationDialog by remember { mutableStateOf(false) }
     var showHdOptionDialog by remember { mutableStateOf(false) }
+    var showHdrModeDialog by remember { mutableStateOf(false) }
     var showPortraitRetouchDialog by remember { mutableStateOf(false) }
     var showPortraitBlurDialog by remember { mutableStateOf(false) }
     var showNightExposureDialog by remember { mutableStateOf(false) }
@@ -398,6 +401,17 @@ fun SettingsScreen(
                 SettingsSectionHeader("Mode Preferences")
 
                 SettingsCard {
+                    SettingsRow(
+                        title = "HDR+ Computational Mode",
+                        subtitle = "Multi-frame exposure bracket fusion for dynamic range",
+                        trailingText = preferences.hdrMode.displayName,
+                        showDropdownIndicator = true,
+                        onClick = { showHdrModeDialog = true },
+                        testTag = "setting_hdr_mode_row"
+                    )
+
+                    SettingsCardDivider()
+
                     SettingsRow(
                         title = "Portrait Background Blur",
                         subtitle = "Subject segmentation background bokeh intensity",
@@ -690,6 +704,17 @@ fun SettingsScreen(
             onOptionSelected = onHdOptionChanged,
             onDismissRequest = { showHdOptionDialog = false },
             optionLabel = { "${it.displayName} — ${it.subtitle}" }
+        )
+    }
+
+    if (showHdrModeDialog) {
+        SingleChoiceDialog(
+            title = "HDR+ Computational Mode",
+            options = HdrMode.entries,
+            selectedOption = preferences.hdrMode,
+            onOptionSelected = onHdrModeChanged,
+            onDismissRequest = { showHdrModeDialog = false },
+            optionLabel = { it.displayName }
         )
     }
 

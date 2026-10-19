@@ -118,30 +118,37 @@ class MediaStorePhotoSaver(private val context: Context) : MediaStorageContract 
 
             var writeSucceeded = false
             try {
-                val stream = contentResolver.openOutputStream(uri) ?: return null
-                stream.use { out ->
-                    out.write(outputBytes)
-                    out.flush()
+                val bytesToWrite = if (mimeType.equals("image/jpeg", ignoreCase = true) && width > 0 && height > 0) {
+                    var tempExifFile: java.io.File? = null
+                    try {
+                        tempExifFile = java.io.File.createTempFile("exif_enrich_", ".jpg", context.cacheDir)
+                        tempExifFile.writeBytes(outputBytes)
+                        val targetExif = ExifInterface(tempExifFile.absolutePath)
+                        AspectCropUtils.copyAndEnrichExifMetadata(
+                            sourceJpegBytes = sourceExifBytes ?: outputBytes,
+                            targetExif = targetExif,
+                            finalWidth = width,
+                            finalHeight = height,
+                            exifOrientation = exifOrientation,
+                            location = location,
+                            timestampMillis = timestampMillis
+                        )
+                        tempExifFile.readBytes()
+                    } catch (_: Exception) {
+                        outputBytes
+                    } finally {
+                        try {
+                            tempExifFile?.delete()
+                        } catch (_: Exception) {}
+                    }
+                } else {
+                    outputBytes
                 }
 
-                // For JPEG assets, copy original camera EXIF metadata and enrich dimensions/orientation/GPS
-                if (mimeType.equals("image/jpeg", ignoreCase = true) && width > 0 && height > 0) {
-                    try {
-                        contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
-                            val targetExif = ExifInterface(pfd.fileDescriptor)
-                            AspectCropUtils.copyAndEnrichExifMetadata(
-                                sourceJpegBytes = sourceExifBytes ?: outputBytes,
-                                targetExif = targetExif,
-                                finalWidth = width,
-                                finalHeight = height,
-                                exifOrientation = exifOrientation,
-                                location = location,
-                                timestampMillis = timestampMillis
-                            )
-                        }
-                    } catch (_: Exception) {
-                        // In JVM Robolectric tests, openFileDescriptor on synthetic MediaStore URIs may be a no-op
-                    }
+                val stream = contentResolver.openOutputStream(uri) ?: return null
+                stream.use { out ->
+                    out.write(bytesToWrite)
+                    out.flush()
                 }
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

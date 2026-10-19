@@ -20,12 +20,18 @@ enum class CameraMode(val displayName: String, val isVideo: Boolean = false) {
     PORTRAIT("Portrait"),
     PHOTO("Camera"),
     VIDEO("Video", isVideo = true),
-    CINEMATIC("Cinematic", isVideo = true),
+    ASTRO("Astrophotography"),
     SLOW_MOTION("Slow Motion", isVideo = true),
     TIME_LAPSE("Time Lapse", isVideo = true),
     PANORAMA("Panorama"),
     HD("HD"),
     PRO("Pro");
+
+    /**
+     * Color filters are supported exclusively in standard Camera/Photo and Video modes.
+     */
+    val supportsFilters: Boolean
+        get() = this == PHOTO || this == VIDEO
 
     companion object {
         val defaultMode = PHOTO

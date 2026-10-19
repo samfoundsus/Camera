@@ -268,7 +268,7 @@ class PhotoPipelinePhase31Test {
             manualCapabilities = ManualSensorCapabilities(isHardwareHdrSceneModeSupported = false)
         )
         assertEquals(HdrSupportPath.HARDWARE_SCENE_MODE_HDR, capsWithHdr.hdrSupportPath)
-        assertEquals(HdrSupportPath.UNAVAILABLE, capsWithoutHdr.hdrSupportPath)
+        assertEquals(HdrSupportPath.SOFTWARE_MULTI_FRAME_HDR, capsWithoutHdr.hdrSupportPath)
 
         // 2. Verify Pro Mode sets manual overrides
         val manualCaps = ManualSensorCapabilities(

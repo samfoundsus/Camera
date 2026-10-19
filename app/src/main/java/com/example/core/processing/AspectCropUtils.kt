@@ -269,7 +269,8 @@ object AspectCropUtils {
         rotationDegrees: Int,
         aspectRatioMode: AspectRatioMode,
         mirrorHorizontally: Boolean = false,
-        jpegQuality: Int = 95
+        jpegQuality: Int = 95,
+        filterPreset: com.example.core.preferences.CameraFilterPreset = com.example.core.preferences.CameraFilterPreset.ORIGINAL
     ): ProcessedPhotoPayload? {
         if (sourceBytes.isEmpty()) return null
 
@@ -294,9 +295,10 @@ object AspectCropUtils {
 
         val isNativeAspectMatch = abs(cropRect.width() - orientedWidth) <= 2 &&
             abs(cropRect.height() - orientedHeight) <= 2
+        val isFilterIdentity = CameraFilterProcessor.getParameters(filterPreset).isIdentity
 
-        // Fast lossless bypass when no pixel rotation, mirroring, or aspect-ratio cropping is required
-        if (normRot == 0 && !mirrorHorizontally && isNativeAspectMatch) {
+        // Fast lossless bypass when no pixel rotation, mirroring, cropping, or filter is required
+        if (normRot == 0 && !mirrorHorizontally && isNativeAspectMatch && isFilterIdentity) {
             return ProcessedPhotoPayload(
                 jpegBytes = sourceBytes,
                 width = orientedWidth,
@@ -309,32 +311,46 @@ object AspectCropUtils {
         val decodeOptions = BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.ARGB_8888
             inScaled = false
+            inMutable = true
         }
         val decodedBitmap = BitmapFactory.decodeByteArray(sourceBytes, 0, sourceBytes.size, decodeOptions)
             ?: return null
 
         try {
-            val processedBitmap = cropAndOrientBitmap(
+            val croppedBitmap = cropAndOrientBitmap(
                 sourceBitmap = decodedBitmap,
                 aspectRatioMode = aspectRatioMode,
                 rotationDegrees = normRot,
                 mirrorHorizontally = mirrorHorizontally
             )
+            val finalBitmap = if (!isFilterIdentity) {
+                CameraFilterProcessor.applyFilterToBitmap(
+                    source = croppedBitmap,
+                    preset = filterPreset,
+                    intensity = 1.0f,
+                    inPlaceIfMutable = croppedBitmap.isMutable
+                )
+            } else {
+                croppedBitmap
+            }
             try {
                 val outStream = ByteArrayOutputStream(sourceBytes.size.coerceAtLeast(65536))
                 val safeQuality = jpegQuality.coerceIn(85, 100)
-                val compressed = processedBitmap.compress(Bitmap.CompressFormat.JPEG, safeQuality, outStream)
+                val compressed = finalBitmap.compress(Bitmap.CompressFormat.JPEG, safeQuality, outStream)
                 if (!compressed) return null
                 return ProcessedPhotoPayload(
                     jpegBytes = outStream.toByteArray(),
-                    width = processedBitmap.width,
-                    height = processedBitmap.height,
+                    width = finalBitmap.width,
+                    height = finalBitmap.height,
                     wasRecompressed = true,
                     exifOrientation = ExifInterface.ORIENTATION_NORMAL
                 )
             } finally {
-                if (processedBitmap != decodedBitmap && !processedBitmap.isRecycled) {
-                    processedBitmap.recycle()
+                if (finalBitmap != croppedBitmap && finalBitmap != decodedBitmap && !finalBitmap.isRecycled) {
+                    finalBitmap.recycle()
+                }
+                if (croppedBitmap != decodedBitmap && !croppedBitmap.isRecycled) {
+                    croppedBitmap.recycle()
                 }
             }
         } finally {

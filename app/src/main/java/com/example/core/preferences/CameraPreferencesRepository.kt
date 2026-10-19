@@ -98,6 +98,14 @@ class CameraPreferencesRepository(context: Context) {
             HdOutputOption.MAX_NATIVE
         }
 
+        val hdrMode = try {
+            HdrMode.valueOf(
+                prefs.getString(KEY_HDR_MODE, HdrMode.AUTO.name) ?: HdrMode.AUTO.name
+            )
+        } catch (_: Exception) {
+            HdrMode.AUTO
+        }
+
         val portraitRetouch = try {
             PortraitRetouch.valueOf(
                 prefs.getString(KEY_PORTRAIT_RETOUCH, PortraitRetouch.NATURAL.name) ?: PortraitRetouch.NATURAL.name
@@ -130,13 +138,35 @@ class CameraPreferencesRepository(context: Context) {
             NightSightExposure.AUTO
         }
 
-        val timeLapse = try {
-            TimeLapseSpeed.valueOf(
-                prefs.getString(KEY_TIME_LAPSE_SPEED, TimeLapseSpeed.SPEED_10X.name) ?: TimeLapseSpeed.SPEED_10X.name
+        val astroDuration = try {
+            AstroDuration.valueOf(
+                prefs.getString(KEY_ASTRO_DURATION, AstroDuration.AUTO.name) ?: AstroDuration.AUTO.name
             )
         } catch (_: Exception) {
-            TimeLapseSpeed.SPEED_10X
+            AstroDuration.AUTO
         }
+
+        val astroFocus = try {
+            AstroFocusMode.valueOf(
+                prefs.getString(KEY_ASTRO_FOCUS, AstroFocusMode.AUTO.name) ?: AstroFocusMode.AUTO.name
+            )
+        } catch (_: Exception) {
+            AstroFocusMode.AUTO
+        }
+
+        val astroStrategy = try {
+            AstroStrategy.valueOf(
+                prefs.getString(KEY_ASTRO_STRATEGY, AstroStrategy.AUTO.name) ?: AstroStrategy.AUTO.name
+            )
+        } catch (_: Exception) {
+            AstroStrategy.AUTO
+        }
+
+        val astroRaw = prefs.getBoolean(KEY_ASTRO_RAW, false)
+
+        val timeLapse = TimeLapseSpeed.fromStoredName(
+            prefs.getString(KEY_TIME_LAPSE_SPEED, TimeLapseSpeed.SPEED_30X.name)
+        )
 
         val slowMo = try {
             SlowMoSpeed.valueOf(
@@ -145,6 +175,10 @@ class CameraPreferencesRepository(context: Context) {
         } catch (_: Exception) {
             SlowMoSpeed.SPEED_1_4X
         }
+
+        val panoramaDir = PanoramaDirection.fromStoredName(
+            prefs.getString(KEY_PANORAMA_DIRECTION, PanoramaDirection.LEFT_TO_RIGHT.name)
+        )
 
         val proFocusMode = try {
             ProFocusMode.valueOf(
@@ -184,6 +218,10 @@ class CameraPreferencesRepository(context: Context) {
             VolumeButtonAction.VOLUME
         }
 
+        val selectedFilter = CameraFilterPreset.fromStoredName(
+            prefs.getString(KEY_SELECTED_FILTER, CameraFilterPreset.ORIGINAL.name)
+        )
+
         val visibleStr = prefs.getString(KEY_VISIBLE_MODES, CameraPreferences.DEFAULT_VISIBLE_MODE_NAMES.joinToString(","))
         val hiddenStr = prefs.getString(KEY_HIDDEN_MODES, CameraPreferences.DEFAULT_HIDDEN_MODE_NAMES.joinToString(","))
         val visibleList = visibleStr?.split(",")?.filter { it.isNotBlank() }
@@ -203,16 +241,23 @@ class CameraPreferencesRepository(context: Context) {
             saveLocation = location,
             selfieMirror = mirror,
             volumeButtonAction = volumeAction,
+            selectedFilter = selectedFilter,
             videoResolution = videoRes,
             videoFrameRate = videoFps,
             videoStabilization = videoStab,
             hdOutputOption = hdOption,
+            hdrMode = hdrMode,
             portraitRetouch = portraitRetouch,
             portraitBlurLevel = portraitBlurLevel,
             portraitBlurStrength = portraitBlurStrength,
             nightSightExposure = nightExposure,
+            astroDuration = astroDuration,
+            astroFocus = astroFocus,
+            astroStrategy = astroStrategy,
+            astroRawEnabled = astroRaw,
             timeLapseSpeed = timeLapse,
             slowMoSpeed = slowMo,
+            panoramaDirection = panoramaDir,
             proIso = proIso,
             proShutterSpeed = proShutter,
             proFocusMode = proFocusMode,
@@ -308,6 +353,20 @@ class CameraPreferencesRepository(context: Context) {
         _preferences.value = _preferences.value.copy(hdOutputOption = option)
     }
 
+    fun setHdrMode(mode: HdrMode) {
+        prefs.edit().putString(KEY_HDR_MODE, mode.name).apply()
+        _preferences.value = _preferences.value.copy(hdrMode = mode)
+    }
+
+    fun cycleHdrMode() {
+        val next = when (_preferences.value.hdrMode) {
+            HdrMode.AUTO -> HdrMode.ON
+            HdrMode.ON -> HdrMode.OFF
+            HdrMode.OFF -> HdrMode.AUTO
+        }
+        setHdrMode(next)
+    }
+
     fun setPortraitRetouch(retouch: PortraitRetouch) {
         prefs.edit().putString(KEY_PORTRAIT_RETOUCH, retouch.name).apply()
         _preferences.value = _preferences.value.copy(portraitRetouch = retouch)
@@ -343,6 +402,26 @@ class CameraPreferencesRepository(context: Context) {
         _preferences.value = _preferences.value.copy(nightSightExposure = exposure)
     }
 
+    fun setAstroDuration(duration: AstroDuration) {
+        prefs.edit().putString(KEY_ASTRO_DURATION, duration.name).apply()
+        _preferences.value = _preferences.value.copy(astroDuration = duration)
+    }
+
+    fun setAstroFocus(focus: AstroFocusMode) {
+        prefs.edit().putString(KEY_ASTRO_FOCUS, focus.name).apply()
+        _preferences.value = _preferences.value.copy(astroFocus = focus)
+    }
+
+    fun setAstroStrategy(strategy: AstroStrategy) {
+        prefs.edit().putString(KEY_ASTRO_STRATEGY, strategy.name).apply()
+        _preferences.value = _preferences.value.copy(astroStrategy = strategy)
+    }
+
+    fun setAstroRawEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_ASTRO_RAW, enabled).apply()
+        _preferences.value = _preferences.value.copy(astroRawEnabled = enabled)
+    }
+
     fun setTimeLapseSpeed(speed: TimeLapseSpeed) {
         prefs.edit().putString(KEY_TIME_LAPSE_SPEED, speed.name).apply()
         _preferences.value = _preferences.value.copy(timeLapseSpeed = speed)
@@ -351,6 +430,11 @@ class CameraPreferencesRepository(context: Context) {
     fun setSlowMoSpeed(speed: SlowMoSpeed) {
         prefs.edit().putString(KEY_SLOW_MO_SPEED, speed.name).apply()
         _preferences.value = _preferences.value.copy(slowMoSpeed = speed)
+    }
+
+    fun setPanoramaDirection(direction: PanoramaDirection) {
+        prefs.edit().putString(KEY_PANORAMA_DIRECTION, direction.name).apply()
+        _preferences.value = _preferences.value.copy(panoramaDirection = direction)
     }
 
     fun setProIso(iso: String) {
@@ -422,6 +506,15 @@ class CameraPreferencesRepository(context: Context) {
         )
     }
 
+    fun setSelectedFilter(filter: CameraFilterPreset) {
+        prefs.edit().putString(KEY_SELECTED_FILTER, filter.name).apply()
+        _preferences.value = _preferences.value.copy(selectedFilter = filter)
+    }
+
+    fun resetFilter() {
+        setSelectedFilter(CameraFilterPreset.ORIGINAL)
+    }
+
     fun resetProSettings() {
         setProIso("AUTO")
         setProShutterSpeed("AUTO")
@@ -444,16 +537,23 @@ class CameraPreferencesRepository(context: Context) {
         private const val KEY_SAVE_LOCATION = "key_save_location"
         private const val KEY_SELFIE_MIRROR = "key_selfie_mirror"
         private const val KEY_VOLUME_ACTION = "key_volume_button_action"
+        private const val KEY_SELECTED_FILTER = "key_selected_filter"
         private const val KEY_VIDEO_RES = "key_video_resolution"
         private const val KEY_VIDEO_FPS = "key_video_fps"
         private const val KEY_VIDEO_STAB = "key_video_stabilization"
         private const val KEY_HD_OPTION = "key_hd_option"
+        private const val KEY_HDR_MODE = "key_hdr_mode"
         private const val KEY_PORTRAIT_RETOUCH = "key_portrait_retouch"
         private const val KEY_PORTRAIT_BLUR_LEVEL = "key_portrait_blur_level"
         private const val KEY_PORTRAIT_BLUR_STRENGTH = "key_portrait_blur_strength"
         private const val KEY_NIGHT_EXPOSURE = "key_night_exposure"
+        private const val KEY_ASTRO_DURATION = "key_astro_duration"
+        private const val KEY_ASTRO_FOCUS = "key_astro_focus"
+        private const val KEY_ASTRO_STRATEGY = "key_astro_strategy"
+        private const val KEY_ASTRO_RAW = "key_astro_raw"
         private const val KEY_TIME_LAPSE_SPEED = "key_time_lapse_speed"
         private const val KEY_SLOW_MO_SPEED = "key_slow_mo_speed"
+        private const val KEY_PANORAMA_DIRECTION = "key_panorama_direction"
         private const val KEY_PRO_ISO = "key_pro_iso"
         private const val KEY_PRO_SHUTTER = "key_pro_shutter"
         private const val KEY_PRO_FOCUS_MODE = "key_pro_focus_mode"

@@ -39,7 +39,15 @@ import androidx.compose.material3.SheetState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -56,6 +64,10 @@ import com.example.core.preferences.CameraPreferences
 import com.example.core.preferences.FlashMode
 import com.example.core.preferences.GridMode
 import com.example.core.preferences.HdOutputOption
+import com.example.core.preferences.AstroDuration
+import com.example.core.preferences.AstroFocusMode
+import com.example.core.preferences.AstroStrategy
+import com.example.core.preferences.HdrMode
 import com.example.core.preferences.NightSightExposure
 import com.example.core.preferences.PortraitBlurLevel
 import com.example.core.preferences.PortraitRetouch
@@ -63,6 +75,7 @@ import com.example.core.preferences.ProFocusMode
 import com.example.core.preferences.ProRawFormat
 import com.example.core.preferences.SlowMoSpeed
 import com.example.core.preferences.TimeLapseSpeed
+import com.example.core.preferences.PanoramaDirection
 import com.example.core.preferences.TimerMode
 import com.example.core.preferences.VideoStabilizationMode
 
@@ -84,11 +97,13 @@ fun CameraQuickControlsSheet(
     onVideoFpsChanged: (VideoFrameRate) -> Unit = {},
     onVideoStabilizationChanged: (VideoStabilizationMode) -> Unit = {},
     onHdOptionChanged: (HdOutputOption) -> Unit = {},
+    onHdrModeChanged: (HdrMode) -> Unit = {},
     onPortraitRetouchChanged: (PortraitRetouch) -> Unit = {},
     onPortraitBlurLevelChanged: (PortraitBlurLevel) -> Unit = {},
     onNightSightExposureChanged: (NightSightExposure) -> Unit = {},
     onTimeLapseSpeedChanged: (TimeLapseSpeed) -> Unit = {},
     onSlowMoSpeedChanged: (SlowMoSpeed) -> Unit = {},
+    onPanoramaDirectionChanged: (PanoramaDirection) -> Unit = {},
     onProIsoChanged: (String) -> Unit = {},
     onProShutterChanged: (String) -> Unit = {},
     onProFocusModeChanged: (ProFocusMode) -> Unit = {},
@@ -97,7 +112,10 @@ fun CameraQuickControlsSheet(
     onProEvChanged: (Float) -> Unit = {},
     onProRawFormatChanged: (ProRawFormat) -> Unit = {},
     onProHistogramToggled: (Boolean) -> Unit = {},
-    onProFocusPeakingToggled: (Boolean) -> Unit = {}
+    onProFocusPeakingToggled: (Boolean) -> Unit = {},
+    onAstroDurationChanged: (AstroDuration) -> Unit = {},
+    onAstroFocusChanged: (AstroFocusMode) -> Unit = {},
+    onAstroStrategyChanged: (AstroStrategy) -> Unit = {}
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismissRequest,
@@ -266,6 +284,17 @@ fun CameraQuickControlsSheet(
                         optionLabel = { it.displayName },
                         optionTestTag = { "quick_ratio_${it.name.lowercase()}" },
                         onOptionSelected = onAspectRatioChanged
+                    )
+
+                    // HDR+
+                    QuickControlPillSection(
+                        label = "HDR+ Computational",
+                        icon = Icons.Outlined.HighQuality,
+                        options = HdrMode.entries,
+                        selectedOption = preferences.hdrMode,
+                        optionLabel = { it.displayName },
+                        optionTestTag = { "quick_hdr_${it.name.lowercase()}" },
+                        onOptionSelected = onHdrModeChanged
                     )
 
                     // Grid
@@ -700,39 +729,68 @@ fun CameraQuickControlsSheet(
                     )
                 }
 
-                CameraMode.CINEMATIC -> {
-                    // Cinematic Resolution (1080p / 4K)
+                CameraMode.ASTRO -> {
                     QuickControlPillSection(
-                        label = "Video Quality",
-                        icon = Icons.Outlined.Videocam,
-                        options = listOf(VideoResolution.FHD_1080P, VideoResolution.UHD_4K),
-                        selectedOption = if (preferences.videoResolution == VideoResolution.UHD_4K) VideoResolution.UHD_4K else VideoResolution.FHD_1080P,
+                        label = "Astrophotography Duration",
+                        icon = Icons.Outlined.NightsStay,
+                        options = AstroDuration.entries,
+                        selectedOption = preferences.astroDuration,
                         optionLabel = { it.displayName },
-                        onOptionSelected = onVideoResolutionChanged
+                        onOptionSelected = onAstroDurationChanged
                     )
-
-                    // Cinematic Frame Rate: 24 FPS / 30 FPS
                     QuickControlPillSection(
-                        label = "Frame Rate",
-                        icon = Icons.Outlined.Speed,
-                        options = listOf(VideoFrameRate.FPS_24, VideoFrameRate.FPS_30),
-                        selectedOption = if (preferences.videoFrameRate == VideoFrameRate.FPS_24) VideoFrameRate.FPS_24 else VideoFrameRate.FPS_30,
+                        label = "Astro Focus",
+                        icon = Icons.Outlined.NightsStay,
+                        options = AstroFocusMode.entries,
+                        selectedOption = preferences.astroFocus,
                         optionLabel = { it.displayName },
-                        onOptionSelected = onVideoFpsChanged
+                        onOptionSelected = onAstroFocusChanged
                     )
-
-                    // Stabilization
                     QuickControlPillSection(
-                        label = "Stabilization",
-                        icon = Icons.Outlined.Videocam,
-                        options = listOf(VideoStabilizationMode.STANDARD, VideoStabilizationMode.ACTIVE),
-                        selectedOption = preferences.videoStabilization,
+                        label = "Capture Strategy",
+                        icon = Icons.Outlined.ShutterSpeed,
+                        options = AstroStrategy.entries,
+                        selectedOption = preferences.astroStrategy,
                         optionLabel = { it.displayName },
-                        onOptionSelected = onVideoStabilizationChanged
+                        onOptionSelected = onAstroStrategyChanged
+                    )
+                    QuickControlPillSection(
+                        label = "Timer",
+                        icon = Icons.Outlined.Timer,
+                        options = TimerMode.entries,
+                        selectedOption = preferences.timerMode,
+                        optionLabel = { it.displayName },
+                        optionTestTag = { "astro_timer_${it.name.lowercase()}" },
+                        onOptionSelected = onTimerChanged
+                    )
+                    QuickControlPillSection(
+                        label = "Aspect Ratio",
+                        icon = Icons.Outlined.AspectRatio,
+                        options = AspectRatioMode.entries,
+                        selectedOption = preferences.aspectRatioMode,
+                        optionLabel = { it.displayName },
+                        onOptionSelected = onAspectRatioChanged
+                    )
+                    QuickControlPillSection(
+                        label = "Grid",
+                        icon = Icons.Outlined.GridOn,
+                        options = GridMode.entries,
+                        selectedOption = preferences.gridMode,
+                        optionLabel = { it.displayName },
+                        onOptionSelected = onGridChanged
                     )
                 }
 
                 CameraMode.SLOW_MOTION -> {
+                    val activeSlowMoFr = VideoFrameRate.entries.firstOrNull {
+                        it.fps == preferences.slowMoSpeed.expectedFps
+                    } ?: VideoFrameRate.FPS_120
+                    val resolvedSlowMoRes = verifiedLensCaps?.resolveSlowMoResolution(
+                        rate = activeSlowMoFr,
+                        preferred = preferences.videoResolution
+                    ) ?: VideoResolution.FHD_1080P
+                    val slowMoSectionNote = "${preferences.slowMoSpeed.displayName} • ${resolvedSlowMoRes.displayName} output (10s capture → ${(10 * preferences.slowMoSpeed.slowDownFactor).toInt()}s playback)"
+
                     // Slow Motion Speed
                     QuickControlPillSection(
                         label = "Slow Motion Speed",
@@ -740,6 +798,12 @@ fun CameraQuickControlsSheet(
                         options = SlowMoSpeed.entries,
                         selectedOption = preferences.slowMoSpeed,
                         optionLabel = { it.displayName },
+                        optionTestTag = { "slow_mo_speed_${it.expectedFps}" },
+                        isOptionEnabled = { speed ->
+                            val matchingFr = VideoFrameRate.entries.firstOrNull { it.fps == speed.expectedFps }
+                            verifiedLensCaps == null || matchingFr == null || matchingFr in verifiedLensCaps.supportedSlowMoRates
+                        },
+                        supportingNote = slowMoSectionNote,
                         onOptionSelected = onSlowMoSpeedChanged
                     )
 
@@ -763,6 +827,7 @@ fun CameraQuickControlsSheet(
                         options = NightSightExposure.entries,
                         selectedOption = preferences.nightSightExposure,
                         optionLabel = { it.displayName },
+                        optionTestTag = { "night_sight_exposure_option_${it.name.lowercase()}" },
                         onOptionSelected = onNightSightExposureChanged
                     )
 
@@ -776,6 +841,16 @@ fun CameraQuickControlsSheet(
                         onOptionSelected = onTimerChanged
                     )
 
+                    // Aspect Ratio
+                    QuickControlPillSection(
+                        label = "Aspect Ratio",
+                        icon = Icons.Outlined.AspectRatio,
+                        options = AspectRatioMode.entries,
+                        selectedOption = preferences.aspectRatioMode,
+                        optionLabel = { it.displayName },
+                        onOptionSelected = onAspectRatioChanged
+                    )
+
                     // Grid
                     QuickControlPillSection(
                         label = "Grid",
@@ -785,9 +860,49 @@ fun CameraQuickControlsSheet(
                         optionLabel = { it.displayName },
                         onOptionSelected = onGridChanged
                     )
+
+                    // Night Sight Hardware & Processing Capability Card
+                    val nightSightPathLabel = verifiedLensCaps?.nightSightSupportPath?.displayName
+                        ?: com.example.core.camera.NightSightDeviceSupport.resolveNightSightSupportPath(
+                            isHardwareNightSceneSupported = false
+                        ).displayName
+                    val maxBurstFrames = com.example.core.camera.NightSightDeviceSupport.getMaxSupportedFrames()
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("night_sight_capability_card")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Info,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = "$nightSightPathLabel • Up to ${maxBurstFrames}-frame low-light alignment & shadow tone mapping.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 }
 
                 CameraMode.TIME_LAPSE -> {
+                    val activeSpeed = preferences.timeLapseSpeed
+                    val intervalLabel = if (activeSpeed.intervalSeconds >= 1f && activeSpeed.intervalSeconds % 1f == 0f) {
+                        "${activeSpeed.intervalSeconds.toInt()}s"
+                    } else {
+                        String.format(java.util.Locale.US, "%.1fs", activeSpeed.intervalSeconds)
+                    }
+                    val timeLapseNote = "${activeSpeed.shortLabel} (${activeSpeed.description}) • 1 frame every $intervalLabel → ${activeSpeed.multiplier}s capture = 1s video"
+
                     // Time Lapse Speed
                     QuickControlPillSection(
                         label = "Lapse Speed",
@@ -795,6 +910,8 @@ fun CameraQuickControlsSheet(
                         options = TimeLapseSpeed.entries,
                         selectedOption = preferences.timeLapseSpeed,
                         optionLabel = { it.displayName },
+                        optionTestTag = { "time_lapse_quick_speed_${it.multiplier}x" },
+                        supportingNote = timeLapseNote,
                         onOptionSelected = onTimeLapseSpeedChanged
                     )
 
@@ -834,13 +951,24 @@ fun CameraQuickControlsSheet(
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
                                 Text(
-                                    text = "Hold device vertically and pan smoothly along the horizon.",
+                                    text = "Move your phone slowly in one direction along the guide line.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
                     }
+
+                    // Sweep Direction
+                    QuickControlPillSection(
+                        label = "Sweep Direction",
+                        icon = Icons.Outlined.PanoramaHorizontal,
+                        options = PanoramaDirection.entries,
+                        selectedOption = preferences.panoramaDirection,
+                        optionLabel = { it.shortLabel },
+                        optionTestTag = { "panorama_quick_dir_${it.name.lowercase()}" },
+                        onOptionSelected = onPanoramaDirectionChanged
+                    )
 
                     // Grid
                     QuickControlPillSection(
@@ -896,23 +1024,52 @@ private fun <T> QuickControlPillSection(
             options.forEach { option ->
                 val isEnabled = isOptionEnabled(option)
                 val isSelected = option == selectedOption && isEnabled
-                Surface(
-                    color = when {
+
+                val animatedBgColor by animateColorAsState(
+                    targetValue = when {
                         isSelected -> MaterialTheme.colorScheme.primary
                         !isEnabled -> MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.45f)
                         else -> MaterialTheme.colorScheme.surfaceContainerHigh
                     },
+                    animationSpec = com.example.ui.theme.CameraMotionTokens.controlTween(),
+                    label = "pill_bg_color"
+                )
+                val animatedTextColor by animateColorAsState(
+                    targetValue = when {
+                        isSelected -> MaterialTheme.colorScheme.onPrimary
+                        !isEnabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    animationSpec = com.example.ui.theme.CameraMotionTokens.controlTween(),
+                    label = "pill_text_color"
+                )
+
+                val interactionSource = remember { MutableInteractionSource() }
+                val isPressed by interactionSource.collectIsPressedAsState()
+                val scale by animateFloatAsState(
+                    targetValue = if (isPressed && isEnabled) 0.95f else 1.0f,
+                    animationSpec = com.example.ui.theme.CameraMotionTokens.touchSpring(),
+                    label = "pill_scale"
+                )
+
+                val baseModifier = Modifier
+                    .weight(1f)
+                    .scale(scale)
+                val taggedModifier = if (optionTestTag != null) {
+                    baseModifier.testTag(optionTestTag(option))
+                } else {
+                    baseModifier
+                }
+
+                Surface(
+                    color = animatedBgColor,
                     shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .then(
-                            if (optionTestTag != null) {
-                                Modifier.testTag(optionTestTag(option))
-                            } else {
-                                Modifier
-                            }
-                        )
-                        .clickable(enabled = isEnabled) {
+                    modifier = taggedModifier
+                        .clickable(
+                            interactionSource = interactionSource,
+                            indication = ripple(bounded = true, radius = 24.dp),
+                            enabled = isEnabled
+                        ) {
                             if (isEnabled) {
                                 onOptionSelected(option)
                             }
@@ -923,11 +1080,7 @@ private fun <T> QuickControlPillSection(
                         style = MaterialTheme.typography.labelMedium.copy(
                             fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                         ),
-                        color = when {
-                            isSelected -> MaterialTheme.colorScheme.onPrimary
-                            !isEnabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
-                            else -> MaterialTheme.colorScheme.onSurfaceVariant
-                        },
+                        color = animatedTextColor,
                         modifier = Modifier.padding(vertical = 10.dp, horizontal = 2.dp),
                         textAlign = TextAlign.Center,
                         maxLines = 1

@@ -22,9 +22,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -55,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.core.camera.CameraLens
 import com.example.core.camera.LensCapabilities
+import com.example.core.camera.NightSightSupportPath
 import com.example.core.camera.PortraitBlurDeviceSupport
 import com.example.core.camera.PortraitDepthSupportPath
 import com.example.core.camera.ReconciledVideoSettings
@@ -62,13 +68,26 @@ import com.example.core.camera.VideoFrameRate
 import com.example.core.camera.VideoResolution
 import com.example.core.model.CameraMode
 import com.example.core.preferences.AspectRatioMode
+import com.example.core.preferences.HdOutputOption
+import com.example.core.preferences.AstroDuration
+import com.example.core.preferences.AstroFocusMode
+import com.example.core.preferences.AstroStrategy
+import com.example.core.preferences.HdrMode
 import com.example.core.preferences.GridMode
+import com.example.core.preferences.NightSightExposure
 import com.example.core.preferences.PortraitBlurLevel
 import com.example.core.preferences.PortraitRetouch
 import com.example.core.preferences.ProFocusMode
 import com.example.core.preferences.ProRawFormat
 import com.example.core.preferences.TimerMode
+import com.example.core.preferences.TimeLapseSpeed
+import com.example.core.preferences.PanoramaDirection
 import com.example.core.preferences.VideoStabilizationMode
+import com.example.core.preferences.SlowMoSpeed
+import com.example.core.processing.PanoramaCapturePhase
+import com.example.core.processing.PanoramaGuidanceStatus
+import com.example.core.processing.PanoramaLiveState
+import com.example.core.processing.PanoramaProcessor
 
 import android.net.Uri
 import com.example.core.preferences.FlashMode
@@ -83,10 +102,14 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.offset
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.LockOpen
+import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.WbSunny
 import androidx.compose.material3.Slider
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.rememberUpdatedState
@@ -105,6 +128,7 @@ import com.example.core.camera.clampZoomRatio
 import com.example.core.camera.formatEvValue
 import com.example.core.camera.formatZoomRatio
 import com.example.core.camera.generateZoomShortcuts
+import com.example.core.camera.isFocusEvSliderEnabledForMode
 import com.example.core.camera.isTapToFocusEnabledForMode
 import com.example.core.camera.resolveSupportedZoomRange
 import kotlinx.coroutines.delay
@@ -114,7 +138,8 @@ import kotlin.math.roundToInt
 enum class SliderExpansionState {
     NONE,
     BLUR,
-    ZOOM
+    ZOOM,
+    TIME_LAPSE_SPEED
 }
 
 fun zoomShortcutTag(ratio: Float): String {
@@ -169,6 +194,31 @@ fun CameraPreviewPlaceholder(
     portraitDepthSupportPath: PortraitDepthSupportPath = PortraitDepthSupportPath.ON_DEVICE_SEGMENTATION_ONLY,
     onPortraitBlurLevelChanged: ((PortraitBlurLevel) -> Unit)? = null,
     onPortraitBlurStrengthChanged: ((Float) -> Unit)? = null,
+    nightSightExposure: NightSightExposure = NightSightExposure.AUTO,
+    astroDuration: AstroDuration = AstroDuration.AUTO,
+    astroFocus: AstroFocusMode = AstroFocusMode.AUTO,
+    astroStrategy: AstroStrategy = AstroStrategy.AUTO,
+    hdOutputOption: HdOutputOption = HdOutputOption.MAX_NATIVE,
+    slowMoSpeed: SlowMoSpeed = SlowMoSpeed.SPEED_1_4X,
+    timeLapseSpeed: TimeLapseSpeed = TimeLapseSpeed.SPEED_30X,
+    onTimeLapseSpeedChanged: ((TimeLapseSpeed) -> Unit)? = null,
+    panoramaDirection: PanoramaDirection = PanoramaDirection.LEFT_TO_RIGHT,
+    onPanoramaDirectionChanged: ((PanoramaDirection) -> Unit)? = null,
+    panoramaLiveState: PanoramaLiveState = PanoramaLiveState(direction = panoramaDirection),
+    isPanoramaCapturingRequested: Boolean = false,
+    panoramaFinishTrigger: Int = 0,
+    panoramaCancelTrigger: Int = 0,
+    panoramaStepTrigger: Int = 0,
+    onPanoramaStateChanged: ((PanoramaLiveState) -> Unit)? = null,
+    onStartPanoramaCapture: (() -> Unit)? = null,
+    onFinishPanoramaCapture: (() -> Unit)? = null,
+    onCancelPanoramaCapture: (() -> Unit)? = null,
+    onStepPanoramaCapture: (() -> Unit)? = null,
+    hdrMode: com.example.core.preferences.HdrMode = com.example.core.preferences.HdrMode.AUTO,
+    selectedFilter: com.example.core.preferences.CameraFilterPreset = com.example.core.preferences.CameraFilterPreset.ORIGINAL,
+    onFilterBadgeClick: (() -> Unit)? = null,
+    nightSightSupportPath: NightSightSupportPath = NightSightSupportPath.MULTI_FRAME_LOW_LIGHT_FUSION,
+    onNightSightExposureChanged: ((NightSightExposure) -> Unit)? = null,
     photoCaptureTrigger: Int = 0,
     onCapabilitiesDiscovered: ((Map<CameraLens, LensCapabilities>) -> Unit)? = null,
     onVideoConfigApplied: ((ReconciledVideoSettings) -> Unit)? = null,
@@ -181,6 +231,7 @@ fun CameraPreviewPlaceholder(
     onRecordingDurationChanged: ((Long) -> Unit)? = null,
     onRecordingSuccess: ((Uri) -> Unit)? = null,
     onRecordingError: ((String) -> Unit)? = null,
+    onCountdownStateChanged: ((Boolean, Int) -> Unit)? = null,
     modifier: Modifier = Modifier,
     onPreviewClick: (() -> Unit)? = null
 ) {
@@ -209,8 +260,10 @@ fun CameraPreviewPlaceholder(
 
     val safeEvMin = minOf(evIndexRange.first, evIndexRange.last)
     val safeEvMax = maxOf(evIndexRange.first, evIndexRange.last)
+    val isFocusEvEnabledForMode = isFocusEvSliderEnabledForMode(activeMode)
     val effectiveEvSupported = isExposureCompensationSupported && (safeEvMin < 0 || safeEvMax > 0)
     val safeEvRange = safeEvMin..safeEvMax
+    val effectiveFilter = com.example.core.processing.CameraFilterProcessor.resolveEffectiveFilter(activeMode, selectedFilter)
 
     // Clear stale focus regions, focus lock, and automatic exposure state when switching camera lens or mode
     LaunchedEffect(activeLens, activeMode) {
@@ -257,7 +310,7 @@ fun CameraPreviewPlaceholder(
             ) {
                 focusIndicatorStatus = when {
                     isAutoFocusSupported -> FocusIndicatorStatus.FOCUSED
-                    isAutoExposureSupported || effectiveEvSupported -> FocusIndicatorStatus.METERING_ONLY
+                    isAutoExposureSupported || (effectiveEvSupported && isFocusEvEnabledForMode) -> FocusIndicatorStatus.METERING_ONLY
                     else -> FocusIndicatorStatus.UNSUPPORTED
                 }
             }
@@ -285,6 +338,8 @@ fun CameraPreviewPlaceholder(
     val latestIsFocusLockSupported by rememberUpdatedState(isFocusLockSupported)
     val latestEffectiveEvSupported by rememberUpdatedState(effectiveEvSupported)
     val latestPreviewPixelSize by rememberUpdatedState(previewPixelSize)
+
+    val latestIsFocusEvEnabledForMode by rememberUpdatedState(isFocusEvEnabledForMode)
 
     // Tracks whether a pointer gesture began inside a child control overlay (zoom bar, zoom slider, exposure panel)
     val childOverlayTouchTracker = remember {
@@ -314,17 +369,18 @@ fun CameraPreviewPlaceholder(
             autoExposureIndex = 0
             latestOnExposureIndexChanged?.invoke(0)
 
+            val canUseEvFallback = latestEffectiveEvSupported && latestIsFocusEvEnabledForMode
             activeFocusRequest = req
             focusIndicatorStatus = if (isLock) {
                 when {
                     latestIsAutoFocusSupported && latestIsFocusLockSupported -> FocusIndicatorStatus.LOCKED
-                    latestIsAutoExposureSupported || latestEffectiveEvSupported -> FocusIndicatorStatus.LOCKED_METERING_ONLY
+                    latestIsAutoExposureSupported || canUseEvFallback -> FocusIndicatorStatus.LOCKED_METERING_ONLY
                     else -> FocusIndicatorStatus.UNSUPPORTED
                 }
             } else {
                 when {
                     latestIsAutoFocusSupported -> FocusIndicatorStatus.FOCUSING
-                    latestIsAutoExposureSupported || latestEffectiveEvSupported -> FocusIndicatorStatus.METERING_ONLY
+                    latestIsAutoExposureSupported || canUseEvFallback -> FocusIndicatorStatus.METERING_ONLY
                     else -> FocusIndicatorStatus.UNSUPPORTED
                 }
             }
@@ -574,8 +630,23 @@ fun CameraPreviewPlaceholder(
                     portraitBlurLevel = portraitBlurLevel,
                     portraitBlurStrength = portraitBlurStrength,
                     portraitRetouch = portraitRetouch,
+                    nightSightExposure = nightSightExposure,
+                    astroDuration = astroDuration,
+                    astroFocus = astroFocus,
+                    astroStrategy = astroStrategy,
+                    hdOutputOption = hdOutputOption,
+                    slowMoSpeed = slowMoSpeed,
+                    timeLapseSpeed = timeLapseSpeed,
+                    panoramaDirection = panoramaDirection,
+                    isPanoramaCapturingRequested = isPanoramaCapturingRequested,
+                    panoramaFinishTrigger = panoramaFinishTrigger,
+                    panoramaCancelTrigger = panoramaCancelTrigger,
+                    panoramaStepTrigger = panoramaStepTrigger,
+                    onPanoramaStateChanged = onPanoramaStateChanged,
+                    selectedFilter = effectiveFilter,
+                    hdrMode = hdrMode,
                     focusTouchRequest = if (isTapToFocusEnabledForMode(activeMode)) activeFocusRequest else null,
-                    autoExposureIndex = if (isTapToFocusEnabledForMode(activeMode)) autoExposureIndex else 0,
+                    autoExposureIndex = if (isFocusEvEnabledForMode) autoExposureIndex else 0,
                     proEv = proEv,
                     isSelfieMirrorEnabled = isSelfieMirrorEnabled,
                     isSaveLocationEnabled = isSaveLocationEnabled,
@@ -594,7 +665,7 @@ fun CameraPreviewPlaceholder(
                         }
                     },
                     onExposureIndexApplied = { appliedIdx ->
-                        if (isTapToFocusEnabledForMode(activeMode) && appliedIdx != autoExposureIndex) {
+                        if (isFocusEvEnabledForMode && appliedIdx != autoExposureIndex) {
                             autoExposureIndex = appliedIdx
                             autoExposureSliderFloat = appliedIdx.toFloat()
                             onExposureIndexChanged?.invoke(appliedIdx)
@@ -606,6 +677,7 @@ fun CameraPreviewPlaceholder(
                     onRecordingDurationChanged = onRecordingDurationChanged,
                     onRecordingSuccess = onRecordingSuccess,
                     onRecordingError = onRecordingError,
+                    onCountdownStateChanged = onCountdownStateChanged,
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
@@ -718,8 +790,41 @@ fun CameraPreviewPlaceholder(
                         )
                         val minutes = recordingDurationSeconds / 60
                         val seconds = recordingDurationSeconds % 60
+                        val recText = when (activeMode) {
+                            CameraMode.SLOW_MOTION -> {
+                                val slowOutTotalSeconds = (recordingDurationSeconds * slowMoSpeed.slowDownFactor).toLong()
+                                val outMin = slowOutTotalSeconds / 60
+                                val outSec = slowOutTotalSeconds % 60
+                                String.format(
+                                    Locale.US,
+                                    "REC • %02d:%02d → %02d:%02d (%d FPS)",
+                                    minutes,
+                                    seconds,
+                                    outMin,
+                                    outSec,
+                                    slowMoSpeed.expectedFps
+                                )
+                            }
+                            CameraMode.TIME_LAPSE -> {
+                                val tlOutSeconds = recordingDurationSeconds / timeLapseSpeed.multiplier.toLong().coerceAtLeast(1L)
+                                val outMin = tlOutSeconds / 60
+                                val outSec = tlOutSeconds % 60
+                                String.format(
+                                    Locale.US,
+                                    "REC • %02d:%02d → %02d:%02d (%s)",
+                                    minutes,
+                                    seconds,
+                                    outMin,
+                                    outSec,
+                                    timeLapseSpeed.shortLabel
+                                )
+                            }
+                            else -> {
+                                String.format(Locale.US, "REC • %02d:%02d", minutes, seconds)
+                            }
+                        }
                         Text(
-                            text = String.format(Locale.US, "REC • %02d:%02d", minutes, seconds),
+                            text = recText,
                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                             color = Color.White
                         )
@@ -745,40 +850,561 @@ fun CameraPreviewPlaceholder(
                 }
             }
 
+            // Active color filter indicator pill in live preview (enabled strictly in PHOTO and VIDEO modes)
+            if (activeMode.supportsFilters && !effectiveFilter.isOriginal) {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.72f),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)),
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(start = 14.dp, bottom = 14.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(enabled = onFilterBadgeClick != null) {
+                            childOverlayTouchTracker.isTouchInsideChild = true
+                            onFilterBadgeClick?.invoke()
+                        }
+                        .testTag("preview_active_filter_badge")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary)
+                        )
+                        Text(
+                            text = selectedFilter.displayName,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = Color.White
+                        )
+                    }
+                }
+            }
+
             // Mode-specific Viewfinder Guidance
             when (activeMode) {
                 CameraMode.PANORAMA -> {
-                    Column(
+                    val phase = panoramaLiveState.phase
+                    val activeDir = panoramaLiveState.direction
+                    val guidance = panoramaLiveState.guidanceStatus
+                    val isWarning = guidance.isWarning || panoramaLiveState.isCaptureLagging
+                    val driftNorm = if (phase == PanoramaCapturePhase.IDLE) {
+                        0f
+                    } else {
+                        panoramaLiveState.alignmentDriftNormalized.coerceIn(-1f, 1f)
+                    }
+                    val progressFraction = if (phase == PanoramaCapturePhase.IDLE) {
+                        0f
+                    } else {
+                        panoramaLiveState.progress.coerceIn(0f, 1f)
+                    }
+                    val coverageFraction = if (phase == PanoramaCapturePhase.IDLE) {
+                        0f
+                    } else {
+                        panoramaLiveState.capturedCoverage.coerceIn(0f, 1f)
+                    }
+                    val trackOffset = PanoramaProcessor.computeArrowTrackOffset(activeDir, progressFraction)
+                    val progressPercent = (progressFraction * 100f).roundToInt()
+
+                    Box(
                         modifier = Modifier
-                            .align(Alignment.Center)
-                            .padding(horizontal = 24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                            .fillMaxSize()
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .testTag("panorama_overlay_container")
                     ) {
-                        Canvas(modifier = Modifier.fillMaxWidth(0.8f).height(24.dp)) {
-                            val midY = size.height / 2f
-                            drawLine(
-                                color = Color.White.copy(alpha = 0.5f),
-                                start = Offset(0f, midY),
-                                end = Offset(size.width, midY),
-                                strokeWidth = 2.dp.toPx()
-                            )
-                            drawCircle(
-                                color = Color.White,
-                                radius = 6.dp.toPx(),
-                                center = Offset(size.width / 2f, midY)
-                            )
-                        }
-                        Surface(
-                            color = Color.Black.copy(alpha = 0.65f),
-                            shape = RoundedCornerShape(12.dp)
+                        // Top instruction & live warning pill
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 36.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Text(
-                                text = "Pan horizontally to capture wide panorama",
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
-                                color = Color.White.copy(alpha = 0.9f),
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
+                            Surface(
+                                color = if (isWarning) {
+                                    Color(0xFFD84315).copy(alpha = 0.92f)
+                                } else {
+                                    Color.Black.copy(alpha = 0.74f)
+                                },
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (isWarning) Color(0xFFFFAB91) else Color.White.copy(alpha = 0.22f)
+                                ),
+                                modifier = Modifier.testTag(
+                                    if (isWarning) "panorama_warning_badge" else "panorama_instruction_card"
+                                )
+                            ) {
+                                val displayInstruction = when {
+                                    phase == PanoramaCapturePhase.IDLE -> "Move your phone slowly in one direction"
+                                    phase == PanoramaCapturePhase.PROCESSING -> "Stitching panorama…"
+                                    panoramaLiveState.isCaptureLagging && guidance != PanoramaGuidanceStatus.WRONG_DIRECTION ->
+                                        PanoramaGuidanceStatus.TOO_FAST.instructionText
+                                    else -> guidance.instructionText
+                                }
+                                Text(
+                                    text = displayInstruction,
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = Color.White,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier
+                                        .padding(horizontal = 14.dp, vertical = 7.dp)
+                                        .testTag("panorama_instruction_text")
+                                )
+                            }
+
+                            if (phase == PanoramaCapturePhase.CAPTURING) {
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.68f),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.testTag("panorama_progress_indicator")
+                                ) {
+                                    Text(
+                                        text = "${panoramaLiveState.capturedFrameCount} / ${panoramaLiveState.targetFrameCount} frames • $progressPercent% (${activeDir.shortLabel})",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                        color = Color(0xFF80CBC4),
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        // Direction-Aware Progress Track & Moving Arrow Indicator
+                        val arrowIconVector = when (activeDir) {
+                            PanoramaDirection.LEFT_TO_RIGHT -> Icons.AutoMirrored.Filled.ArrowForward
+                            PanoramaDirection.RIGHT_TO_LEFT -> Icons.AutoMirrored.Filled.ArrowBack
+                            PanoramaDirection.TOP_TO_BOTTOM -> Icons.Filled.ArrowDownward
+                            PanoramaDirection.BOTTOM_TO_TOP -> Icons.Filled.ArrowUpward
+                        }
+                        val isAligned = abs(driftNorm) <= PanoramaProcessor.MAX_DRIFT_WARNING_THRESHOLD && !isWarning
+                        val arrowContainerColor = if (isAligned) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            Color(0xFFFF7043)
+                        }
+                        val arrowContentColor = if (isAligned) {
+                            MaterialTheme.colorScheme.onPrimary
+                        } else {
+                            Color.White
+                        }
+
+                        if (activeDir.isHorizontal) {
+                            // HORIZONTAL PROGRESS TRACK (LEFT_TO_RIGHT or RIGHT_TO_LEFT)
+                            Column(
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .fillMaxWidth(0.88f)
+                                    .testTag("panorama_alignment_guide"),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.58f),
+                                    shape = RoundedCornerShape(16.dp),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (isWarning) Color(0xFFFF7043) else Color.White.copy(alpha = 0.35f)
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(56.dp)
+                                        .testTag("panorama_track_horizontal")
+                                ) {
+                                    BoxWithConstraints(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                                    ) {
+                                        val density = LocalDensity.current
+                                        val arrowSizeDp = 36.dp
+                                        val arrowSizePx = with(density) { arrowSizeDp.toPx() }
+                                        val trackWidthPx = constraints.maxWidth.toFloat()
+                                        val trackHeightPx = constraints.maxHeight.toFloat()
+                                        val usableSpanPx = (trackWidthPx - arrowSizePx).coerceAtLeast(0f)
+                                        val arrowXpx = (usableSpanPx * trackOffset).roundToInt()
+                                        val maxDriftOffsetPx = ((trackHeightPx - arrowSizePx) * 0.5f).coerceAtLeast(0f)
+                                        val arrowYpx = (((trackHeightPx - arrowSizePx) * 0.5f) + driftNorm * maxDriftOffsetPx)
+                                            .coerceIn(0f, (trackHeightPx - arrowSizePx).coerceAtLeast(0f))
+                                            .roundToInt()
+
+                                        Canvas(modifier = Modifier.fillMaxSize()) {
+                                            val midY = size.height / 2f
+
+                                            // Swept progress highlight from active starting endpoint
+                                            val fillW = (size.width * progressFraction).coerceIn(0f, size.width)
+                                            val fillStartX = if (activeDir == PanoramaDirection.RIGHT_TO_LEFT) {
+                                                size.width - fillW
+                                            } else {
+                                                0f
+                                            }
+                                            if (fillW > 1f) {
+                                                drawRect(
+                                                    color = arrowContainerColor.copy(alpha = 0.24f),
+                                                    topLeft = Offset(fillStartX, 0f),
+                                                    size = androidx.compose.ui.geometry.Size(fillW, size.height)
+                                                )
+                                            }
+
+                                            // Usable frame coverage sub-bar along bottom edge
+                                            val covW = (size.width * coverageFraction).coerceIn(0f, size.width)
+                                            val covStartX = if (activeDir == PanoramaDirection.RIGHT_TO_LEFT) {
+                                                size.width - covW
+                                            } else {
+                                                0f
+                                            }
+                                            if (covW > 1f) {
+                                                drawRect(
+                                                    color = Color(0xFF80CBC4).copy(alpha = 0.55f),
+                                                    topLeft = Offset(covStartX, size.height - 3.dp.toPx()),
+                                                    size = androidx.compose.ui.geometry.Size(covW, 3.dp.toPx())
+                                                )
+                                            }
+
+                                            // Center horizontal alignment rail
+                                            drawLine(
+                                                color = Color.White.copy(alpha = 0.55f),
+                                                start = Offset(0f, midY),
+                                                end = Offset(size.width, midY),
+                                                strokeWidth = 2.dp.toPx()
+                                            )
+
+                                            // Start and End tick marks
+                                            val tickHalfH = 7.dp.toPx()
+                                            drawLine(
+                                                color = Color.White.copy(alpha = 0.75f),
+                                                start = Offset(2.dp.toPx(), midY - tickHalfH),
+                                                end = Offset(2.dp.toPx(), midY + tickHalfH),
+                                                strokeWidth = 2.dp.toPx()
+                                            )
+                                            drawLine(
+                                                color = Color.White.copy(alpha = 0.75f),
+                                                start = Offset(size.width - 2.dp.toPx(), midY - tickHalfH),
+                                                end = Offset(size.width - 2.dp.toPx(), midY + tickHalfH),
+                                                strokeWidth = 2.dp.toPx()
+                                            )
+                                        }
+
+                                        // Directional Arrow Indicator (never starts in the center)
+                                        Surface(
+                                            color = arrowContainerColor,
+                                            shape = CircleShape,
+                                            border = BorderStroke(1.5.dp, Color.White),
+                                            shadowElevation = 4.dp,
+                                            modifier = Modifier
+                                                .offset { IntOffset(arrowXpx, arrowYpx) }
+                                                .size(arrowSizeDp)
+                                                .testTag("panorama_arrow_indicator")
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    imageVector = arrowIconVector,
+                                                    contentDescription = "Panorama arrow pointing ${activeDir.arrowDirectionName}",
+                                                    tint = arrowContentColor,
+                                                    modifier = Modifier
+                                                        .size(20.dp)
+                                                        .testTag("panorama_arrow_direction_${activeDir.arrowDirectionName.lowercase()}")
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Text(
+                                    text = "Sweep Direction: ${activeDir.shortLabel}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                                    color = Color.White.copy(alpha = 0.90f)
+                                )
+                            }
+                        } else {
+                            // VERTICAL PROGRESS TRACK (TOP_TO_BOTTOM or BOTTOM_TO_TOP)
+                            Column(
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .padding(vertical = 8.dp)
+                                    .testTag("panorama_alignment_guide"),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.58f),
+                                    shape = RoundedCornerShape(16.dp),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (isWarning) Color(0xFFFF7043) else Color.White.copy(alpha = 0.35f)
+                                    ),
+                                    modifier = Modifier
+                                        .width(48.dp)
+                                        .height(168.dp)
+                                        .testTag("panorama_track_vertical")
+                                ) {
+                                    BoxWithConstraints(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(horizontal = 6.dp, vertical = 10.dp)
+                                    ) {
+                                        val density = LocalDensity.current
+                                        val arrowSizeDp = 36.dp
+                                        val arrowSizePx = with(density) { arrowSizeDp.toPx() }
+                                        val trackWidthPx = constraints.maxWidth.toFloat()
+                                        val trackHeightPx = constraints.maxHeight.toFloat()
+                                        val usableSpanPx = (trackHeightPx - arrowSizePx).coerceAtLeast(0f)
+                                        val arrowYpx = (usableSpanPx * trackOffset).roundToInt()
+                                        val maxDriftOffsetPx = ((trackWidthPx - arrowSizePx) * 0.5f).coerceAtLeast(0f)
+                                        val arrowXpx = (((trackWidthPx - arrowSizePx) * 0.5f) + driftNorm * maxDriftOffsetPx)
+                                            .coerceIn(0f, (trackWidthPx - arrowSizePx).coerceAtLeast(0f))
+                                            .roundToInt()
+
+                                        Canvas(modifier = Modifier.fillMaxSize()) {
+                                            val midX = size.width / 2f
+
+                                            // Swept progress highlight from active vertical endpoint
+                                            val fillH = (size.height * progressFraction).coerceIn(0f, size.height)
+                                            val fillStartY = if (activeDir == PanoramaDirection.BOTTOM_TO_TOP) {
+                                                size.height - fillH
+                                            } else {
+                                                0f
+                                            }
+                                            if (fillH > 1f) {
+                                                drawRect(
+                                                    color = arrowContainerColor.copy(alpha = 0.24f),
+                                                    topLeft = Offset(0f, fillStartY),
+                                                    size = androidx.compose.ui.geometry.Size(size.width, fillH)
+                                                )
+                                            }
+
+                                            // Usable frame coverage sub-bar along right edge
+                                            val covH = (size.height * coverageFraction).coerceIn(0f, size.height)
+                                            val covStartY = if (activeDir == PanoramaDirection.BOTTOM_TO_TOP) {
+                                                size.height - covH
+                                            } else {
+                                                0f
+                                            }
+                                            if (covH > 1f) {
+                                                drawRect(
+                                                    color = Color(0xFF80CBC4).copy(alpha = 0.55f),
+                                                    topLeft = Offset(size.width - 3.dp.toPx(), covStartY),
+                                                    size = androidx.compose.ui.geometry.Size(3.dp.toPx(), covH)
+                                                )
+                                            }
+
+                                            // Center vertical alignment rail
+                                            drawLine(
+                                                color = Color.White.copy(alpha = 0.55f),
+                                                start = Offset(midX, 0f),
+                                                end = Offset(midX, size.height),
+                                                strokeWidth = 2.dp.toPx()
+                                            )
+
+                                            // Top and Bottom endpoint tick marks
+                                            val tickHalfW = 7.dp.toPx()
+                                            drawLine(
+                                                color = Color.White.copy(alpha = 0.75f),
+                                                start = Offset(midX - tickHalfW, 2.dp.toPx()),
+                                                end = Offset(midX + tickHalfW, 2.dp.toPx()),
+                                                strokeWidth = 2.dp.toPx()
+                                            )
+                                            drawLine(
+                                                color = Color.White.copy(alpha = 0.75f),
+                                                start = Offset(midX - tickHalfW, size.height - 2.dp.toPx()),
+                                                end = Offset(midX + tickHalfW, size.height - 2.dp.toPx()),
+                                                strokeWidth = 2.dp.toPx()
+                                            )
+                                        }
+
+                                        // Directional Arrow Indicator (never starts in the center)
+                                        Surface(
+                                            color = arrowContainerColor,
+                                            shape = CircleShape,
+                                            border = BorderStroke(1.5.dp, Color.White),
+                                            shadowElevation = 4.dp,
+                                            modifier = Modifier
+                                                .offset { IntOffset(arrowXpx, arrowYpx) }
+                                                .size(arrowSizeDp)
+                                                .testTag("panorama_arrow_indicator")
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    imageVector = arrowIconVector,
+                                                    contentDescription = "Panorama arrow pointing ${activeDir.arrowDirectionName}",
+                                                    tint = arrowContentColor,
+                                                    modifier = Modifier
+                                                        .size(20.dp)
+                                                        .testTag("panorama_arrow_direction_${activeDir.arrowDirectionName.lowercase()}")
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Text(
+                                    text = "Sweep Direction: ${activeDir.shortLabel}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                                    color = Color.White.copy(alpha = 0.90f)
+                                )
+                            }
+                        }
+
+                        // Processing overlay when stitching frames
+                        if (phase == PanoramaCapturePhase.PROCESSING) {
+                            Surface(
+                                color = Color.Black.copy(alpha = 0.86f),
+                                shape = RoundedCornerShape(18.dp),
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .testTag("panorama_processing_indicator")
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    androidx.compose.material3.CircularProgressIndicator(
+                                        color = MaterialTheme.colorScheme.primary,
+                                        strokeWidth = 3.dp,
+                                        modifier = Modifier.size(32.dp)
+                                    )
+                                    Text(
+                                        text = "Stitching panorama…",
+                                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                        color = Color.White
+                                    )
+                                }
+                            }
+                        }
+
+                        // Bottom Panorama Controls (Direction selector in IDLE; Cancel / Capture Slice / Finish in CAPTURING)
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 6.dp)
+                                .pointerInput(Unit) {
+                                    awaitEachGesture {
+                                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Main)
+                                        childOverlayTouchTracker.isTouchInsideChild = true
+                                    }
+                                },
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (phase == PanoramaCapturePhase.IDLE) {
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.72f),
+                                    shape = RoundedCornerShape(24.dp),
+                                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.16f)),
+                                    modifier = Modifier.testTag("panorama_direction_selector_row")
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        PanoramaDirection.entries.forEach { dir ->
+                                            val isSelected = dir == activeDir
+                                            Box(
+                                                modifier = Modifier
+                                                    .minimumInteractiveComponentSize()
+                                                    .clip(RoundedCornerShape(18.dp))
+                                                    .background(
+                                                        if (isSelected) MaterialTheme.colorScheme.primary
+                                                        else Color.Transparent
+                                                    )
+                                                    .clickable {
+                                                        onPanoramaDirectionChanged?.invoke(dir)
+                                                    }
+                                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                                                    .testTag("panorama_direction_${dir.name.lowercase()}"),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Text(
+                                                    text = dir.shortLabel,
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                                        fontSize = 11.sp
+                                                    ),
+                                                    color = if (isSelected) {
+                                                        MaterialTheme.colorScheme.onPrimary
+                                                    } else {
+                                                        Color.White.copy(alpha = 0.85f)
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if (phase == PanoramaCapturePhase.CAPTURING) {
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // Cancel panorama button
+                                    Surface(
+                                        color = Color.Black.copy(alpha = 0.78f),
+                                        shape = RoundedCornerShape(22.dp),
+                                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
+                                        modifier = Modifier
+                                            .minimumInteractiveComponentSize()
+                                            .clip(RoundedCornerShape(22.dp))
+                                            .clickable {
+                                                onCancelPanoramaCapture?.invoke()
+                                            }
+                                            .testTag("panorama_cancel_button")
+                                    ) {
+                                        Text(
+                                            text = "Cancel",
+                                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                            color = Color.White,
+                                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                                        )
+                                    }
+
+                                    // Capture next overlapping slice button
+                                    Surface(
+                                        color = Color.Black.copy(alpha = 0.78f),
+                                        shape = RoundedCornerShape(22.dp),
+                                        border = BorderStroke(1.dp, Color(0xFF80CBC4).copy(alpha = 0.55f)),
+                                        modifier = Modifier
+                                            .minimumInteractiveComponentSize()
+                                            .clip(RoundedCornerShape(22.dp))
+                                            .clickable {
+                                                onStepPanoramaCapture?.invoke()
+                                            }
+                                            .testTag("panorama_step_button")
+                                    ) {
+                                        Text(
+                                            text = "Capture Slice (${panoramaLiveState.capturedFrameCount}/${panoramaLiveState.targetFrameCount})",
+                                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                            color = Color(0xFF80CBC4),
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                                        )
+                                    }
+
+                                    // Finish & stitch button
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.primary,
+                                        shape = RoundedCornerShape(22.dp),
+                                        modifier = Modifier
+                                            .minimumInteractiveComponentSize()
+                                            .clip(RoundedCornerShape(22.dp))
+                                            .clickable {
+                                                onFinishPanoramaCapture?.invoke()
+                                            }
+                                            .testTag("panorama_finish_button")
+                                    ) {
+                                        Text(
+                                            text = "Finish",
+                                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                            color = MaterialTheme.colorScheme.onPrimary,
+                                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1371,6 +1997,215 @@ fun CameraPreviewPlaceholder(
                         }
                     }
 
+                    // Night Sight Exposure Controls (Off, Auto, Max) integrated cleanly above zoom controls
+                    if (activeMode == CameraMode.NIGHT_SIGHT) {
+                        Box(
+                            modifier = Modifier
+                                .testTag("night_sight_exposure_selector_bar")
+                                .clip(RoundedCornerShape(24.dp))
+                                .background(Color.Black.copy(alpha = 0.65f))
+                                .border(BorderStroke(1.dp, Color.White.copy(alpha = 0.14f)), RoundedCornerShape(24.dp))
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                NightSightExposure.entries.forEach { exposureOption ->
+                                    val isSelected = nightSightExposure == exposureOption
+                                    Box(
+                                        modifier = Modifier
+                                            .testTag("night_sight_exposure_pill_${exposureOption.name.lowercase(Locale.US)}")
+                                            .clip(CircleShape)
+                                            .background(
+                                                if (isSelected) {
+                                                    MaterialTheme.colorScheme.primaryContainer
+                                                } else {
+                                                    Color.Transparent
+                                                }
+                                            )
+                                            .clickable {
+                                                childOverlayTouchTracker.isTouchInsideChild = true
+                                                onNightSightExposureChanged?.invoke(exposureOption)
+                                            }
+                                            .padding(horizontal = 10.dp, vertical = 5.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = exposureOption.displayName,
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontSize = 11.sp,
+                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                                            ),
+                                            color = if (isSelected) {
+                                                MaterialTheme.colorScheme.onPrimaryContainer
+                                            } else {
+                                                Color.White.copy(alpha = 0.85f)
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Time Lapse Compact Speed Shortcut & Anchored Popup Menu immediately above Zoom Shortcuts
+                    if (activeMode == CameraMode.TIME_LAPSE) {
+                        val isPopupOpen = expandedSliderState == SliderExpansionState.TIME_LAPSE_SPEED
+
+                        if (isPopupOpen) {
+                            val speedRows = remember { TimeLapseSpeed.entries.chunked(4) }
+                            val intervalFormatted = if (timeLapseSpeed.intervalSeconds >= 1f && timeLapseSpeed.intervalSeconds % 1f == 0f) {
+                                "${timeLapseSpeed.intervalSeconds.toInt()}s"
+                            } else {
+                                String.format(Locale.US, "%.1fs", timeLapseSpeed.intervalSeconds)
+                            }
+
+                            Surface(
+                                color = Color.Black.copy(alpha = 0.84f),
+                                shape = RoundedCornerShape(20.dp),
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.18f)),
+                                modifier = Modifier
+                                    .widthIn(max = 340.dp)
+                                    .testTag("time_lapse_speed_popup")
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = "${timeLapseSpeed.description} • 1 frame / $intervalFormatted",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Medium
+                                        ),
+                                        color = Color.White.copy(alpha = 0.78f),
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.testTag("time_lapse_speed_popup_subtitle")
+                                    )
+
+                                    speedRows.forEach { rowSpeeds ->
+                                        Row(
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            rowSpeeds.forEach { option ->
+                                                val isSelected = option == timeLapseSpeed
+                                                Box(
+                                                    modifier = Modifier
+                                                        .minimumInteractiveComponentSize()
+                                                        .clip(RoundedCornerShape(16.dp))
+                                                        .background(
+                                                            if (isSelected) {
+                                                                MaterialTheme.colorScheme.primaryContainer
+                                                            } else {
+                                                                Color.White.copy(alpha = 0.10f)
+                                                            }
+                                                        )
+                                                        .clickable {
+                                                            childOverlayTouchTracker.isTouchInsideChild = true
+                                                            onTimeLapseSpeedChanged?.invoke(option)
+                                                            expandedSliderState = SliderExpansionState.NONE
+                                                        }
+                                                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                                                        .testTag("time_lapse_speed_option_${option.multiplier}x"),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Text(
+                                                        text = option.shortLabel,
+                                                        style = MaterialTheme.typography.labelMedium.copy(
+                                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                                                        ),
+                                                        color = if (isSelected) {
+                                                            MaterialTheme.colorScheme.onPrimaryContainer
+                                                        } else {
+                                                            Color.White
+                                                        }
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Compact single Time Lapse Speed Selector pill immediately above zoom shortcuts
+                        Box(
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .clip(RoundedCornerShape(22.dp))
+                                .background(
+                                    if (isPopupOpen) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        Color.Black.copy(alpha = 0.68f)
+                                    }
+                                )
+                                .border(
+                                    BorderStroke(
+                                        1.dp,
+                                        if (isPopupOpen) {
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                                        } else {
+                                            Color.White.copy(alpha = 0.18f)
+                                        }
+                                    ),
+                                    RoundedCornerShape(22.dp)
+                                )
+                                .clickable {
+                                    childOverlayTouchTracker.isTouchInsideChild = true
+                                    expandedSliderState = if (isPopupOpen) {
+                                        SliderExpansionState.NONE
+                                    } else {
+                                        SliderExpansionState.TIME_LAPSE_SPEED
+                                    }
+                                }
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                                .testTag("time_lapse_speed_selector_button"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Speed,
+                                    contentDescription = "Time Lapse Speed",
+                                    tint = if (isPopupOpen) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.primary
+                                    },
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(
+                                    text = if (isPopupOpen) "Speed • ${timeLapseSpeed.shortLabel}" else timeLapseSpeed.shortLabel,
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.Bold
+                                    ),
+                                    color = if (isPopupOpen) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        Color.White
+                                    },
+                                    modifier = Modifier.testTag("time_lapse_speed_selected_label")
+                                )
+                                Icon(
+                                    imageVector = if (isPopupOpen) Icons.Outlined.KeyboardArrowDown else Icons.Outlined.KeyboardArrowUp,
+                                    contentDescription = if (isPopupOpen) "Collapse Time Lapse speeds" else "Expand Time Lapse speeds",
+                                    tint = if (isPopupOpen) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        Color.White.copy(alpha = 0.85f)
+                                    },
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+
                     // Continuous Zoom Slider revealed on long-press of any zoom shortcut (Mutually exclusive with blur slider)
                     if (expandedSliderState == SliderExpansionState.ZOOM && effectiveMax > effectiveMin) {
                         Box(
@@ -1383,8 +2218,8 @@ fun CameraPreviewPlaceholder(
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
                             ) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
@@ -1451,6 +2286,7 @@ fun CameraPreviewPlaceholder(
                                         valueRange = effectiveMin..effectiveMax.coerceAtLeast(effectiveMin + 0.1f),
                                         modifier = Modifier
                                             .weight(1f)
+                                            .height(28.dp)
                                             .padding(horizontal = 8.dp)
                                             .testTag("zoom_continuous_slider")
                                     )

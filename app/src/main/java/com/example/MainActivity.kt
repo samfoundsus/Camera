@@ -24,6 +24,16 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import com.example.core.preferences.VolumeButtonAction
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.runtime.LaunchedEffect
+import com.example.ui.theme.CameraMotionTokens
+import kotlinx.coroutines.delay
+
 enum class CameraScreenDestination {
     CAMERA,
     SETTINGS
@@ -48,61 +58,110 @@ class MainActivity : ComponentActivity() {
         setContent {
             val preferences by preferencesRepository.preferences.collectAsStateWithLifecycle()
             var currentScreen by rememberSaveable { mutableStateOf(CameraScreenDestination.CAMERA) }
+            var isNavigating by remember { mutableStateOf(false) }
 
             currentDestination = currentScreen
             currentVolumeAction = preferences.volumeButtonAction
+
+            val navigateToSettings: () -> Unit = {
+                if (!isNavigating && currentScreen == CameraScreenDestination.CAMERA) {
+                    isNavigating = true
+                    currentScreen = CameraScreenDestination.SETTINGS
+                }
+            }
+            val navigateToCamera: () -> Unit = {
+                if (!isNavigating && currentScreen == CameraScreenDestination.SETTINGS) {
+                    isNavigating = true
+                    currentScreen = CameraScreenDestination.CAMERA
+                }
+            }
+
+            LaunchedEffect(currentScreen) {
+                delay(CameraMotionTokens.DURATION_SCREEN_ENTER.toLong())
+                isNavigating = false
+            }
 
             PixelCameraTheme(
                 themePreference = preferences.themePreference,
                 dynamicColor = preferences.dynamicColor
             ) {
-                when (currentScreen) {
-                    CameraScreenDestination.CAMERA -> {
-                        CameraFoundationScreen(
-                            preferences = preferences,
-                            preferencesRepository = preferencesRepository,
-                            capabilitiesRepository = capabilitiesRepository,
-                            hardwareShutterTrigger = hardwareShutterTriggerState.intValue,
-                            hardwareZoomDelta = hardwareZoomDeltaState.floatValue,
-                            onNavigateToSettings = { currentScreen = CameraScreenDestination.SETTINGS }
-                        )
-                    }
-                    CameraScreenDestination.SETTINGS -> {
-                        SettingsScreen(
-                            preferences = preferences,
-                            capabilitiesRepository = capabilitiesRepository,
-                            onThemeChanged = { preferencesRepository.setThemePreference(it) },
-                            onDynamicColorChanged = { preferencesRepository.setDynamicColor(it) },
-                            onAspectRatioChanged = { preferencesRepository.setAspectRatioMode(it) },
-                            onGridChanged = { preferencesRepository.setGridMode(it) },
-                            onTimerChanged = { preferencesRepository.setTimerMode(it) },
-                            onFlashChanged = { preferencesRepository.setFlashMode(it) },
-                            onSoundsChanged = { preferencesRepository.setCameraSounds(it) },
-                            onLocationChanged = { preferencesRepository.setSaveLocation(it) },
-                            onMirrorChanged = { preferencesRepository.setSelfieMirror(it) },
-                            onVolumeActionChanged = { preferencesRepository.setVolumeButtonAction(it) },
-                            onVideoResolutionChanged = { preferencesRepository.setVideoResolution(it) },
-                            onVideoFpsChanged = { preferencesRepository.setVideoFrameRate(it) },
-                            onVideoStabilizationChanged = { preferencesRepository.setVideoStabilization(it) },
-                            onHdOptionChanged = { preferencesRepository.setHdOutputOption(it) },
-                            onPortraitRetouchChanged = { preferencesRepository.setPortraitRetouch(it) },
-                            onPortraitBlurLevelChanged = { preferencesRepository.setPortraitBlurLevel(it) },
-                            onNightSightExposureChanged = { preferencesRepository.setNightSightExposure(it) },
-                            onTimeLapseSpeedChanged = { preferencesRepository.setTimeLapseSpeed(it) },
-                            onSlowMoSpeedChanged = { preferencesRepository.setSlowMoSpeed(it) },
-                            onProIsoChanged = { preferencesRepository.setProIso(it) },
-                            onProShutterChanged = { preferencesRepository.setProShutterSpeed(it) },
-                            onProFocusModeChanged = { preferencesRepository.setProFocusMode(it) },
-                            onProFocusDistanceChanged = { preferencesRepository.setProFocusDistance(it) },
-                            onProWbChanged = { preferencesRepository.setProWhiteBalance(it) },
-                            onProEvChanged = { preferencesRepository.setProEv(it) },
-                            onProRawFormatChanged = { preferencesRepository.setProRawFormat(it) },
-                            onProHistogramToggled = { preferencesRepository.setProHistogramEnabled(it) },
-                            onProFocusPeakingToggled = { preferencesRepository.setProFocusPeakingEnabled(it) },
-                            onCustomModeLayoutChanged = { visible, hidden -> preferencesRepository.setCustomModeLayout(visible, hidden) },
-                            onResetModeLayout = { preferencesRepository.resetModeLayoutToDefaults() },
-                            onNavigateBack = { currentScreen = CameraScreenDestination.CAMERA }
-                        )
+                AnimatedContent(
+                    targetState = currentScreen,
+                    transitionSpec = {
+                        if (targetState == CameraScreenDestination.SETTINGS) {
+                            (slideInHorizontally(
+                                initialOffsetX = { fullWidth -> (fullWidth * 0.16f).toInt() },
+                                animationSpec = CameraMotionTokens.screenEnterTween()
+                            ) + fadeIn(animationSpec = CameraMotionTokens.screenEnterTween()))
+                                .togetherWith(
+                                    slideOutHorizontally(
+                                        targetOffsetX = { fullWidth -> -(fullWidth * 0.10f).toInt() },
+                                        animationSpec = CameraMotionTokens.screenExitTween()
+                                    ) + fadeOut(animationSpec = CameraMotionTokens.screenExitTween())
+                                )
+                        } else {
+                            (slideInHorizontally(
+                                initialOffsetX = { fullWidth -> -(fullWidth * 0.10f).toInt() },
+                                animationSpec = CameraMotionTokens.screenEnterTween()
+                            ) + fadeIn(animationSpec = CameraMotionTokens.screenEnterTween()))
+                                .togetherWith(
+                                    slideOutHorizontally(
+                                        targetOffsetX = { fullWidth -> (fullWidth * 0.16f).toInt() },
+                                        animationSpec = CameraMotionTokens.screenExitTween()
+                                    ) + fadeOut(animationSpec = CameraMotionTokens.screenExitTween())
+                                )
+                        }
+                    },
+                    label = "main_screen_transition"
+                ) { screen ->
+                    when (screen) {
+                        CameraScreenDestination.CAMERA -> {
+                            CameraFoundationScreen(
+                                preferences = preferences,
+                                preferencesRepository = preferencesRepository,
+                                capabilitiesRepository = capabilitiesRepository,
+                                hardwareShutterTrigger = hardwareShutterTriggerState.intValue,
+                                hardwareZoomDelta = hardwareZoomDeltaState.floatValue,
+                                onNavigateToSettings = navigateToSettings
+                            )
+                        }
+                        CameraScreenDestination.SETTINGS -> {
+                            SettingsScreen(
+                                preferences = preferences,
+                                capabilitiesRepository = capabilitiesRepository,
+                                onThemeChanged = { preferencesRepository.setThemePreference(it) },
+                                onDynamicColorChanged = { preferencesRepository.setDynamicColor(it) },
+                                onAspectRatioChanged = { preferencesRepository.setAspectRatioMode(it) },
+                                onGridChanged = { preferencesRepository.setGridMode(it) },
+                                onTimerChanged = { preferencesRepository.setTimerMode(it) },
+                                onFlashChanged = { preferencesRepository.setFlashMode(it) },
+                                onSoundsChanged = { preferencesRepository.setCameraSounds(it) },
+                                onLocationChanged = { preferencesRepository.setSaveLocation(it) },
+                                onMirrorChanged = { preferencesRepository.setSelfieMirror(it) },
+                                onVolumeActionChanged = { preferencesRepository.setVolumeButtonAction(it) },
+                                onVideoResolutionChanged = { preferencesRepository.setVideoResolution(it) },
+                                onVideoFpsChanged = { preferencesRepository.setVideoFrameRate(it) },
+                                onVideoStabilizationChanged = { preferencesRepository.setVideoStabilization(it) },
+                                onHdOptionChanged = { preferencesRepository.setHdOutputOption(it) },
+                                onPortraitRetouchChanged = { preferencesRepository.setPortraitRetouch(it) },
+                                onPortraitBlurLevelChanged = { preferencesRepository.setPortraitBlurLevel(it) },
+                                onNightSightExposureChanged = { preferencesRepository.setNightSightExposure(it) },
+                                onTimeLapseSpeedChanged = { preferencesRepository.setTimeLapseSpeed(it) },
+                                onSlowMoSpeedChanged = { preferencesRepository.setSlowMoSpeed(it) },
+                                onProIsoChanged = { preferencesRepository.setProIso(it) },
+                                onProShutterChanged = { preferencesRepository.setProShutterSpeed(it) },
+                                onProFocusModeChanged = { preferencesRepository.setProFocusMode(it) },
+                                onProFocusDistanceChanged = { preferencesRepository.setProFocusDistance(it) },
+                                onProWbChanged = { preferencesRepository.setProWhiteBalance(it) },
+                                onProEvChanged = { preferencesRepository.setProEv(it) },
+                                onProRawFormatChanged = { preferencesRepository.setProRawFormat(it) },
+                                onProHistogramToggled = { preferencesRepository.setProHistogramEnabled(it) },
+                                onProFocusPeakingToggled = { preferencesRepository.setProFocusPeakingEnabled(it) },
+                                onCustomModeLayoutChanged = { visible, hidden -> preferencesRepository.setCustomModeLayout(visible, hidden) },
+                                onResetModeLayout = { preferencesRepository.resetModeLayoutToDefaults() },
+                                onNavigateBack = navigateToCamera
+                            )
+                        }
                     }
                 }
             }

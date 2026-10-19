@@ -2,6 +2,8 @@ package com.example.core.camera
 
 import android.hardware.camera2.CaptureRequest
 import androidx.camera.camera2.interop.CaptureRequestOptions
+import com.example.core.preferences.AstroFocusMode
+import com.example.core.preferences.AstroStrategy
 import com.example.core.preferences.FlashMode
 import com.example.core.preferences.ProFocusMode
 import com.example.core.preferences.VideoStabilizationMode
@@ -49,7 +51,9 @@ enum class VideoFrameRate(val fps: Int, val displayName: String) {
     FPS_30(30, "30 FPS"),
     FPS_60(60, "60 FPS"),
     FPS_120(120, "120 FPS"),
-    FPS_240(240, "240 FPS");
+    FPS_240(240, "240 FPS"),
+    FPS_360(360, "360 FPS"),
+    FPS_480(480, "480 FPS");
 
     companion object {
         val VIDEO_MODE_OPTIONS = listOf(FPS_24, FPS_30, FPS_60)
@@ -465,11 +469,51 @@ fun formatEvValue(index: Int, step: Float, includeUnit: Boolean = true): String 
 }
 
 /**
- * Returns true if automatic tap-to-focus, tap-and-hold focus lock, and the associated exposure slider
- * are enabled for [mode]. All non-Pro modes are supported; Pro mode keeps its own manual controls separate.
+ * Returns true if automatic tap-to-focus and tap-and-hold focus lock are enabled for [mode].
+ * All non-Pro modes (including Night Sight) support tap-to-focus; Pro mode keeps its own manual controls separate.
  */
 fun isTapToFocusEnabledForMode(mode: com.example.core.model.CameraMode): Boolean {
     return mode != com.example.core.model.CameraMode.PRO
+}
+
+/**
+ * Returns true if the focus-adjacent vertical exposure compensation (EV) slider is enabled for [mode].
+ * Enabled in all supported non-Pro modes (Photo, Portrait, Video, Slow Motion, HD, Panorama)
+ * except Night Sight (which uses its own low-light exposure and multi-frame pipeline) and Pro mode
+ * (which uses its dedicated manual exposure controls).
+ */
+fun isFocusEvSliderEnabledForMode(mode: com.example.core.model.CameraMode): Boolean {
+    return isTapToFocusEnabledForMode(mode) && mode != com.example.core.model.CameraMode.NIGHT_SIGHT
+}
+
+/**
+ * Resolves the effective hardware exposure compensation index to apply for [mode] given
+ * the non-Pro focus-adjacent slider index [autoExposureIndex], the Pro mode EV value [proEv],
+ * and the active camera's [isExposureCompensationSupported], [evRange], and [evStep].
+ *
+ * - Returns 0 when exposure compensation is unsupported by the active camera or when [mode]
+ *   is [com.example.core.model.CameraMode.NIGHT_SIGHT] (where the focus-adjacent EV slider is disabled).
+ * - Uses [evToExposureIndex] with [proEv] in [com.example.core.model.CameraMode.PRO].
+ * - Uses [clampExposureIndex] with [autoExposureIndex] in all supported non-Pro modes
+ *   (Photo, Portrait, Video, Slow Motion, HD, Panorama).
+ */
+fun resolveModeExposureCompensationIndex(
+    mode: com.example.core.model.CameraMode,
+    autoExposureIndex: Int,
+    proEv: Float,
+    isExposureCompensationSupported: Boolean,
+    evRange: ClosedRange<Int>?,
+    evStep: Float
+): Int {
+    if (!isExposureCompensationSupported || evRange == null) return 0
+    val minIdx = minOf(evRange.start, evRange.endInclusive)
+    val maxIdx = maxOf(evRange.start, evRange.endInclusive)
+    if (minIdx >= 0 && maxIdx <= 0) return 0
+    return when {
+        mode == com.example.core.model.CameraMode.PRO -> evToExposureIndex(proEv, minIdx..maxIdx, evStep)
+        isFocusEvSliderEnabledForMode(mode) -> clampExposureIndex(autoExposureIndex, minIdx..maxIdx)
+        else -> 0
+    }
 }
 
 /**
@@ -496,6 +540,7 @@ data class ManualSensorCapabilities(
     val availableSceneModes: List<Int> = emptyList(),
     val availableControlModes: List<Int> = emptyList(),
     val isHardwareHdrSceneModeSupported: Boolean = false,
+    val isHardwareNightSceneModeSupported: Boolean = false,
     val isManualWhiteBalanceSupported: Boolean = false,
     val whiteBalanceKelvinRange: ClosedRange<Int>? = null,
     val isExposureCompensationSupported: Boolean = true,
@@ -560,6 +605,78 @@ enum class PortraitDepthSupportPath(
 }
 
 /**
+ * Verified Night Sight low-light capture and fusion path for a specific camera lens.
+ * Never claims unsupported hardware; dynamically resolves between Camera2 hardware night scene,
+ * computational multi-frame low-light fusion, and single-frame sensor-enhanced integration.
+ */
+enum class NightSightSupportPath(
+    val displayName: String,
+    val isMultiFrameFusion: Boolean = false
+) {
+    HARDWARE_SCENE_NIGHT(
+        displayName = "Camera2 Hardware Night Scene",
+        isMultiFrameFusion = false
+    ),
+    MULTI_FRAME_LOW_LIGHT_FUSION(
+        displayName = "Computational Multi-Frame Low-Light Fusion",
+        isMultiFrameFusion = true
+    ),
+    SENSOR_ENHANCED_INTEGRATION(
+        displayName = "Sensor-Enhanced Low-Light Integration",
+        isMultiFrameFusion = false
+    ),
+    UNAVAILABLE(
+        displayName = "Standard Capture (Night Sight Unavailable)",
+        isMultiFrameFusion = false
+    )
+}
+
+/**
+ * Verified Astrophotography pipeline path for a specific camera lens.
+ * Dynamically resolves between hardware manual long exposure, computational star-aligned multi-frame,
+ * and adaptive low-light night sky fallback.
+ */
+enum class AstroSupportPath(
+    val displayName: String,
+    val isGenuineLongExposure: Boolean,
+    val isMultiFrameFusion: Boolean
+) {
+    HARDWARE_MANUAL_LONG_EXPOSURE(
+        displayName = "Hardware Manual Long-Exposure Stacking",
+        isGenuineLongExposure = true,
+        isMultiFrameFusion = true
+    ),
+    COMPUTATIONAL_MULTI_FRAME_ASTRO(
+        displayName = "Computational Star-Aligned Multi-Frame Stacking",
+        isGenuineLongExposure = false,
+        isMultiFrameFusion = true
+    ),
+    NIGHT_SIGHT_ADAPTIVE_FALLBACK(
+        displayName = "Adaptive Low-Light Night Sky Fallback",
+        isGenuineLongExposure = false,
+        isMultiFrameFusion = true
+    )
+}
+
+/**
+ * Utility for resolving Astrophotography hardware capabilities.
+ */
+object AstroDeviceSupport {
+    fun resolveAstroSupportPath(
+        isManualShutterSupported: Boolean,
+        maxExposureNanos: Long?,
+        isManualIsoSupported: Boolean
+    ): AstroSupportPath {
+        val maxExposureSec = (maxExposureNanos ?: 0L) / 1_000_000_000f
+        return when {
+            isManualShutterSupported && maxExposureSec >= 1.0f -> AstroSupportPath.HARDWARE_MANUAL_LONG_EXPOSURE
+            isManualIsoSupported || isManualShutterSupported -> AstroSupportPath.COMPUTATIONAL_MULTI_FRAME_ASTRO
+            else -> AstroSupportPath.NIGHT_SIGHT_ADAPTIVE_FALLBACK
+        }
+    }
+}
+
+/**
  * Verified hardware capabilities for an individual lens.
  * Populated exclusively by hardware detection queries; never fabricated.
  */
@@ -569,6 +686,7 @@ data class LensCapabilities(
     val highestNativeStillSize: PhotoOutputSize? = null,
     val supportedVideoQualities: Map<VideoResolution, List<VideoFrameRate>> = emptyMap(),
     val supportedSlowMoRates: List<VideoFrameRate> = emptyList(),
+    val supportedSlowMoResolutionsByRate: Map<VideoFrameRate, List<VideoResolution>> = emptyMap(),
     val isStabilizationSupported: Boolean = false,
     val isOpticalStabilizationSupported: Boolean = false,
     val isActiveStabilizationSupported: Boolean = false,
@@ -577,6 +695,27 @@ data class LensCapabilities(
     val sensorDescription: String? = null,
     val manualCapabilities: ManualSensorCapabilities = ManualSensorCapabilities()
 ) {
+    fun isSlowMoRateSupported(rate: VideoFrameRate): Boolean = rate in supportedSlowMoRates
+
+    fun getSupportedSlowMoResolutions(rate: VideoFrameRate): List<VideoResolution> {
+        val explicit = supportedSlowMoResolutionsByRate[rate]
+        if (!explicit.isNullOrEmpty()) return explicit
+        val standard = supportedVideoQualities.keys.filter {
+            it == VideoResolution.HD_720P || it == VideoResolution.FHD_1080P
+        }
+        return standard.ifEmpty { listOf(VideoResolution.HD_720P, VideoResolution.FHD_1080P) }
+    }
+
+    fun resolveSlowMoResolution(
+        rate: VideoFrameRate,
+        preferred: VideoResolution = VideoResolution.FHD_1080P
+    ): VideoResolution {
+        val supported = getSupportedSlowMoResolutions(rate)
+        if (preferred in supported) return preferred
+        if (VideoResolution.FHD_1080P in supported) return VideoResolution.FHD_1080P
+        if (VideoResolution.HD_720P in supported) return VideoResolution.HD_720P
+        return supported.firstOrNull() ?: VideoResolution.HD_720P
+    }
     val minZoomRatio: Float
         get() = manualCapabilities.minZoomRatio
 
@@ -620,7 +759,7 @@ data class LensCapabilities(
         get() = if (isHardwareHdrSceneModeSupported) {
             HdrSupportPath.HARDWARE_SCENE_MODE_HDR
         } else {
-            HdrSupportPath.UNAVAILABLE
+            HdrSupportPath.SOFTWARE_MULTI_FRAME_HDR
         }
 
     val isHardwareDepthSupported: Boolean
@@ -640,6 +779,21 @@ data class LensCapabilities(
                 PortraitDepthSupportPath.LOGICAL_MULTI_CAMERA_ASSISTED
             else -> PortraitDepthSupportPath.ON_DEVICE_SEGMENTATION_ONLY
         }
+
+    val isHardwareNightSceneModeSupported: Boolean
+        get() = manualCapabilities.isHardwareNightSceneModeSupported
+
+    val nightSightSupportPath: NightSightSupportPath
+        get() = NightSightDeviceSupport.resolveNightSightSupportPath(
+            isHardwareNightSceneSupported = isHardwareNightSceneModeSupported
+        )
+
+    val astroSupportPath: AstroSupportPath
+        get() = AstroDeviceSupport.resolveAstroSupportPath(
+            isManualShutterSupported = isManualShutterSupported,
+            maxExposureNanos = manualCapabilities.shutterSpeedRangeNanos?.endInclusive,
+            isManualIsoSupported = isManualIsoSupported
+        )
 
     val availableAwbModes: List<Int>
         get() = manualCapabilities.availableAwbModes
@@ -1113,6 +1267,48 @@ fun buildProCamera2CaptureRequestOptions(
 }
 
 /**
+ * Builds real Camera2 [CaptureRequestOptions] for Astrophotography mode.
+ * Dynamically configures long exposure / sensor sensitivity boost, focus mode (Auto vs Infinity),
+ * and locks focus & exposure for multi-frame astrophotography consistency.
+ */
+fun buildAstroCamera2CaptureRequestOptions(
+    astroFocus: AstroFocusMode,
+    astroStrategy: AstroStrategy,
+    manualCaps: ManualSensorCapabilities?,
+    exposureCompensationIndex: Int = 0
+): CaptureRequestOptions {
+    val builder = CaptureRequestOptions.Builder()
+
+    // 1. Focus Mode (Auto vs Infinity)
+    if (astroFocus == AstroFocusMode.INFINITY) {
+        val isManualFocusSupported = manualCaps?.isManualFocusSupported == true
+        if (isManualFocusSupported) {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f) // 0 diopters = infinity
+        } else {
+            builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+        }
+    } else {
+        builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+    }
+
+    // 2. Preview Exposure Strategy: Keep live repeating preview stream auto-exposed at 30 FPS.
+    // Multi-second manual shutter exposure times apply exclusively during still capture sequence.
+    builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+    if (manualCaps?.isHardwareNightSceneModeSupported == true) {
+        builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+        builder.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_NIGHT)
+    }
+
+    // 3. Exposure compensation
+    if (manualCaps?.isExposureCompensationSupported == true && exposureCompensationIndex != 0) {
+        builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureCompensationIndex)
+    }
+
+    return builder.build()
+}
+
+/**
  * Checks whether the Camera2 hardware characteristics genuinely support hardware scene-mode HDR
  * (`CONTROL_SCENE_MODE_HDR` alongside `CONTROL_MODE_USE_SCENE_MODE`).
  */
@@ -1127,12 +1323,28 @@ fun isCamera2HardwareHdrSceneModeSupported(
 }
 
 /**
+ * Checks whether the Camera2 hardware characteristics genuinely support hardware scene-mode Night
+ * (`CONTROL_SCENE_MODE_NIGHT` alongside `CONTROL_MODE_USE_SCENE_MODE`).
+ */
+fun isCamera2HardwareNightSceneModeSupported(
+    availableSceneModes: List<Int>,
+    availableControlModes: List<Int>
+): Boolean {
+    val hasNightScene = availableSceneModes.contains(CaptureRequest.CONTROL_SCENE_MODE_NIGHT)
+    val hasUseSceneControl = availableControlModes.isEmpty() ||
+        availableControlModes.contains(CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+    return hasNightScene && hasUseSceneControl
+}
+
+/**
  * Builds [CaptureRequestOptions] that strictly resets all Camera2 manual overrides when switching away
  * from Pro mode to any non-Pro mode (Photo, Video, Night Sight, Portrait, etc.).
  * Ensures AE mode returns to ON, AF returns to Continuous AF (or single-shot lock hold), AWB returns to AUTO,
  * and sensor sensitivity, exposure time, and manual focus distance overrides are not retained.
  * - When [enableHardwareHdrSceneMode] is true (only when genuinely supported in Photo mode and compatible with flash),
  *   applies Camera2 hardware `CONTROL_SCENE_MODE_HDR`.
+ * - When [enableHardwareNightSceneMode] is true (only when genuinely supported in Night Sight mode),
+ *   applies Camera2 hardware `CONTROL_SCENE_MODE_NIGHT`.
  * - When [enableHardwarePortraitBokeh] is true (only when genuinely supported in Portrait mode on API 30+),
  *   applies Camera2 `CONTROL_EXTENDED_SCENE_MODE_BOKEH_CONTINUOUS` or `CONTROL_EXTENDED_SCENE_MODE_BOKEH_STILL_CAPTURE`
  *   and hardware face detection (`STATISTICS_FACE_DETECT_MODE_SIMPLE`) when supported.
@@ -1142,19 +1354,24 @@ fun buildNonProResetCamera2CaptureRequestOptions(
     isHardwareAfLockActive: Boolean,
     supportsAfAutoHold: Boolean,
     enableHardwareHdrSceneMode: Boolean = false,
+    enableHardwareNightSceneMode: Boolean = false,
     enableHardwarePortraitBokeh: Boolean = false,
     supportsExtendedBokehContinuous: Boolean = false,
     supportsExtendedBokehStill: Boolean = false,
-    enableHardwareFaceDetect: Boolean = false
+    enableHardwareFaceDetect: Boolean = false,
+    exposureCompensationIndex: Int = 0
 ): CaptureRequestOptions {
     val builder = CaptureRequestOptions.Builder()
         .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, false)
-        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0)
+        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureCompensationIndex)
         .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
         .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
 
-    if (!isVideoMode && enableHardwareHdrSceneMode) {
+    if (!isVideoMode && enableHardwareNightSceneMode) {
+        builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+        builder.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_NIGHT)
+    } else if (!isVideoMode && enableHardwareHdrSceneMode && exposureCompensationIndex == 0) {
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
     } else {
