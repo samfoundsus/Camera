@@ -23,6 +23,7 @@ import org.robolectric.annotation.Config
  * - User theme preferences: System default, Light, and Dark.
  */
 @RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
 class ThemeApiCompatibilityRobolectricTest {
 
     @Test

@@ -195,13 +195,13 @@ class CameraFiltersTest {
         val repository = CameraPreferencesRepository(context)
 
         composeTestRule.setContent {
-            val prefs = repository.preferences.value
+            val prefs = repository.preferences.collectAsState().value
             PixelCameraTheme(
                 themePreference = prefs.themePreference,
                 dynamicColor = false
             ) {
                 CameraFoundationScreen(
-                    preferences = repository.preferences.collectAsState().value,
+                    preferences = prefs,
                     preferencesRepository = repository,
                     onNavigateToSettings = {}
                 )
@@ -221,13 +221,20 @@ class CameraFiltersTest {
         composeTestRule.onNodeWithTag("shutter_button").assertIsDisplayed()
 
         // 3. Select Warm preset in Natural category
+        composeTestRule.onNodeWithTag("filter_presets_lazy_row")
+            .performScrollToNode(hasTestTag("filter_item_warm"))
+        composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("filter_item_warm").performClick()
         composeTestRule.waitForIdle()
         assertEquals(CameraFilterPreset.WARM, repository.preferences.value.selectedFilter)
-        composeTestRule.onNodeWithTag("preview_active_filter_badge").assertIsDisplayed()
         composeTestRule.onNodeWithTag("top_bar_filter_active_dot", useUnmergedTree = true).assertIsDisplayed()
+        composeTestRule.onNodeWithTag("filter_tray_close_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("preview_active_filter_badge").assertIsDisplayed()
 
-        // 4. Switch to Creative category and select Noir
+        // 4. Re-open filter tray, switch to Creative category and select Noir
+        composeTestRule.onNodeWithTag("top_bar_filters_button").performClick()
+        composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("filter_category_creative").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("filter_presets_lazy_row")
