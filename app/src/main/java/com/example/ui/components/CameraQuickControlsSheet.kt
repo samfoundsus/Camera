@@ -205,6 +205,24 @@ fun CameraQuickControlsSheet(
                     }
                 }
                 is CameraCapabilitiesState.Verified -> {
+                    val lensCaps = capabilitiesState.currentLensCapabilities
+                    val activeHardwareLabel = lensCaps?.resolvedHardwareLabel
+                        ?: capabilitiesState.activeLens.displayName
+                    val videoResSummary = lensCaps?.getSupportedVideoModeResolutions()
+                        ?.joinToString("/") { it.id }
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "720p/1080p"
+                    val maxVideoFps = lensCaps?.supportedVideoQualities
+                        ?.values
+                        ?.flatten()
+                        ?.maxOfOrNull { it.fps } ?: 30
+                    val stabHardwareSummary = when {
+                        lensCaps?.isActiveStabilizationSupported == true -> "EIS+OIS"
+                        lensCaps?.isPreviewStabilizationSupported == true -> "Preview EIS"
+                        lensCaps?.isDigitalVideoStabilizationSupported == true -> "Hardware EIS"
+                        lensCaps?.isOpticalStabilizationSupported == true -> "Hardware OIS"
+                        else -> "No HW EIS/OIS"
+                    }
                     Surface(
                         color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f),
                         shape = RoundedCornerShape(12.dp),
@@ -222,7 +240,7 @@ fun CameraQuickControlsSheet(
                                 modifier = Modifier.size(20.dp)
                             )
                             Text(
-                                text = "${capabilitiesState.activeLens.displayName} • Verified hardware capabilities active",
+                                text = "$activeHardwareLabel • $videoResSummary up to ${maxVideoFps}fps • $stabHardwareSummary",
                                 style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
                                 color = MaterialTheme.colorScheme.onSecondaryContainer
                             )
@@ -374,6 +392,13 @@ fun CameraQuickControlsSheet(
                 }
 
                 CameraMode.HD -> {
+                    val hasDistinctHighResTier = verifiedLensCaps?.let { caps ->
+                        val maxPixels = caps.highestNativeStillSize?.totalPixels ?: 0L
+                        val minStandardPixels = caps.supportedPhotoSizes.filter { it.totalPixels >= 8_000_000L }
+                            .minOfOrNull { it.totalPixels } ?: maxPixels
+                        maxPixels > 16_500_000L && maxPixels > (minStandardPixels * 3L) / 2L
+                    } ?: true
+
                     // HD Output Option
                     QuickControlPillSection(
                         label = "HD Capture Quality",
@@ -381,6 +406,11 @@ fun CameraQuickControlsSheet(
                         options = HdOutputOption.entries,
                         selectedOption = preferences.hdOutputOption,
                         optionLabel = { it.displayName },
+                        supportingNote = if (verifiedLensCaps != null && !hasDistinctHighResTier && verifiedLensCaps.sensorPixelArraySize != null &&
+                            verifiedLensCaps.sensorPixelArraySize.totalPixels > (verifiedLensCaps.highestNativeStillSize?.totalPixels ?: 0L) * 2L
+                        ) {
+                            "Public Camera2 HAL exposes ${verifiedLensCaps.highestNativeStillSize?.formattedMegapixels ?: "12.0 MP"} pixel-binned output from the ${verifiedLensCaps.sensorPixelArraySize.formattedMegapixels} physical sensor."
+                        } else null,
                         onOptionSelected = onHdOptionChanged
                     )
 
@@ -402,9 +432,18 @@ fun CameraQuickControlsSheet(
                             Text(
                                 text = when (capabilitiesState) {
                                     is CameraCapabilitiesState.Verified -> {
-                                        val highest = capabilitiesState.currentLensCapabilities?.highestNativeStillSize
-                                        if (highest != null) {
-                                            "Target output: ${highest.formattedMegapixels} (${highest.dimensionsLabel}) native unbinned sensor capture."
+                                        val caps = capabilitiesState.currentLensCapabilities
+                                        val selectedSize = caps?.selectOptimalPhotoOutputSize(
+                                            aspectRatioMode = preferences.aspectRatioMode,
+                                            preferMaxNative = preferences.hdOutputOption == HdOutputOption.MAX_NATIVE
+                                        ) ?: caps?.highestNativeStillSize
+                                        val arraySize = caps?.sensorPixelArraySize
+                                        if (selectedSize != null) {
+                                            if (arraySize != null && arraySize.totalPixels > selectedSize.totalPixels * 2L && !caps.isFullSensorResolutionExposed) {
+                                                "Target output: ${selectedSize.formattedMegapixels} (${selectedSize.dimensionsLabel}) max Camera2 stream (${arraySize.formattedMegapixels} physical array pixel-binned)."
+                                            } else {
+                                                "Target output: ${selectedSize.formattedMegapixels} (${selectedSize.dimensionsLabel}) native sensor capture."
+                                            }
                                         } else {
                                             "Target output: Dynamic highest native output for ${capabilitiesState.activeLens.displayName}."
                                         }

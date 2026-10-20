@@ -125,7 +125,7 @@ sealed interface PortraitProcessingOutcome {
  */
 object PortraitProcessor {
 
-    private const val MAX_ANALYSIS_DIMENSION = 160
+    private const val MAX_ANALYSIS_DIMENSION = 224
     private const val MAX_BOKEH_BUFFER_DIMENSION = 640
     private const val MAX_DETECTED_FACES = 5
     private const val MAX_BORDER_PALETTE_CLUSTERS = 8
@@ -450,14 +450,14 @@ object PortraitProcessor {
             val maxSupported = PortraitBlurDeviceSupport.getMaxSupportedBlurStrength()
             val clampedStrength = effectiveStrength.coerceIn(0.0f, maxSupported)
 
-            val maxRadius = (min(bokehW, bokehH) * 0.08f).coerceIn(16f, 36f)
-            val minRadius = 2.0f
+            val maxRadius = (min(bokehW, bokehH) * 0.10f).coerceIn(20f, 40f)
+            val minRadius = 3.0f
             val norm = if (clampedStrength <= 1.0f) {
-                (0.08f * clampedStrength).coerceIn(0.02f, 0.08f)
+                (0.10f * clampedStrength).coerceIn(0.04f, 0.10f)
             } else {
-                (0.08f + 0.92f * ((clampedStrength - 1.0f) / 15.0f).coerceIn(0f, 1f))
+                (0.10f + 0.90f * ((clampedStrength - 1.0f) / 15.0f).coerceIn(0f, 1f))
             }
-            val bokehRadiusPx = (minRadius + (maxRadius - minRadius) * norm).roundToInt().coerceAtLeast(2)
+            val bokehRadiusPx = (minRadius + (maxRadius - minRadius) * norm).roundToInt().coerceAtLeast(3)
             val fullEquivalentRadiusPx = (bokehRadiusPx / bokehScale).roundToInt().coerceAtLeast(bokehRadiusPx)
 
             // Build halo-free blurred background buffer with foreground pixels excluded (weight = (1 - alpha)^3)
@@ -982,12 +982,12 @@ object PortraitProcessor {
     }
 
     private fun isSkinTonePixel(argb: Int, yVal: Float, cb: Float, cr: Float): Boolean {
-        if (yVal !in 0.16f..0.92f) return false
+        if (yVal !in 0.12f..0.95f) return false
         val r = (argb shr 16) and 0xFF
         val g = (argb shr 8) and 0xFF
         val b = argb and 0xFF
-        if (r <= g || r <= b || (r - min(g, b)) < 18) return false
-        return cb in 77f..127f && cr in 133f..175f
+        if (r <= g || r <= b || (r - min(g, b)) < 10) return false
+        return cb in 72f..132f && cr in 128f..180f
     }
 
     /**
@@ -1287,22 +1287,22 @@ object PortraitProcessor {
                     val bgDist = minNormalizedColorDistance(luma[idx], cbArr[idx], crArr[idx], borderClusters)
                     val fgDist = minNormalizedColorDistance(luma[idx], cbArr[idx], crArr[idx], fgPersonClusters)
 
-                    // Inner face core (including eyes, brows, nose, mouth) is protected unconditionally
-                    if (distSqHead <= 0.48f) {
-                        outPersonProb[idx] = max(outPersonProb[idx], 0.98f)
+                    // Inner face and upper-torso core are protected unconditionally
+                    if (distSqHead <= 0.56f || distSqTorso <= 0.42f) {
+                        outPersonProb[idx] = max(outPersonProb[idx], 0.96f)
                         continue
                     }
 
-                    // If pixel outside the inner face core strongly matches a border background cluster, reject it
-                    if (bgDist < 0.85f && fgDist > bgDist * 1.15f) {
+                    // If pixel outside the inner core strongly matches a border background cluster, reject it
+                    if (bgDist < 0.80f && fgDist > bgDist * 1.20f && distSqHead > 0.85f && distSqTorso > 0.72f) {
                         continue
                     }
 
-                    val colorLikelihood = ((bgDist - 0.45f) / (bgDist + fgDist + 0.30f)).coerceIn(0f, 1f)
-                    val combined = if (distSqHead <= 0.88f || distSqTorso <= 0.62f) {
-                        (0.65f * spatialPrior + 0.35f * colorLikelihood).coerceIn(0f, 1f)
+                    val colorLikelihood = ((bgDist - 0.40f) / (bgDist + fgDist + 0.30f)).coerceIn(0f, 1f)
+                    val combined = if (distSqHead <= 0.92f || distSqTorso <= 0.75f) {
+                        (0.72f * spatialPrior + 0.28f * colorLikelihood).coerceIn(0f, 1f)
                     } else {
-                        (spatialPrior * (0.25f + 0.75f * colorLikelihood)).coerceIn(0f, 1f)
+                        (spatialPrior * (0.30f + 0.70f * colorLikelihood)).coerceIn(0f, 1f)
                     }
 
                     if (combined > outPersonProb[idx]) {

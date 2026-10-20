@@ -735,8 +735,9 @@ object PanoramaProcessor {
             val cumulativeX = FloatArray(normalizedFrames.size)
             val cumulativeY = FloatArray(normalizedFrames.size)
 
-            val minStepPrimary = (if (direction.isHorizontal) frameW else frameH) * 0.12f
-            val defaultStepPrimary = (if (direction.isHorizontal) frameW else frameH) * KEYFRAME_STEP_FRACTION
+            val primaryDim = (if (direction.isHorizontal) frameW else frameH).toFloat()
+            val minGenuineMotionPx = primaryDim * 0.025f
+            val defaultStepPrimary = primaryDim * KEYFRAME_STEP_FRACTION
 
             for (i in 1 until normalizedFrames.size) {
                 val alignment = estimatePairwiseAlignment(
@@ -750,21 +751,42 @@ object PanoramaProcessor {
 
                 if (direction.isHorizontal) {
                     val signedForward = stepX * direction.sign
-                    if (signedForward < minStepPrimary) {
-                        // Ensure forward progression when user finishes on low-motion / emulator frames
-                        stepX = direction.sign * max(signedForward, defaultStepPrimary)
+                    stepX = if (signedForward >= minGenuineMotionPx) {
+                        direction.sign * signedForward.coerceAtMost(frameW * 0.65f)
+                    } else {
+                        // Near-duplicate or slightly reversed frame: keep at 0 forward step instead of jumping 30%
+                        0f
                     }
                     stepY = stepY.coerceIn(-frameH * 0.18f, frameH * 0.18f)
                 } else {
                     val signedForward = stepY * direction.sign
-                    if (signedForward < minStepPrimary) {
-                        stepY = direction.sign * max(signedForward, defaultStepPrimary)
+                    stepY = if (signedForward >= minGenuineMotionPx) {
+                        direction.sign * signedForward.coerceAtMost(frameH * 0.65f)
+                    } else {
+                        0f
                     }
                     stepX = stepX.coerceIn(-frameW * 0.18f, frameW * 0.18f)
                 }
 
                 cumulativeX[i] = cumulativeX[i - 1] + stepX
                 cumulativeY[i] = cumulativeY[i - 1] + stepY
+            }
+
+            // If the entire sequence had zero visual translation (e.g., static emulator/uniform test frames),
+            // distribute frames evenly so the output panorama still spans multiple frames cleanly.
+            val totalPrimarySpan = if (direction.isHorizontal) {
+                abs(cumulativeX.last() - cumulativeX.first())
+            } else {
+                abs(cumulativeY.last() - cumulativeY.first())
+            }
+            if (totalPrimarySpan < primaryDim * 0.08f) {
+                for (i in 1 until normalizedFrames.size) {
+                    if (direction.isHorizontal) {
+                        cumulativeX[i] = cumulativeX[i - 1] + direction.sign * defaultStepPrimary
+                    } else {
+                        cumulativeY[i] = cumulativeY[i - 1] + direction.sign * defaultStepPrimary
+                    }
+                }
             }
 
             // Center vertical/lateral drift trend so the sweep stays level across the canvas

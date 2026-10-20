@@ -278,6 +278,7 @@ fun CameraXViewfinder(
     var activeRecording by remember { mutableStateOf<Recording?>(null) }
     var lastBoundConfig by remember { mutableStateOf<BoundPipelineConfig?>(null) }
     var cachedCapabilities by remember { mutableStateOf<Map<CameraLens, LensCapabilities>>(emptyMap()) }
+    var hasQueriedWithCameraProvider by remember { mutableStateOf(false) }
     val cachedAeRanges = remember { mutableMapOf<CameraLens, Array<Range<Int>>>() }
     var isCapturing by remember { mutableStateOf(false) }
     val isCaptureInFlight = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
@@ -546,16 +547,17 @@ fun CameraXViewfinder(
                     return@addListener
                 }
 
-                // Discover real capabilities across both rear and front cameras once using Camera2 + CameraX VideoCapabilities
-                val discoveredCapabilities = if (cachedCapabilities.isNotEmpty()) {
+                // Discover real capabilities across both rear and front cameras using Camera2 + CameraX Codec VideoCapabilities
+                val discoveredCapabilities = if (cachedCapabilities.isNotEmpty() && hasQueriedWithCameraProvider) {
                     cachedCapabilities
                 } else {
                     val queried = queryDeviceCameraCapabilities(context, cameraProvider)
                     if (queried.isNotEmpty()) {
                         cachedCapabilities = queried
+                        hasQueriedWithCameraProvider = true
                         onCapabilitiesDiscovered?.invoke(queried)
                     }
-                    queried
+                    queried.ifEmpty { cachedCapabilities }
                 }
 
                 val activeLensCaps = discoveredCapabilities[activeLens]
@@ -621,10 +623,6 @@ fun CameraXViewfinder(
                     return@addListener
                 }
 
-                val preview = Preview.Builder().build().also {
-                    it.surfaceProvider = previewView.surfaceProvider
-                }
-
                 cameraProvider.unbindAll()
 
                 var boundCam: Camera? = null
@@ -644,76 +642,136 @@ fun CameraXViewfinder(
                     }
                     val targetFpsRange = selectBestTargetFpsRange(aeRanges, effectiveVideoFps)
                     val targetVideoRes = if (isSlowMo) effectiveSlowMoResolution else reconciled.resolution
-                    val targetQuality = targetVideoRes.toCameraXQuality()
-                    val qualitySelector = QualitySelector.from(
-                        targetQuality,
-                        FallbackStrategy.lowerQualityOrHigherThan(targetQuality)
-                    )
-
-                    val recorder = Recorder.Builder()
-                        .setQualitySelector(qualitySelector)
-                        .build()
-
-                    val videoCaptureBuilder = VideoCapture.Builder(recorder)
-                        .setTargetFrameRate(targetFpsRange)
-                        .setVideoStabilizationEnabled(
-                            reconciled.stabilization == VideoStabilizationMode.STANDARD ||
-                                reconciled.stabilization == VideoStabilizationMode.ACTIVE
+                    val usePreviewStab = !isSlowMo && (
+                        (reconciled.stabilization == VideoStabilizationMode.ACTIVE && activeLensCaps?.isPreviewStabilizationSupported == true) ||
+                            (reconciled.stabilization == VideoStabilizationMode.STANDARD &&
+                                activeLensCaps?.isPreviewStabilizationSupported == true &&
+                                activeLensCaps.isDigitalVideoStabilizationSupported != true)
                         )
+                    val useVideoStab = !isSlowMo && (
+                        reconciled.stabilization == VideoStabilizationMode.STANDARD ||
+                            reconciled.stabilization == VideoStabilizationMode.ACTIVE
+                        ) && (activeLensCaps?.isStabilizationSupported == true)
 
-                    // Configure Camera2Interop options for exact FPS range and stabilization mode
-                    val camera2Extender = Camera2Interop.Extender(videoCaptureBuilder)
-                    camera2Extender.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                        targetFpsRange
-                    )
-                    when (reconciled.stabilization) {
-                        VideoStabilizationMode.OFF -> {
-                            camera2Extender.setCaptureRequestOption(
-                                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-                            )
-                            if (activeLensCaps?.isOpticalStabilizationSupported == true) {
-                                camera2Extender.setCaptureRequestOption(
-                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
-                                )
-                            }
-                        }
-                        VideoStabilizationMode.STANDARD -> {
-                            if (activeLensCaps?.isStabilizationSupported == true) {
-                                camera2Extender.setCaptureRequestOption(
-                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                                )
-                            }
-                            if (activeLensCaps?.isOpticalStabilizationSupported == true) {
-                                camera2Extender.setCaptureRequestOption(
-                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
-                                )
-                            }
-                        }
-                        VideoStabilizationMode.ACTIVE -> {
-                            if (activeLensCaps?.isStabilizationSupported == true) {
-                                camera2Extender.setCaptureRequestOption(
-                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                                )
-                            }
-                            if (activeLensCaps?.isOpticalStabilizationSupported == true) {
-                                camera2Extender.setCaptureRequestOption(
-                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
-                                )
-                            }
-                        }
+                    val previewBuilder = Preview.Builder()
+                        .setTargetFrameRate(targetFpsRange)
+                    if (usePreviewStab) {
+                        runCatching { previewBuilder.setPreviewStabilizationEnabled(true) }
+                    }
+                    val preview = previewBuilder.build().also {
+                        it.surfaceProvider = previewView.surfaceProvider
                     }
 
-                    val configuredVideoCapture = videoCaptureBuilder.build()
+                    fun buildConfiguredVideoCapture(useCustomQhdResolution: Boolean): VideoCapture<Recorder> {
+                        val recorderBuilder = Recorder.Builder()
+                            .setVideoCapabilitiesSource(Recorder.VIDEO_CAPABILITIES_SOURCE_CODEC_CAPABILITIES)
+                        if (!useCustomQhdResolution) {
+                            val targetQuality = when (targetVideoRes) {
+                                VideoResolution.HD_720P -> Quality.HD
+                                VideoResolution.FHD_1080P -> Quality.FHD
+                                VideoResolution.QHD_2K -> Quality.UHD
+                                VideoResolution.UHD_4K -> Quality.UHD
+                            }
+                            val qualitySelector = QualitySelector.from(
+                                targetQuality,
+                                FallbackStrategy.lowerQualityOrHigherThan(targetQuality)
+                            )
+                            recorderBuilder.setQualitySelector(qualitySelector)
+                        }
+                        val recorder = recorderBuilder.build()
+                        val videoCaptureBuilder = VideoCapture.Builder(recorder)
+                            .setTargetFrameRate(targetFpsRange)
+                            .setVideoStabilizationEnabled(useVideoStab)
+
+                        if (useCustomQhdResolution && targetVideoRes == VideoResolution.QHD_2K) {
+                            runCatching {
+                                val method = VideoCapture.Builder::class.java.getDeclaredMethod(
+                                    "setCustomOrderedResolutions",
+                                    List::class.java
+                                )
+                                method.isAccessible = true
+                                method.invoke(
+                                    videoCaptureBuilder,
+                                    listOf(
+                                        Size(VideoResolution.QHD_2K.width, VideoResolution.QHD_2K.height),
+                                        Size(VideoResolution.FHD_1080P.width, VideoResolution.FHD_1080P.height)
+                                    )
+                                )
+                            }
+                        }
+
+                        // Configure Camera2Interop options for exact FPS range and stabilization mode
+                        val camera2Extender = Camera2Interop.Extender(videoCaptureBuilder)
+                        camera2Extender.setCaptureRequestOption(
+                            CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                            targetFpsRange
+                        )
+                        when (if (isSlowMo) VideoStabilizationMode.OFF else reconciled.stabilization) {
+                            VideoStabilizationMode.OFF -> {
+                                camera2Extender.setCaptureRequestOption(
+                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                                )
+                                if (activeLensCaps?.isOpticalStabilizationSupported == true) {
+                                    camera2Extender.setCaptureRequestOption(
+                                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                                    )
+                                }
+                            }
+                            VideoStabilizationMode.STANDARD -> {
+                                when {
+                                    activeLensCaps?.isDigitalVideoStabilizationSupported == true -> {
+                                        camera2Extender.setCaptureRequestOption(
+                                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                                        )
+                                    }
+                                    activeLensCaps?.isPreviewStabilizationSupported == true &&
+                                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+                                        camera2Extender.setCaptureRequestOption(
+                                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                            2 // CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
+                                        )
+                                    }
+                                    activeLensCaps?.isOpticalStabilizationSupported == true -> {
+                                        camera2Extender.setCaptureRequestOption(
+                                            CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                            CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+                                        )
+                                    }
+                                }
+                            }
+                            VideoStabilizationMode.ACTIVE -> {
+                                if (activeLensCaps?.isPreviewStabilizationSupported == true &&
+                                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                                ) {
+                                    camera2Extender.setCaptureRequestOption(
+                                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                        2 // CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
+                                    )
+                                } else if (activeLensCaps?.isDigitalVideoStabilizationSupported == true) {
+                                    camera2Extender.setCaptureRequestOption(
+                                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                                    )
+                                }
+                                if (activeLensCaps?.isOpticalStabilizationSupported == true) {
+                                    camera2Extender.setCaptureRequestOption(
+                                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+                                    )
+                                }
+                            }
+                        }
+                        return videoCaptureBuilder.build()
+                    }
 
                     try {
-                        // In Video mode, prioritize Preview + VideoCapture so 4K UHD, 60 FPS, and
+                        val configuredVideoCapture = buildConfiguredVideoCapture(
+                            useCustomQhdResolution = targetVideoRes == VideoResolution.QHD_2K
+                        )
+                        // In Video mode, prioritize Preview + VideoCapture so 4K UHD, 2K QHD, 60 FPS, and
                         // Stabilization are never throttled by an unused 3rd JPEG stream.
                         boundCam = cameraProvider.bindToLifecycle(
                             lifecycleOwner,
@@ -726,39 +784,56 @@ fun CameraXViewfinder(
                             TAG,
                             "Bound Video pipeline (${reconciled.resolution.displayName} @ ${reconciled.frameRate.displayName}, Stab=${reconciled.stabilization.displayName}) on ${activeLens.displayName}"
                         )
-                    } catch (excVideo: Exception) {
-                        Log.w(TAG, "Primary video configuration failed to bind, attempting safe 1080p/720p 30 FPS fallback", excVideo)
+                    } catch (excPrimary: Exception) {
+                        Log.w(TAG, "Primary video configuration failed to bind, attempting standard QualitySelector fallback", excPrimary)
                         try {
-                            val fallbackRecorder = Recorder.Builder().build()
-                            val fallbackFpsRange = selectBestTargetFpsRange(aeRanges, 30)
-                            val fallbackVideoCapture = VideoCapture.Builder(fallbackRecorder)
-                                .setTargetFrameRate(fallbackFpsRange)
-                                .setVideoStabilizationEnabled(false)
-                                .build()
+                            val fallbackQualityCapture = buildConfiguredVideoCapture(useCustomQhdResolution = false)
                             boundCam = cameraProvider.bindToLifecycle(
                                 lifecycleOwner,
                                 cameraSelector,
                                 preview,
-                                fallbackVideoCapture
+                                fallbackQualityCapture
                             )
-                            boundVidCap = fallbackVideoCapture
-                            val fallbackRes = if (activeLensCaps?.isResolutionSupported(VideoResolution.FHD_1080P) == true) {
-                                VideoResolution.FHD_1080P
-                            } else {
-                                VideoResolution.HD_720P
+                            boundVidCap = fallbackQualityCapture
+                        } catch (excVideo: Exception) {
+                            Log.w(TAG, "Secondary video configuration failed to bind, attempting safe 1080p/720p 30 FPS fallback", excVideo)
+                            try {
+                                val fallbackRecorder = Recorder.Builder()
+                                    .setVideoCapabilitiesSource(Recorder.VIDEO_CAPABILITIES_SOURCE_CODEC_CAPABILITIES)
+                                    .build()
+                                val fallbackFpsRange = selectBestTargetFpsRange(aeRanges, 30)
+                                val fallbackVideoCapture = VideoCapture.Builder(fallbackRecorder)
+                                    .setTargetFrameRate(fallbackFpsRange)
+                                    .setVideoStabilizationEnabled(false)
+                                    .build()
+                                boundCam = cameraProvider.bindToLifecycle(
+                                    lifecycleOwner,
+                                    cameraSelector,
+                                    preview,
+                                    fallbackVideoCapture
+                                )
+                                boundVidCap = fallbackVideoCapture
+                                val fallbackRes = if (activeLensCaps?.isResolutionSupported(VideoResolution.FHD_1080P) == true) {
+                                    VideoResolution.FHD_1080P
+                                } else {
+                                    VideoResolution.HD_720P
+                                }
+                                effectiveBoundReconciled = reconciled.copy(
+                                    resolution = fallbackRes,
+                                    frameRate = VideoFrameRate.FPS_30,
+                                    stabilization = VideoStabilizationMode.OFF
+                                )
+                                onVideoConfigApplied?.invoke(effectiveBoundReconciled)
+                            } catch (excFallback: Exception) {
+                                Log.e(TAG, "Failed to bind fallback video pipeline", excFallback)
+                                onCameraError?.invoke("Failed to initialize video stream: ${excFallback.localizedMessage}")
                             }
-                            effectiveBoundReconciled = reconciled.copy(
-                                resolution = fallbackRes,
-                                frameRate = VideoFrameRate.FPS_30,
-                                stabilization = VideoStabilizationMode.OFF
-                            )
-                            onVideoConfigApplied?.invoke(effectiveBoundReconciled)
-                        } catch (excFallback: Exception) {
-                            Log.e(TAG, "Failed to bind fallback video pipeline", excFallback)
-                            onCameraError?.invoke("Failed to initialize video stream: ${excFallback.localizedMessage}")
                         }
                     }
                 } else {
+                    val preview = Preview.Builder().build().also {
+                        it.surfaceProvider = previewView.surfaceProvider
+                    }
                     val preferMaxNative = activeMode == CameraMode.HD && hdOutputOption == HdOutputOption.MAX_NATIVE
                     val maxPhotoSize = if (preferMaxNative) {
                         activeLensCaps?.highestNativeStillSize ?: activeLensCaps?.selectOptimalPhotoOutputSize(aspectRatioMode, preferMaxNative = true)
@@ -769,6 +844,11 @@ fun CameraXViewfinder(
                         .setAspectRatioStrategy(
                             androidx.camera.core.resolutionselector.AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
                         )
+                    if (preferMaxNative) {
+                        resolutionSelectorBuilder.setAllowedResolutionMode(
+                            androidx.camera.core.resolutionselector.ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE
+                        )
+                    }
                     if (maxPhotoSize != null && maxPhotoSize.width > 0 && maxPhotoSize.height > 0) {
                         resolutionSelectorBuilder.setResolutionStrategy(
                             androidx.camera.core.resolutionselector.ResolutionStrategy(
@@ -1139,9 +1219,13 @@ fun CameraXViewfinder(
         )
 
         val meteringPoint: MeteringPoint = if (previewView.width > 0 && previewView.height > 0) {
-            val viewX = ((normalizedCoord.clampedPixelX / request.previewWidth.coerceAtLeast(1f)) * previewView.width)
+            // Note: PreviewView.meteringPointFactory already transforms view coordinates for front-camera mirroring
+            // and display rotation, so pass the un-mirrored clamped tap position in previewView space.
+            val rawClampedX = request.tapX.coerceIn(0f, request.previewWidth.coerceAtLeast(1f))
+            val rawClampedY = request.tapY.coerceIn(0f, request.previewHeight.coerceAtLeast(1f))
+            val viewX = ((rawClampedX / request.previewWidth.coerceAtLeast(1f)) * previewView.width)
                 .coerceIn(0f, previewView.width.toFloat())
-            val viewY = ((normalizedCoord.clampedPixelY / request.previewHeight.coerceAtLeast(1f)) * previewView.height)
+            val viewY = ((rawClampedY / request.previewHeight.coerceAtLeast(1f)) * previewView.height)
                 .coerceIn(0f, previewView.height.toFloat())
             previewView.meteringPointFactory.createPoint(viewX, viewY)
         } else {
@@ -1361,9 +1445,45 @@ fun CameraXViewfinder(
                             CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                             CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
                         )
+                        if (lensCaps.isOpticalStabilizationSupported) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                            )
+                        }
                     }
-                    VideoStabilizationMode.STANDARD, VideoStabilizationMode.ACTIVE -> {
-                        if (lensCaps.isStabilizationSupported) {
+                    VideoStabilizationMode.STANDARD -> {
+                        when {
+                            lensCaps.isDigitalVideoStabilizationSupported -> {
+                                optionsBuilder.setCaptureRequestOption(
+                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                                )
+                            }
+                            lensCaps.isPreviewStabilizationSupported &&
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+                                optionsBuilder.setCaptureRequestOption(
+                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                    2 // CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
+                                )
+                            }
+                            lensCaps.isOpticalStabilizationSupported -> {
+                                optionsBuilder.setCaptureRequestOption(
+                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+                                )
+                            }
+                        }
+                    }
+                    VideoStabilizationMode.ACTIVE -> {
+                        if (lensCaps.isPreviewStabilizationSupported &&
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                        ) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                2 // CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
+                            )
+                        } else if (lensCaps.isDigitalVideoStabilizationSupported) {
                             optionsBuilder.setCaptureRequestOption(
                                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
@@ -2184,19 +2304,12 @@ fun CameraXViewfinder(
                     }
                 }
 
-                // Coordinate sensor-measured progress with keyframe acquisition
+                // Coordinate sensor-measured progress with keyframe acquisition:
+                // Request a keyframe from the ImageAnalysis stream (so all frames share identical 4:3 sensor FOV and resolution).
                 val currentFrames = panoramaKeyframes.size
                 if (panoramaAnalyzer.motionTracker.shouldAcquireNextKeyframe(currentFrames, lastSensorKeyframeProgress)) {
                     lastSensorKeyframeProgress = panoramaAnalyzer.motionTracker.currentProgress()
                     panoramaAnalyzer.requestManualStepCapture()
-                    // Also acquire from preview surface if ImageAnalysis hasn't delivered the slice yet
-                    val previewBmp = runCatching { previewView.bitmap }.getOrNull()
-                    if (previewBmp != null && previewBmp.width > 16 && previewBmp.height > 16 &&
-                        panoramaKeyframes.size < PanoramaProcessor.DEFAULT_TARGET_FRAMES
-                    ) {
-                        panoramaKeyframes.add(previewBmp)
-                        panoramaAnalyzer.recordExternalKeyframe(lastSensorKeyframeProgress)
-                    }
                 }
 
                 val updatedFrames = maxOf(1, panoramaKeyframes.size)
@@ -2272,17 +2385,18 @@ fun CameraXViewfinder(
         if (isPanoramaCapturingRequested) {
             if (isPanoramaProcessingInFlight.get()) return@LaunchedEffect
             clearPanoramaKeyframes()
-            // Capture anchor frame #1 at the starting orientation (progress = 0.0f)
-            val initialPreviewBmp = runCatching { previewView.bitmap }.getOrNull()
-            if (initialPreviewBmp != null && initialPreviewBmp.width > 16 && initialPreviewBmp.height > 16) {
-                panoramaKeyframes.add(initialPreviewBmp)
-            }
             val currentDisplayRotation = previewView.display?.rotation ?: android.view.Surface.ROTATION_0
             panoramaAnalyzer.startSession(
                 selectedDirection = panoramaDirection,
                 targetFrameCount = PanoramaProcessor.DEFAULT_TARGET_FRAMES,
                 screenRotation = currentDisplayRotation
             )
+            // Request anchor frame #1 from ImageAnalysis; if unavailable within 120ms (e.g. unit test / preview-only), fall back to previewView.bitmap
+            panoramaAnalyzer.requestManualStepCapture()
+            val initialPreviewBmp = runCatching { previewView.bitmap }.getOrNull()
+            if (panoramaKeyframes.isEmpty() && initialPreviewBmp != null && initialPreviewBmp.width > 16 && initialPreviewBmp.height > 16) {
+                panoramaKeyframes.add(initialPreviewBmp)
+            }
             latestOnPanoramaStateChanged?.invoke(
                 PanoramaLiveState(
                     phase = PanoramaCapturePhase.CAPTURING,
@@ -3121,7 +3235,54 @@ fun discoverVideoQualitiesFromHardware(
 }
 
 /**
- * Queries Camera2 CameraCharacteristics and CameraX VideoCapabilities to discover
+ * Queries hardware MediaCodec H.264 (AVC) and HEVC video encoders to determine the maximum
+ * supported frame rate at each candidate [VideoResolution].
+ */
+internal fun queryHardwareEncoderMaxFpsByResolution(): Map<VideoResolution, Double> {
+    val result = mutableMapOf<VideoResolution, Double>()
+    try {
+        val codecList = android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+        val videoMimeTypes = setOf(
+            android.media.MediaFormat.MIMETYPE_VIDEO_AVC,
+            android.media.MediaFormat.MIMETYPE_VIDEO_HEVC
+        )
+        for (info in codecList.codecInfos) {
+            if (!info.isEncoder) continue
+            for (type in info.supportedTypes) {
+                val matchedMime = videoMimeTypes.firstOrNull { it.equals(type, ignoreCase = true) } ?: continue
+                val caps = runCatching { info.getCapabilitiesForType(matchedMime)?.videoCapabilities }.getOrNull() ?: continue
+                for (res in VideoResolution.VIDEO_MODE_OPTIONS) {
+                    val w = res.width
+                    val h = res.height
+                    val sizeSupported = runCatching {
+                        caps.isSizeSupported(w, h) || caps.isSizeSupported(h, w)
+                    }.getOrDefault(false)
+                    if (!sizeSupported) continue
+                    val supportedUpper = runCatching {
+                        val r1 = if (caps.isSizeSupported(w, h)) caps.getSupportedFrameRatesFor(w, h)?.upper ?: 0.0 else 0.0
+                        val r2 = if (caps.isSizeSupported(h, w)) caps.getSupportedFrameRatesFor(h, w)?.upper ?: 0.0 else 0.0
+                        maxOf(r1, r2)
+                    }.getOrDefault(30.0)
+                    val rate60Supported = runCatching {
+                        caps.areSizeAndRateSupported(w, h, 60.0) || caps.areSizeAndRateSupported(h, w, 60.0)
+                    }.getOrDefault(false)
+                    val effectiveMax = if (rate60Supported) maxOf(supportedUpper, 60.0) else supportedUpper
+                    val current = result[res] ?: 0.0
+                    if (effectiveMax > current) {
+                        result[res] = effectiveMax
+                    }
+                }
+            }
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Unable to query MediaCodecList video encoder limits", e)
+    }
+    return result
+}
+
+/**
+ * Queries Camera2 CameraCharacteristics, physical sub-camera characteristics, CamcorderProfile/EncoderProfiles,
+ * MediaCodecList hardware encoder capabilities, and CameraX Codec VideoCapabilities to discover
  * genuine hardware capabilities separately for rear and front cameras without fabrication.
  */
 fun queryDeviceCameraCapabilities(
@@ -3132,6 +3293,7 @@ fun queryDeviceCameraCapabilities(
     try {
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return emptyMap()
         val cameraIdList = cameraManager.cameraIdList
+        val codecMaxFpsByRes = queryHardwareEncoderMaxFpsByResolution()
 
         for (id in cameraIdList) {
             val characteristics = cameraManager.getCameraCharacteristics(id)
@@ -3146,38 +3308,157 @@ fun queryDeviceCameraCapabilities(
             // Keep primary lens entry per facing (first discovered main back / front camera)
             if (capabilitiesMap.containsKey(lens)) continue
 
+            // Collect physical camera IDs and same-facing auxiliary camera IDs to inspect all hardware capabilities
+            val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                runCatching { characteristics.physicalCameraIds.toList() }.getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
+            val sameFacingCameraIds = cameraIdList.filter { otherId ->
+                runCatching {
+                    cameraManager.getCameraCharacteristics(otherId).get(CameraCharacteristics.LENS_FACING) == facing
+                }.getOrDefault(false)
+            }
+            val allRelevantIdsForLens = (listOf(id) + physicalIds + sameFacingCameraIds).distinct()
+            val allRelevantCharacteristics = allRelevantIdsForLens.mapNotNull { cid ->
+                runCatching { cid to cameraManager.getCameraCharacteristics(cid) }.getOrNull()
+            }
+
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val outputSizes = map?.getOutputSizes(android.graphics.ImageFormat.JPEG) ?: emptyArray()
+            val pixelArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.let {
+                PhotoOutputSize(width = it.width, height = it.height, isSensorMaxResolution = true)
+            }
 
-            val photoSizes = outputSizes.map { size ->
-                PhotoOutputSize(width = size.width, height = size.height)
-            }.sortedByDescending { it.totalPixels }
-
-            val highestNativeSize = photoSizes.firstOrNull()?.copy(isSensorMaxResolution = true)
-
-            // Discover video output sizes and per-resolution minimum frame durations
-            val rawVideoSizes = map?.getOutputSizes(android.media.MediaRecorder::class.java)
-                ?: map?.getOutputSizes(android.graphics.SurfaceTexture::class.java)
-                ?: emptyArray()
-
-            val minFrameDurationByRes = mutableMapOf<VideoResolution, Long>()
-            for (res in VideoResolution.VIDEO_MODE_OPTIONS) {
-                val matchingSize = rawVideoSizes.firstOrNull { size ->
-                    (size.width == res.width && size.height == res.height) ||
-                        (size.width == res.height && size.height == res.width)
+            // 1. Collect all still JPEG sizes across standard output sizes, high-resolution output sizes, and physical cameras
+            val rawPhotoSet = LinkedHashSet<Pair<Int, Int>>()
+            for ((_, chars) in allRelevantCharacteristics) {
+                val scMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
+                scMap.getOutputSizes(android.graphics.ImageFormat.JPEG)?.forEach { sz ->
+                    if (sz.width > 0 && sz.height > 0) rawPhotoSet.add(sz.width to sz.height)
                 }
-                if (matchingSize != null && map != null) {
-                    val minDur = try {
-                        map.getOutputMinFrameDuration(android.media.MediaRecorder::class.java, matchingSize)
-                    } catch (_: Exception) {
-                        0L
+                runCatching {
+                    scMap.getHighResolutionOutputSizes(android.graphics.ImageFormat.JPEG)?.forEach { sz ->
+                        if (sz.width > 0 && sz.height > 0) rawPhotoSet.add(sz.width to sz.height)
                     }
-                    minFrameDurationByRes[res] = minDur
+                }
+            }
+            val sortedPhotoDims = rawPhotoSet.sortedByDescending { it.first.toLong() * it.second.toLong() }
+            val maxPhotoPixels = sortedPhotoDims.firstOrNull()?.let { it.first.toLong() * it.second.toLong() } ?: 0L
+            val photoSizes = sortedPhotoDims.map { (w, h) ->
+                PhotoOutputSize(
+                    width = w,
+                    height = h,
+                    isSensorMaxResolution = (w.toLong() * h.toLong()) == maxPhotoPixels && maxPhotoPixels > 0L
+                )
+            }
+            val highestNativeSize = photoSizes.firstOrNull()
+            val isFullSensorExposed = pixelArraySize != null && highestNativeSize != null &&
+                highestNativeSize.totalPixels >= (pixelArraySize.totalPixels * 90L) / 100L
+
+            // 2. Collect video stream sizes and minimum frame durations across MediaRecorder, MediaCodec, SurfaceTexture, and YUV_420_888
+            val streamVideoSizes = LinkedHashSet<Pair<Int, Int>>()
+            val minFrameDurationByRes = mutableMapOf<VideoResolution, Long>()
+
+            for ((_, chars) in allRelevantCharacteristics) {
+                val scMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
+                val recSizes = scMap.getOutputSizes(android.media.MediaRecorder::class.java) ?: emptyArray()
+                val codecSizes = scMap.getOutputSizes(android.media.MediaCodec::class.java) ?: emptyArray()
+                val texSizes = scMap.getOutputSizes(android.graphics.SurfaceTexture::class.java) ?: emptyArray()
+                val yuvSizes = scMap.getOutputSizes(android.graphics.ImageFormat.YUV_420_888) ?: emptyArray()
+                val hiResYuvSizes = runCatching {
+                    scMap.getHighResolutionOutputSizes(android.graphics.ImageFormat.YUV_420_888) ?: emptyArray()
+                }.getOrDefault(emptyArray())
+
+                val combinedSizes = (recSizes + codecSizes + texSizes + yuvSizes + hiResYuvSizes).distinct()
+                for (sz in combinedSizes) {
+                    if (sz.width > 0 && sz.height > 0) {
+                        streamVideoSizes.add(maxOf(sz.width, sz.height) to minOf(sz.width, sz.height))
+                    }
+                }
+
+                for (res in VideoResolution.VIDEO_MODE_OPTIONS) {
+                    val matchingSize = combinedSizes.firstOrNull { sz ->
+                        (sz.width == res.width && sz.height == res.height) ||
+                            (sz.width == res.height && sz.height == res.width)
+                    } ?: continue
+
+                    val candidateDurations = listOf(
+                        runCatching { scMap.getOutputMinFrameDuration(android.media.MediaCodec::class.java, matchingSize) }.getOrDefault(0L),
+                        runCatching { scMap.getOutputMinFrameDuration(android.graphics.SurfaceTexture::class.java, matchingSize) }.getOrDefault(0L),
+                        runCatching { scMap.getOutputMinFrameDuration(android.graphics.ImageFormat.YUV_420_888, matchingSize) }.getOrDefault(0L),
+                        runCatching { scMap.getOutputMinFrameDuration(android.media.MediaRecorder::class.java, matchingSize) }.getOrDefault(0L)
+                    ).filter { it > 0L }
+
+                    val bestDuration = candidateDurations.minOrNull() ?: 0L
+                    if (bestDuration > 0L) {
+                        val existing = minFrameDurationByRes[res] ?: 0L
+                        if (existing == 0L || bestDuration < existing) {
+                            minFrameDurationByRes[res] = bestDuration
+                        }
+                    }
                 }
             }
 
-            // Query CameraX Recorder.getVideoCapabilities for this camera selector when cameraProvider is available
-            val cameraXSupportedResolutions: Set<VideoResolution>? = try {
+            // 3. Collect high-speed video sizes and max FPS
+            val highSpeedSizeToMaxFps = mutableMapOf<Pair<Int, Int>, Int>()
+            for ((_, chars) in allRelevantCharacteristics) {
+                val scMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
+                val hsSizes = runCatching { scMap.highSpeedVideoSizes ?: emptyArray() }.getOrDefault(emptyArray())
+                for (hsSize in hsSizes) {
+                    val ranges = runCatching { scMap.getHighSpeedVideoFpsRangesFor(hsSize) ?: emptyArray() }.getOrDefault(emptyArray())
+                    val maxFps = ranges.maxOfOrNull { it.upper } ?: 0
+                    if (maxFps > 0) {
+                        val key = maxOf(hsSize.width, hsSize.height) to minOf(hsSize.width, hsSize.height)
+                        val prev = highSpeedSizeToMaxFps[key] ?: 0
+                        if (maxFps > prev) highSpeedSizeToMaxFps[key] = maxFps
+                    }
+                }
+            }
+
+            // 4. Query CamcorderProfile & EncoderProfiles for explicit resolution + frameRate support
+            val camcorderMaxFpsByRes = mutableMapOf<VideoResolution, Int>()
+            for (cid in allRelevantIdsForLens) {
+                val camIdInt = cid.toIntOrNull()
+                val qualityPairs = listOf(
+                    android.media.CamcorderProfile.QUALITY_720P to VideoResolution.HD_720P,
+                    android.media.CamcorderProfile.QUALITY_1080P to VideoResolution.FHD_1080P,
+                    10 to VideoResolution.QHD_2K, // CamcorderProfile.QUALITY_2K
+                    11 to VideoResolution.QHD_2K, // CamcorderProfile.QUALITY_QHD
+                    android.media.CamcorderProfile.QUALITY_2160P to VideoResolution.UHD_4K,
+                    android.media.CamcorderProfile.QUALITY_HIGH_SPEED_720P to VideoResolution.HD_720P,
+                    android.media.CamcorderProfile.QUALITY_HIGH_SPEED_1080P to VideoResolution.FHD_1080P,
+                    android.media.CamcorderProfile.QUALITY_HIGH_SPEED_2160P to VideoResolution.UHD_4K
+                )
+                for ((qCode, videoRes) in qualityPairs) {
+                    try {
+                        val hasProf = if (camIdInt != null) {
+                            android.media.CamcorderProfile.hasProfile(camIdInt, qCode)
+                        } else false
+                        if (hasProf && camIdInt != null) {
+                            var profFps = 0
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                val encProfiles = runCatching { android.media.CamcorderProfile.getAll(cid, qCode) }.getOrNull()
+                                profFps = encProfiles?.videoProfiles?.maxOfOrNull { it.frameRate } ?: 0
+                            }
+                            if (profFps <= 0) {
+                                val legacyProf = runCatching {
+                                    @Suppress("DEPRECATION")
+                                    android.media.CamcorderProfile.get(camIdInt, qCode)
+                                }.getOrNull()
+                                profFps = legacyProf?.videoFrameRate ?: 30
+                            }
+                            val prev = camcorderMaxFpsByRes[videoRes] ?: 0
+                            if (profFps > prev) camcorderMaxFpsByRes[videoRes] = profFps
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+
+            // 5. Query CameraX Recorder.getVideoCapabilities (both CODEC_CAPABILITIES and CAMCORDER_PROFILE) & PreviewCapabilities
+            val cameraXSupportedResolutions = mutableSetOf<VideoResolution>()
+            var isCameraXVideoStabSupported = false
+            var isCameraXPreviewStabSupported = false
+            try {
                 if (cameraProvider != null) {
                     val selector = if (lens == CameraLens.FRONT) {
                         CameraSelector.DEFAULT_FRONT_CAMERA
@@ -3186,63 +3467,73 @@ fun queryDeviceCameraCapabilities(
                     }
                     val matchingCameraInfo = selector.filter(cameraProvider.availableCameraInfos).firstOrNull()
                     if (matchingCameraInfo != null) {
-                        val videoCaps = Recorder.getVideoCapabilities(matchingCameraInfo)
-                        val qualities = videoCaps.getSupportedQualities(DynamicRange.SDR)
-                        val resolvedSet = mutableSetOf<VideoResolution>()
+                        val codecVideoCaps = Recorder.getVideoCapabilities(
+                            matchingCameraInfo,
+                            Recorder.VIDEO_CAPABILITIES_SOURCE_CODEC_CAPABILITIES
+                        )
+                        val profileVideoCaps = Recorder.getVideoCapabilities(
+                            matchingCameraInfo,
+                            Recorder.VIDEO_CAPABILITIES_SOURCE_CAMCORDER_PROFILE
+                        )
+                        isCameraXVideoStabSupported = codecVideoCaps.isStabilizationSupported || profileVideoCaps.isStabilizationSupported
+                        isCameraXPreviewStabSupported = runCatching {
+                            Preview.getPreviewCapabilities(matchingCameraInfo).isStabilizationSupported
+                        }.getOrDefault(false)
+
+                        val qualities = (
+                            codecVideoCaps.getSupportedQualities(DynamicRange.SDR) +
+                                profileVideoCaps.getSupportedQualities(DynamicRange.SDR)
+                            ).distinct()
                         for (q in qualities) {
-                            q.toVideoResolution()?.let { resolvedSet.add(it) }
+                            q.toVideoResolution()?.let { cameraXSupportedResolutions.add(it) }
                         }
-                        resolvedSet
-                    } else null
-                } else {
-                    val camIdInt = id.toIntOrNull()
-                    if (camIdInt != null) {
-                        buildSet {
-                            if (android.media.CamcorderProfile.hasProfile(camIdInt, android.media.CamcorderProfile.QUALITY_720P)) {
-                                add(VideoResolution.HD_720P)
-                            }
-                            if (android.media.CamcorderProfile.hasProfile(camIdInt, android.media.CamcorderProfile.QUALITY_1080P)) {
-                                add(VideoResolution.FHD_1080P)
-                            }
-                            if (android.media.CamcorderProfile.hasProfile(camIdInt, android.media.CamcorderProfile.QUALITY_2160P)) {
-                                add(VideoResolution.UHD_4K)
-                            }
-                        }.takeIf { it.isNotEmpty() }
-                    } else null
+                        // If CameraX codec capabilities support UHD (3840x2160) and the camera stream map exposes 2560x1440,
+                        // QHD_2K is also within the validated CameraX codec capability envelope.
+                        if (VideoResolution.UHD_4K in cameraXSupportedResolutions &&
+                            (VideoResolution.QHD_2K.width to VideoResolution.QHD_2K.height) in streamVideoSizes
+                        ) {
+                            cameraXSupportedResolutions.add(VideoResolution.QHD_2K)
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Unable to query CameraX VideoCapabilities for ${lens.displayName}", e)
-                null
             }
 
-            val aeFpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList()
-                ?: emptyList()
+            // 6. Collect AE target FPS ranges and stabilization modes across logical and physical camera characteristics
+            val aeFpsRangesList = mutableListOf<Range<Int>>()
+            val videoStabModesSet = LinkedHashSet<Int>()
+            val oisModesSet = LinkedHashSet<Int>()
+            for ((_, chars) in allRelevantCharacteristics) {
+                chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.forEach { r ->
+                    aeFpsRangesList.add(r)
+                }
+                chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.forEach { m ->
+                    videoStabModesSet.add(m)
+                }
+                chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.forEach { m ->
+                    oisModesSet.add(m)
+                }
+            }
 
-            val supportedVideoQualities = discoverVideoQualitiesFromHardware(
-                videoOutputSizes = rawVideoSizes.toList(),
+            val verifiedVideoProfile = com.example.core.camera.buildVerifiedVideoCapabilityProfile(
+                streamVideoSizes = streamVideoSizes,
                 minFrameDurationNanosByResolution = minFrameDurationByRes,
-                aeFpsRanges = aeFpsRanges,
-                cameraXSupportedResolutions = cameraXSupportedResolutions
+                aeFpsRanges = aeFpsRangesList.map { it.lower to it.upper },
+                highSpeedSizeToMaxFps = highSpeedSizeToMaxFps,
+                cameraXSupportedResolutions = cameraXSupportedResolutions,
+                camcorderMaxFpsByResolution = camcorderMaxFpsByRes,
+                codecMaxFpsByResolution = codecMaxFpsByRes,
+                availableVideoStabilizationModes = videoStabModesSet.toList(),
+                availableOpticalStabilizationModes = oisModesSet.toList(),
+                isCameraXVideoStabilizationSupported = isCameraXVideoStabSupported,
+                isCameraXPreviewStabilizationSupported = isCameraXPreviewStabSupported
             )
 
-            // Discover real stabilization capabilities
-            val availableVideoStabModes = characteristics.get(
-                CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES
-            ) ?: IntArray(0)
-            val availableOisModes = characteristics.get(
-                CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION
-            ) ?: IntArray(0)
-
-            val hasDigitalVideoStab = availableVideoStabModes.any {
-                it == CameraCharacteristics.CONTROL_VIDEO_STABILIZATION_MODE_ON
-            }
-            val hasOpticalStab = availableOisModes.any {
-                it == CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON
-            }
-            val isActiveStabSupported = hasOpticalStab && hasDigitalVideoStab
-
             // Discover real flash / torch hardware availability
-            val hasFlashUnit = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            val hasFlashUnit = allRelevantCharacteristics.any { (_, chars) ->
+                chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            }
 
             val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             val shutterRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
@@ -3265,6 +3556,10 @@ fun queryDeviceCameraCapabilities(
                 availableControlModes = controlModes
             )
             val availableCapabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() ?: emptyList()
+            val isLogicalMultiCam = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                availableCapabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) &&
+                    physicalIds.size >= 2
+            } else false
             val rawOutputSizes = map?.getOutputSizes(android.graphics.ImageFormat.RAW_SENSOR)
             val isRawSupported = availableCapabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) ||
                 (rawOutputSizes != null && rawOutputSizes.isNotEmpty())
@@ -3300,6 +3595,37 @@ fun queryDeviceCameraCapabilities(
                 1f / 3f
             }
 
+            // Hardware zoom range from CONTROL_ZOOM_RATIO_RANGE (API 30+) or SCALER_AVAILABLE_MAX_DIGITAL_ZOOM
+            val zoomRatioRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                runCatching { characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) }.getOrNull()
+            } else null
+            val maxDigitalZoom = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 4.0f
+            val hwMinZoom = (zoomRatioRange?.lower ?: 1.0f).coerceAtLeast(0.5f)
+            val hwMaxZoom = (zoomRatioRange?.upper ?: maxDigitalZoom).coerceAtLeast(1.0f)
+            val resolvedZoomRange = com.example.core.camera.resolveSupportedZoomRange(hwMinZoom, hwMaxZoom)
+            val zoomShortcuts = com.example.core.camera.generateZoomShortcuts(
+                resolvedZoomRange.start,
+                resolvedZoomRange.endInclusive
+            )
+
+            val focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            val primaryFocalMm = focalLengths?.firstOrNull()
+            val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)
+                ?: if (lens == CameraLens.FRONT) 270 else 90
+
+            val maxMpLabel = highestNativeSize?.formattedMegapixels ?: pixelArraySize?.formattedMegapixels
+            val focalLabel = primaryFocalMm?.let { String.format(Locale.US, "%.1fmm", it) }
+            val sensorDesc = buildString {
+                append(lens.displayName)
+                append(" • ID $id")
+                if (!maxMpLabel.isNullOrBlank()) {
+                    append(" • $maxMpLabel")
+                }
+                if (!focalLabel.isNullOrBlank()) {
+                    append(" • $focalLabel")
+                }
+            }
+
             val manualCap = ManualSensorCapabilities(
                 isManualIsoSupported = isoRange != null,
                 isoRange = isoRange?.let { it.lower..it.upper },
@@ -3325,71 +3651,34 @@ fun queryDeviceCameraCapabilities(
                 isExposureCompensationSupported = isEvCompSupported,
                 evRange = aeCompRange?.let { it.lower..it.upper },
                 evStepRational = evStepFloat,
-                availableZoomRatios = listOf(0.5f, 1.0f, 2.0f, 5.0f)
+                minZoomRatio = resolvedZoomRange.start,
+                maxZoomRatio = resolvedZoomRange.endInclusive,
+                availableZoomRatios = zoomShortcuts,
+                isLogicalMultiCamera = isLogicalMultiCam,
+                physicalCameraIds = physicalIds
             )
-
-            val highSpeedFpsRanges = try {
-                map?.getHighSpeedVideoFpsRanges() ?: emptyArray()
-            } catch (_: Exception) {
-                emptyArray()
-            }
-            val supportedSlowMoRatesList = mutableListOf<VideoFrameRate>()
-            val slowMoResolutionsByRate = mutableMapOf<VideoFrameRate, List<VideoResolution>>()
-            val maxHighSpeedFps = highSpeedFpsRanges.maxOfOrNull { it.upper } ?: aeFpsRanges.maxOfOrNull { it.upper } ?: 30
-            val candidateSlowMoRates = listOf(
-                VideoFrameRate.FPS_120,
-                VideoFrameRate.FPS_240,
-                VideoFrameRate.FPS_360,
-                VideoFrameRate.FPS_480
-            )
-            for (rate in candidateSlowMoRates) {
-                if (maxHighSpeedFps >= rate.fps) {
-                    supportedSlowMoRatesList.add(rate)
-                    val matchingRanges = highSpeedFpsRanges.filter { it.upper >= rate.fps }
-                    val sizesForRate = matchingRanges.flatMap { range ->
-                        try {
-                            map?.getHighSpeedVideoSizesFor(range)?.toList() ?: emptyList()
-                        } catch (_: Exception) {
-                            emptyList()
-                        }
-                    }
-                    val mappedResolutions = sizesForRate.mapNotNull { sz ->
-                        val maxDim = maxOf(sz.width, sz.height)
-                        val minDim = minOf(sz.width, sz.height)
-                        when {
-                            maxDim >= 3840 && minDim >= 2160 -> VideoResolution.UHD_4K
-                            maxDim >= 1920 && minDim >= 1080 -> VideoResolution.FHD_1080P
-                            maxDim >= 1280 && minDim >= 720 -> VideoResolution.HD_720P
-                            else -> null
-                        }
-                    }.distinct()
-                    if (mappedResolutions.isNotEmpty()) {
-                        slowMoResolutionsByRate[rate] = mappedResolutions
-                    }
-                }
-            }
-            if (supportedSlowMoRatesList.isEmpty()) {
-                supportedSlowMoRatesList.add(VideoFrameRate.FPS_120)
-                supportedSlowMoRatesList.add(VideoFrameRate.FPS_240)
-                val fallbackRes = supportedVideoQualities.keys.filter {
-                    it == VideoResolution.HD_720P || it == VideoResolution.FHD_1080P
-                }.ifEmpty { listOf(VideoResolution.HD_720P, VideoResolution.FHD_1080P) }
-                slowMoResolutionsByRate[VideoFrameRate.FPS_120] = fallbackRes
-                slowMoResolutionsByRate[VideoFrameRate.FPS_240] = fallbackRes
-            }
 
             val lensCap = LensCapabilities(
                 lens = lens,
                 supportedPhotoSizes = photoSizes,
                 highestNativeStillSize = highestNativeSize,
-                supportedVideoQualities = supportedVideoQualities,
-                supportedSlowMoRates = supportedSlowMoRatesList,
-                supportedSlowMoResolutionsByRate = slowMoResolutionsByRate,
-                isStabilizationSupported = hasDigitalVideoStab || hasOpticalStab,
-                isOpticalStabilizationSupported = hasOpticalStab,
-                isActiveStabilizationSupported = isActiveStabSupported,
+                supportedVideoQualities = verifiedVideoProfile.supportedVideoQualities,
+                supportedSlowMoRates = verifiedVideoProfile.supportedSlowMoRates,
+                supportedSlowMoResolutionsByRate = verifiedVideoProfile.supportedSlowMoResolutionsByRate,
+                supportedStabilizationModesByConfig = verifiedVideoProfile.supportedStabilizationModesByConfig,
+                isStabilizationSupported = verifiedVideoProfile.isStabilizationSupported,
+                isDigitalVideoStabilizationSupported = verifiedVideoProfile.isDigitalVideoStabilizationSupported,
+                isPreviewStabilizationSupported = verifiedVideoProfile.isPreviewStabilizationSupported,
+                isOpticalStabilizationSupported = verifiedVideoProfile.isOpticalStabilizationSupported,
+                isActiveStabilizationSupported = verifiedVideoProfile.isActiveStabilizationSupported,
                 isTorchSupported = hasFlashUnit,
-                sensorDescription = "Camera ID $id",
+                isFullSensorResolutionExposed = isFullSensorExposed,
+                sensorPixelArraySize = pixelArraySize,
+                camera2CameraId = id,
+                physicalCameraIds = physicalIds,
+                focalLengthMm = primaryFocalMm,
+                sensorOrientationDegrees = sensorOrientation,
+                sensorDescription = sensorDesc,
                 manualCapabilities = manualCap
             )
 
@@ -3829,6 +4118,16 @@ internal fun saveVideoFileToMediaStore(
     val nowMs = System.currentTimeMillis()
     val nowSec = nowMs / 1000L
 
+    val videoRotation = runCatching {
+        val retriever = android.media.MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(videoFile.absolutePath)
+            retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }.getOrDefault(0)
+
     val insertValues = ContentValues().apply {
         put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
         put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -3844,6 +4143,7 @@ internal fun saveVideoFileToMediaStore(
             put(MediaStore.MediaColumns.HEIGHT, height)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            put(MediaStore.Video.Media.ORIENTATION, videoRotation)
             put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/Camera")
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
