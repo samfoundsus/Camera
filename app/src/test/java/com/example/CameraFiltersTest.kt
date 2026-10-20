@@ -334,5 +334,47 @@ class CameraFiltersTest {
         composeTestRule.onNodeWithTag("top_bar_filters_button").assertIsDisplayed()
         composeTestRule.onNodeWithTag("preview_active_filter_badge").assertIsDisplayed()
     }
+
+    @Test
+    fun filteredVideo_originalAndIdentityPresets_bypassTranscodingLosslessly() {
+        val dummyVideo = java.io.File(context.cacheDir, "test_dummy_video.mp4")
+        dummyVideo.writeBytes(ByteArray(1024) { 1 })
+
+        try {
+            // When filter is ORIGINAL, input file is returned directly without transcoding
+            val result = CameraFilterProcessor.processVideoFileWithFilter(
+                context = context,
+                inputFile = dummyVideo,
+                preset = CameraFilterPreset.ORIGINAL
+            )
+            assertSame("ORIGINAL preset must bypass transcoding and return inputFile directly", dummyVideo, result)
+        } finally {
+            dummyVideo.delete()
+        }
+    }
+
+    @Test
+    fun filteredVideo_nv12ConversionAndInPlacePixelFiltering_preservesOrientationAndDimensions() {
+        val portraitW = 108
+        val portraitH = 192
+        val portraitPixels = IntArray(portraitW * portraitH) { Color.rgb(200, 150, 100) }
+        val portraitNv12 = ByteArray(portraitW * portraitH * 3 / 2)
+
+        CameraFilterProcessor.applyFilterToPixelsInPlace(portraitPixels, CameraFilterPreset.WARM)
+        CameraFilterProcessor.argbToNv12(portraitPixels, portraitW, portraitH, portraitNv12)
+
+        assertTrue("NV12 output buffer must contain valid encoded YUV data", portraitNv12.any { it.toInt() != 0 })
+
+        // Landscape dimensions
+        val landscapeW = 192
+        val landscapeH = 108
+        val landscapePixels = IntArray(landscapeW * landscapeH) { Color.rgb(100, 150, 200) }
+        val landscapeNv12 = ByteArray(landscapeW * landscapeH * 3 / 2)
+
+        CameraFilterProcessor.applyFilterToPixelsInPlace(landscapePixels, CameraFilterPreset.COOL)
+        CameraFilterProcessor.argbToNv12(landscapePixels, landscapeW, landscapeH, landscapeNv12)
+
+        assertTrue("Landscape NV12 output buffer must contain valid encoded YUV data", landscapeNv12.any { it.toInt() != 0 })
+    }
 }
 

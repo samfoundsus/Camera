@@ -970,9 +970,24 @@ object CameraFilterProcessor {
                 return false
             }
 
-            // Ensure even dimensions for YUV420 H.264 encoding
-            val width = (rawWidth and 0xFFFE).coerceAtLeast(16)
-            val height = (rawHeight and 0xFFFE).coerceAtLeast(16)
+            // Inspect initial sample frame to determine actual decoded bitmap dimensions.
+            // MediaMetadataRetriever on Android auto-rotates decoded frames to upright display orientation.
+            val sampleFrame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                retriever.getFrameAtIndex(0) ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            } else {
+                retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            } ?: return false
+
+            val decodedW = sampleFrame.width
+            val decodedH = sampleFrame.height
+            sampleFrame.recycle()
+
+            // If decoded bitmap is already in upright display orientation (e.g. portrait 1080x1920 from 1920x1080 stream),
+            // output pixel buffer matches decoded dimensions directly and rotation hint must be 0 to avoid double rotation.
+            val isAutoRotated = (rotationDegrees == 90 || rotationDegrees == 270) && (decodedW == rawHeight && decodedH == rawWidth)
+            val width = (decodedW and 0xFFFE).coerceAtLeast(16)
+            val height = (decodedH and 0xFFFE).coerceAtLeast(16)
+            val outputRotationHint = if (isAutoRotated) 0 else rotationDegrees
 
             extractor = MediaExtractor()
             extractor.setDataSource(inputFile.absolutePath)
@@ -1039,8 +1054,8 @@ object CameraFilterProcessor {
             encoder.start()
 
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            if (rotationDegrees == 90 || rotationDegrees == 180 || rotationDegrees == 270) {
-                muxer.setOrientationHint(rotationDegrees)
+            if (outputRotationHint == 90 || outputRotationHint == 180 || outputRotationHint == 270) {
+                muxer.setOrientationHint(outputRotationHint)
             }
 
             var muxerVideoTrack = -1
@@ -1081,44 +1096,38 @@ object CameraFilterProcessor {
                 }
             }
 
-            // Cap maximum decoded frames on very long clips to prevent excessive latency on lower-end devices
-            val maxFramesToProcess = min(frameTimestampsUs.size, 300)
-            val step = if (frameTimestampsUs.size > maxFramesToProcess) {
-                frameTimestampsUs.size.toFloat() / maxFramesToProcess.toFloat()
-            } else {
-                1.0f
-            }
+            // Sequential hardware-accelerated frame decoding preserving full duration and frame order
+            val totalFrameCount = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)?.toIntOrNull() ?: 0
+            } else 0
+            val hasFrameIndex = totalFrameCount > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+            val totalFrames = if (hasFrameIndex) totalFrameCount else frameTimestampsUs.size
 
-            var lastExtractedFrame: Bitmap? = null
-            var lastExtractedPtsUs = -1_000_000L
-
-            for (idx in 0 until maxFramesToProcess) {
-                val sourceIdx = (idx * step).toInt().coerceIn(0, frameTimestampsUs.lastIndex)
-                val ptsUs = frameTimestampsUs[sourceIdx]
-
-                val rawFrame = if (lastExtractedFrame != null && abs(ptsUs - lastExtractedPtsUs) < 15_000L) {
-                    lastExtractedFrame
+            for (idx in 0 until totalFrames) {
+                val ptsUs = if (idx < frameTimestampsUs.size) {
+                    frameTimestampsUs[idx]
                 } else {
-                    val fetched = retriever.getFrameAtTime(ptsUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                        ?: retriever.getFrameAtTime(ptsUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                        ?: lastExtractedFrame
-                    if (fetched != null && fetched !== lastExtractedFrame) {
-                        lastExtractedFrame?.recycle()
-                        lastExtractedFrame = fetched
-                        lastExtractedPtsUs = ptsUs
-                    }
-                    fetched
+                    idx * 1_000_000L / sourceFps
+                }
+
+                val rawFrame = if (hasFrameIndex) {
+                    retriever.getFrameAtIndex(idx) ?: retriever.getFrameAtTime(ptsUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                } else {
+                    retriever.getFrameAtTime(ptsUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 } ?: continue
 
-                val scaledFrame = if (rawFrame.width != width || rawFrame.height != height) {
+                val frameToUse = if (rawFrame.width != width || rawFrame.height != height) {
                     Bitmap.createScaledBitmap(rawFrame, width, height, true)
                 } else {
                     rawFrame
                 }
 
-                scaledFrame.getPixels(pixels, 0, width, 0, 0, width, height)
-                if (scaledFrame !== rawFrame && !scaledFrame.isRecycled) {
-                    scaledFrame.recycle()
+                frameToUse.getPixels(pixels, 0, width, 0, 0, width, height)
+                if (frameToUse !== rawFrame && !frameToUse.isRecycled) {
+                    frameToUse.recycle()
+                }
+                if (!rawFrame.isRecycled) {
+                    rawFrame.recycle()
                 }
 
                 // Apply the shared filter pipeline to the video frame pixels
@@ -1137,8 +1146,6 @@ object CameraFilterProcessor {
                 }
                 drainEncoder(endOfStream = false)
             }
-
-            lastExtractedFrame?.let { if (!it.isRecycled) it.recycle() }
 
             val eosIndex = encoder.dequeueInputBuffer(15_000L)
             if (eosIndex >= 0) {
