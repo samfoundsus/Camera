@@ -105,7 +105,7 @@ class MediaStorePhotoSaver(private val context: Context) : MediaStorageContract 
                 }
                 put(MediaStore.Images.Media.DATE_TAKEN, timestampMillis)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/PixelCamera")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
             }

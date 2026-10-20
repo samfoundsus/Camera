@@ -2014,7 +2014,7 @@ fun CameraXViewfinder(
                                         put(MediaStore.Images.Media.LONGITUDE, location.longitude)
                                     }
                                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/PixelCamera")
+                                        put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
                                         put(MediaStore.Images.Media.IS_PENDING, 1)
                                     }
                                 }
@@ -2063,7 +2063,7 @@ fun CameraXViewfinder(
                                         put(MediaStore.MediaColumns.WIDTH, processedPayload.width)
                                         put(MediaStore.MediaColumns.HEIGHT, processedPayload.height)
                                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/PixelCamera")
+                                            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
                                             put(MediaStore.Images.Media.IS_PENDING, 1)
                                         }
                                     }
@@ -3844,7 +3844,7 @@ internal fun saveVideoFileToMediaStore(
             put(MediaStore.MediaColumns.HEIGHT, height)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/PixelCamera")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/Camera")
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
     }
