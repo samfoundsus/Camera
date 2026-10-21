@@ -520,7 +520,7 @@ fun SettingsScreen(
                     SettingsRow(
                         title = "Active Camera Lens",
                         subtitle = "Target lens for photo and video streams",
-                        trailingText = activeLens.displayName,
+                        trailingText = verifiedLensCaps?.resolvedHardwareLabel ?: activeLens.displayName,
                         onClick = {}
                     )
 
@@ -530,15 +530,15 @@ fun SettingsScreen(
                         title = "Hardware Discovery Status",
                         subtitle = when (capabilitiesState) {
                             is CameraCapabilitiesState.PendingDiscovery -> {
-                                "Pending camera engine bind (Phase 2). No artificial capabilities fabricated."
+                                "Discovered Camera2 streams. Camera engine pending binding."
                             }
                             is CameraCapabilitiesState.Verified -> {
-                                "Verified device hardware streams active."
+                                "Discovered and active hardware camera streams."
                             }
                         },
                         trailingText = when (capabilitiesState) {
-                            is CameraCapabilitiesState.PendingDiscovery -> "Pending"
-                            is CameraCapabilitiesState.Verified -> "Verified"
+                            is CameraCapabilitiesState.PendingDiscovery -> "Discovered"
+                            is CameraCapabilitiesState.Verified -> "Active"
                         },
                         onClick = {}
                     )

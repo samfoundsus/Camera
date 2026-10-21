@@ -364,10 +364,6 @@ fun CameraPreviewPlaceholder(
                 isAfRequested = latestIsAutoFocusSupported,
                 isAeRequested = latestIsAutoExposureSupported
             )
-            // Immediately reset exposure compensation to neutral (0 EV) on every new focus point or focus-lock gesture
-            autoExposureSliderFloat = 0f
-            autoExposureIndex = 0
-            latestOnExposureIndexChanged?.invoke(0)
 
             val canUseEvFallback = latestEffectiveEvSupported && latestIsFocusEvEnabledForMode
             activeFocusRequest = req

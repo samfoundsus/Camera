@@ -831,9 +831,18 @@ fun CameraXViewfinder(
                         }
                     }
                 } else {
-                    val preview = Preview.Builder().build().also {
-                        it.surfaceProvider = previewView.surfaceProvider
+                    val previewAspectRatioStrategy = when (aspectRatioMode) {
+                        AspectRatioMode.RATIO_9_16 -> androidx.camera.core.resolutionselector.AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
+                        AspectRatioMode.RATIO_1_1, AspectRatioMode.RATIO_4_3 -> androidx.camera.core.resolutionselector.AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
                     }
+                    val previewResolutionSelector = androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(previewAspectRatioStrategy)
+                        .build()
+                    val preview = Preview.Builder()
+                        .setResolutionSelector(previewResolutionSelector)
+                        .build().also {
+                            it.surfaceProvider = previewView.surfaceProvider
+                        }
                     val preferMaxNative = activeMode == CameraMode.HD && hdOutputOption == HdOutputOption.MAX_NATIVE
                     val maxPhotoSize = if (preferMaxNative) {
                         activeLensCaps?.highestNativeStillSize ?: activeLensCaps?.selectOptimalPhotoOutputSize(aspectRatioMode, preferMaxNative = true)
@@ -841,9 +850,7 @@ fun CameraXViewfinder(
                         activeLensCaps?.selectOptimalPhotoOutputSize(aspectRatioMode, preferMaxNative = activeMode == CameraMode.HD)
                     }
                     val resolutionSelectorBuilder = androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
-                        .setAspectRatioStrategy(
-                            androidx.camera.core.resolutionselector.AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
-                        )
+                        .setAspectRatioStrategy(previewAspectRatioStrategy)
                     if (preferMaxNative) {
                         resolutionSelectorBuilder.setAllowedResolutionMode(
                             androidx.camera.core.resolutionselector.ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE
@@ -1185,26 +1192,10 @@ fun CameraXViewfinder(
             isHardwareAfLockActive = false
         }
 
-        // Reset hardware exposure compensation to neutral (index 0) on every new non-Pro focus or focus-lock point
         val expState = camera.cameraInfo.exposureState
         val evRange = expState.exposureCompensationRange.let { it.lower..it.upper }
         val isEvCompSupported = expState.isExposureCompensationSupported && (evRange.start < 0 || evRange.endInclusive > 0)
         val isModeFocusEvSupported = isEvCompSupported && isFocusEvSliderEnabledForMode(activeMode)
-        if (expState.isExposureCompensationSupported && 0 in evRange) {
-            try {
-                val evResetFuture = camera.cameraControl.setExposureCompensationIndex(0)
-                evResetFuture.addListener({
-                    try {
-                        val appliedIdx = evResetFuture.get()
-                        if (isFocusEvSliderEnabledForMode(latestActiveMode) && latestAutoExposureIndex == 0) {
-                            onExposureIndexApplied?.invoke(appliedIdx)
-                        }
-                    } catch (_: Exception) {}
-                }, ContextCompat.getMainExecutor(context))
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to reset exposure compensation to 0 on new focus request", e)
-            }
-        }
 
         val lensCaps = cachedCapabilities[activeLens]?.manualCapabilities
             ?: queryDeviceCameraCapabilities(context)[activeLens]?.manualCapabilities
@@ -1547,7 +1538,8 @@ fun CameraXViewfinder(
             val enableHardwareHdr = activeMode == CameraMode.PHOTO &&
                 hdrMode != com.example.core.preferences.HdrMode.OFF &&
                 (lensCaps?.isHardwareHdrSceneModeSupported == true) &&
-                effectiveNonProEvIndex == 0
+                effectiveNonProEvIndex == 0 &&
+                focusTouchRequest == null
             val enableHardwareNightScene = activeMode == CameraMode.NIGHT_SIGHT &&
                 nightSightExposure != NightSightExposure.OFF &&
                 (lensCaps?.isHardwareNightSceneModeSupported == true)
@@ -1679,6 +1671,12 @@ fun CameraXViewfinder(
                     } finally {
                         // Release camera buffer immediately before decoding/saving
                         try { imageProxy.close() } catch (_: Exception) {}
+                    }
+
+                    // Shutter button readiness: Unlock shutter immediately once frame readout completes
+                    isCaptureInFlight.set(false)
+                    mainExecutor.execute {
+                        isCapturing = false
                     }
 
                     try {
@@ -2083,21 +2081,27 @@ fun CameraXViewfinder(
                                     }
                                 }
                             } else {
+                                val allowBypass = captureMode == CameraMode.HD ||
+                                    (captureMode == CameraMode.PHOTO && captureAspectRatio == AspectRatioMode.RATIO_4_3)
                                 AspectCropUtils.processCapturedJpegBytes(
                                     sourceBytes = bytes,
                                     rotationDegrees = rotationDegrees,
                                     aspectRatioMode = captureAspectRatio,
                                     mirrorHorizontally = captureSelfieMirror,
-                                    jpegQuality = 95
+                                    jpegQuality = 95,
+                                    allowExifOrientationBypass = allowBypass
                                 )
                             }
                         } else {
+                            val allowBypass = captureMode == CameraMode.HD ||
+                                (captureMode == CameraMode.PHOTO && captureAspectRatio == AspectRatioMode.RATIO_4_3)
                             AspectCropUtils.processCapturedJpegBytes(
                                 sourceBytes = bytes,
                                 rotationDegrees = rotationDegrees,
                                 aspectRatioMode = captureAspectRatio,
                                 mirrorHorizontally = captureSelfieMirror,
-                                jpegQuality = 95
+                                jpegQuality = 95,
+                                allowExifOrientationBypass = allowBypass
                             )
                         }
 
@@ -3341,6 +3345,18 @@ fun queryDeviceCameraCapabilities(
                         if (sz.width > 0 && sz.height > 0) rawPhotoSet.add(sz.width to sz.height)
                     }
                 }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    runCatching {
+                        chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)?.let { maxResMap ->
+                            maxResMap.getOutputSizes(android.graphics.ImageFormat.JPEG)?.forEach { sz ->
+                                if (sz.width > 0 && sz.height > 0) rawPhotoSet.add(sz.width to sz.height)
+                            }
+                            maxResMap.getHighResolutionOutputSizes(android.graphics.ImageFormat.JPEG)?.forEach { sz ->
+                                if (sz.width > 0 && sz.height > 0) rawPhotoSet.add(sz.width to sz.height)
+                            }
+                        }
+                    }
+                }
             }
             val sortedPhotoDims = rawPhotoSet.sortedByDescending { it.first.toLong() * it.second.toLong() }
             val maxPhotoPixels = sortedPhotoDims.firstOrNull()?.let { it.first.toLong() * it.second.toLong() } ?: 0L
@@ -3487,11 +3503,15 @@ fun queryDeviceCameraCapabilities(
                         for (q in qualities) {
                             q.toVideoResolution()?.let { cameraXSupportedResolutions.add(it) }
                         }
-                        // If CameraX codec capabilities support UHD (3840x2160) and the camera stream map exposes 2560x1440,
-                        // QHD_2K is also within the validated CameraX codec capability envelope.
-                        if (VideoResolution.UHD_4K in cameraXSupportedResolutions &&
-                            (VideoResolution.QHD_2K.width to VideoResolution.QHD_2K.height) in streamVideoSizes
-                        ) {
+                        // If hardware encoder and camera stream map expose 2560x1440 (2K QHD),
+                        // add QHD_2K directly to cameraXSupportedResolutions
+                        val has2kStream = streamVideoSizes.any { (w, h) ->
+                            maxOf(w, h) == VideoResolution.QHD_2K.width && minOf(w, h) == VideoResolution.QHD_2K.height
+                        }
+                        val is2kEncoderReady = (codecMaxFpsByRes[VideoResolution.QHD_2K] ?: 0.0) >= 29.0 ||
+                            (camcorderMaxFpsByRes[VideoResolution.QHD_2K] ?: 0) > 0 ||
+                            VideoResolution.UHD_4K in cameraXSupportedResolutions
+                        if (has2kStream && is2kEncoderReady) {
                             cameraXSupportedResolutions.add(VideoResolution.QHD_2K)
                         }
                     }
@@ -3617,7 +3637,6 @@ fun queryDeviceCameraCapabilities(
             val focalLabel = primaryFocalMm?.let { String.format(Locale.US, "%.1fmm", it) }
             val sensorDesc = buildString {
                 append(lens.displayName)
-                append(" • ID $id")
                 if (!maxMpLabel.isNullOrBlank()) {
                     append(" • $maxMpLabel")
                 }

@@ -270,7 +270,8 @@ object AspectCropUtils {
         aspectRatioMode: AspectRatioMode,
         mirrorHorizontally: Boolean = false,
         jpegQuality: Int = 95,
-        filterPreset: com.example.core.preferences.CameraFilterPreset = com.example.core.preferences.CameraFilterPreset.ORIGINAL
+        filterPreset: com.example.core.preferences.CameraFilterPreset = com.example.core.preferences.CameraFilterPreset.ORIGINAL,
+        allowExifOrientationBypass: Boolean = false
     ): ProcessedPhotoPayload? {
         if (sourceBytes.isEmpty()) return null
 
@@ -305,6 +306,23 @@ object AspectCropUtils {
                 height = orientedHeight,
                 wasRecompressed = false,
                 exifOrientation = ExifInterface.ORIENTATION_NORMAL
+            )
+        }
+
+        // Fast zero-recompression path for high-res/HD captures where EXIF orientation is used instead of expensive bitmap decoding
+        if (allowExifOrientationBypass && !mirrorHorizontally && isNativeAspectMatch && isFilterIdentity) {
+            val targetExifOrientation = when (normRot) {
+                90 -> ExifInterface.ORIENTATION_ROTATE_90
+                180 -> ExifInterface.ORIENTATION_ROTATE_180
+                270 -> ExifInterface.ORIENTATION_ROTATE_270
+                else -> ExifInterface.ORIENTATION_NORMAL
+            }
+            return ProcessedPhotoPayload(
+                jpegBytes = sourceBytes,
+                width = orientedWidth,
+                height = orientedHeight,
+                wasRecompressed = false,
+                exifOrientation = targetExifOrientation
             )
         }
 

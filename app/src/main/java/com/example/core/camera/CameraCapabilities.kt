@@ -19,9 +19,9 @@ import java.util.Locale
  */
 enum class CameraLens(val id: String, val displayName: String, val facing: LensFacing, val defaultZoom: Float = 1.0f) {
     BACK_ULTRAWIDE("1", "Ultrawide (0.5x)", LensFacing.BACK, 0.5f),
-    BACK_MAIN("0", "Rear Main (1x)", LensFacing.BACK, 1.0f),
+    BACK_MAIN("0", "Main Camera (1×)", LensFacing.BACK, 1.0f),
     BACK_TELEPHOTO("2", "Telephoto (5x)", LensFacing.BACK, 5.0f),
-    FRONT("3", "Front Camera (1x)", LensFacing.FRONT, 1.0f)
+    FRONT("3", "Front Camera", LensFacing.FRONT, 1.0f)
 }
 
 /**
