@@ -365,6 +365,12 @@ fun CameraPreviewPlaceholder(
                 isAeRequested = latestIsAutoExposureSupported
             )
 
+            autoExposureSliderFloat = 0f
+            if (autoExposureIndex != 0) {
+                autoExposureIndex = 0
+                latestOnExposureIndexChanged?.invoke(0)
+            }
+
             val canUseEvFallback = latestEffectiveEvSupported && latestIsFocusEvEnabledForMode
             activeFocusRequest = req
             focusIndicatorStatus = if (isLock) {
