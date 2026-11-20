@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import com.example.core.camera.CameraCapabilitiesRepository
 import com.example.core.camera.CameraLens
 import com.example.core.camera.DefaultCameraCapabilitiesRepository
+import com.example.core.camera.NightSightProgressState
 import com.example.core.model.CameraMode
 import com.example.core.model.SystemDeviceInfo
 import com.example.core.preferences.CameraPreferences
@@ -84,9 +85,20 @@ fun CameraFoundationScreen(
     var photoCaptureTrigger by remember { mutableIntStateOf(0) }
     var lastCapturedPhotoUri by remember { mutableStateOf<Uri?>(null) }
     var captureConfirmationTrigger by remember { mutableIntStateOf(0) }
+    var showSavedBadge by remember { mutableStateOf(false) }
     var inAppViewerUri by remember { mutableStateOf<Uri?>(null) }
+
+    LaunchedEffect(captureConfirmationTrigger) {
+        if (captureConfirmationTrigger > 0) {
+            showSavedBadge = true
+            kotlinx.coroutines.delay(1150L)
+            showSavedBadge = false
+        }
+    }
     var isCountingDown by remember { mutableStateOf(false) }
     var countdownRemainingSeconds by remember { mutableIntStateOf(0) }
+    var nightSightProgress by remember { mutableStateOf(NightSightProgressState()) }
+    var nightSightCancelTrigger by remember { mutableIntStateOf(0) }
     var panoramaLiveState by remember {
         mutableStateOf(PanoramaLiveState(direction = preferences.panoramaDirection))
     }
@@ -104,9 +116,47 @@ fun CameraFoundationScreen(
     }
 
     val context = LocalContext.current
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(context) {
+        val latestUri = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            com.example.core.storage.MediaStorePhotoSaver.queryLatestGalleryMediaUri(context)
+        }
+        if (lastCapturedPhotoUri == null && latestUri != null) {
+            lastCapturedPhotoUri = latestUri
+        }
+    }
+
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner, context) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                coroutineScope.launch {
+                    val latestUri = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        com.example.core.storage.MediaStorePhotoSaver.queryLatestGalleryMediaUri(context)
+                    }
+                    if (latestUri != null) {
+                        lastCapturedPhotoUri = latestUri
+                    } else if (lastCapturedPhotoUri != null) {
+                        val stillReadable = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            runCatching {
+                                context.contentResolver.openAssetFileDescriptor(lastCapturedPhotoUri!!, "r")?.use { true } ?: false
+                            }.getOrDefault(false)
+                        }
+                        if (!stillReadable) {
+                            lastCapturedPhotoUri = null
+                        }
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     fun startPanoramaCaptureSession() {
         if (panoramaLiveState.phase != PanoramaCapturePhase.IDLE) return
@@ -235,7 +285,9 @@ fun CameraFoundationScreen(
                     }
                 }
                 else -> {
-                    photoCaptureTrigger++
+                    if (!nightSightProgress.isActive) {
+                        photoCaptureTrigger++
+                    }
                 }
             }
         }
@@ -482,6 +534,8 @@ fun CameraFoundationScreen(
                 timerMode = preferences.timerMode,
                 flashMode = preferences.flashMode,
                 hdrMode = preferences.hdrMode,
+                photoCaptureSpeedMode = preferences.photoCaptureSpeedMode,
+                showSavedConfirmationBadge = showSavedBadge,
                 selectedFilter = if (selectedMode.supportsFilters) preferences.selectedFilter else com.example.core.preferences.CameraFilterPreset.ORIGINAL,
                 onFilterBadgeClick = {
                     if (selectedMode.supportsFilters) {
@@ -614,6 +668,10 @@ fun CameraFoundationScreen(
                         selectedProControl = null
                     }
                 },
+                nightSightCancelTrigger = nightSightCancelTrigger,
+                onNightSightProgressChanged = { updatedProgress ->
+                    nightSightProgress = updatedProgress
+                },
                 onCountdownStateChanged = { counting, remaining ->
                     isCountingDown = counting
                     countdownRemainingSeconds = remaining
@@ -679,14 +737,33 @@ fun CameraFoundationScreen(
                     Spacer(modifier = Modifier.height(4.dp))
                 }
 
-                // Pixel mode carousel with auto-centering for all modes
+                // Pixel mode carousel with dynamic HD megapixel count synced from CaptureResolutionResolver
+                val modeLabelOverrides = remember(
+                    verifiedLensCaps,
+                    preferences.aspectRatioMode,
+                    preferences.hdOutputOption
+                ) {
+                    verifiedLensCaps?.let {
+                        mapOf(
+                            CameraMode.HD to com.example.core.camera.CaptureResolutionResolver.formatHdModeButtonLabel(
+                                lensCaps = it,
+                                aspectRatioMode = preferences.aspectRatioMode,
+                                hdOutputOption = preferences.hdOutputOption
+                            )
+                        )
+                    } ?: emptyMap()
+                }
                 CameraModeSelector(
                     selectedMode = selectedMode,
                     visibleModes = preferences.visibleModes,
                     hiddenModes = preferences.hiddenModes,
+                    modeLabelOverrides = modeLabelOverrides,
                     onModeSelected = { mode ->
                         if (selectedMode == CameraMode.PANORAMA && mode != CameraMode.PANORAMA) {
                             cancelPanoramaCaptureSession()
+                        }
+                        if (selectedMode == CameraMode.NIGHT_SIGHT && mode != CameraMode.NIGHT_SIGHT && nightSightProgress.isActive) {
+                            nightSightCancelTrigger++
                         }
                         selectedMode = mode
                     },
@@ -706,6 +783,10 @@ fun CameraFoundationScreen(
                     },
                     isCountingDown = isCountingDown,
                     countdownSeconds = countdownRemainingSeconds,
+                    nightSightProgress = if (selectedMode == CameraMode.NIGHT_SIGHT) nightSightProgress else NightSightProgressState(),
+                    onCancelNightSightCapture = {
+                        nightSightCancelTrigger++
+                    },
                     lastCapturedPhotoUri = lastCapturedPhotoUri,
                     captureConfirmationTrigger = captureConfirmationTrigger,
                     onShutterClick = {
@@ -724,6 +805,9 @@ fun CameraFoundationScreen(
                                         // Ignore duplicate taps while panorama stitching is in flight
                                     }
                                 }
+                            }
+                            selectedMode == CameraMode.NIGHT_SIGHT && nightSightProgress.isActive -> {
+                                // Shutter is disabled while capturing/processing; cancellation uses onCancelNightSightCapture
                             }
                             else -> {
                                 // Photo, Portrait, Night Sight, HD, Pro, Astro modes execute real image capture

@@ -38,6 +38,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import com.example.core.camera.NightSightProgressState
 import com.example.core.model.CameraMode
 import com.example.ui.components.CameraShutterButton
 import com.example.ui.components.CircularIconButton
@@ -51,6 +52,8 @@ fun CameraShutterBar(
     countdownSeconds: Int = 0,
     lastCapturedPhotoUri: Uri? = null,
     captureConfirmationTrigger: Int = 0,
+    nightSightProgress: NightSightProgressState = NightSightProgressState(),
+    onCancelNightSightCapture: () -> Unit = {},
     onShutterClick: () -> Unit = {},
     onGalleryClick: () -> Unit = {},
     onFlipCameraClick: () -> Unit = {},
@@ -75,7 +78,7 @@ fun CameraShutterBar(
 
     val handleFlipClick = {
         val now = System.currentTimeMillis()
-        if (now - lastFlipTimestamp >= 320L) {
+        if (!nightSightProgress.isActive && now - lastFlipTimestamp >= 320L) {
             lastFlipTimestamp = now
             lensFlipRotationTarget += 180f
             onFlipCameraClick()
@@ -99,7 +102,11 @@ fun CameraShutterBar(
             label = "gallery_scale"
         )
 
-        if (lastCapturedPhotoUri != null) {
+        var thumbnailLoadFailed by remember(lastCapturedPhotoUri) {
+            androidx.compose.runtime.mutableStateOf(false)
+        }
+
+        if (lastCapturedPhotoUri != null && !thumbnailLoadFailed) {
             val context = androidx.compose.ui.platform.LocalContext.current
             val videoThumbnail by androidx.compose.runtime.produceState<android.graphics.Bitmap?>(
                 initialValue = null,
@@ -148,16 +155,21 @@ fun CameraShutterBar(
                 if (bmp != null) {
                     androidx.compose.foundation.Image(
                         bitmap = bmp.asImageBitmap(),
-                        contentDescription = "Last captured photo thumbnail",
+                        contentDescription = "Latest video thumbnail",
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("gallery_thumbnail_image")
                     )
                 } else {
                     AsyncImage(
                         model = lastCapturedPhotoUri,
-                        contentDescription = "Last captured photo thumbnail",
+                        contentDescription = "Latest gallery thumbnail",
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
+                        onError = { thumbnailLoadFailed = true },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("gallery_thumbnail_image")
                     )
                 }
             }
@@ -178,22 +190,26 @@ fun CameraShutterBar(
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.PhotoLibrary,
-                        contentDescription = "Gallery preview",
+                        contentDescription = "Open gallery",
                         tint = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier
+                            .size(24.dp)
+                            .testTag("gallery_placeholder_icon")
                     )
                 }
             }
         }
 
-        // Pixel prominent double-ring shutter button with touch feedback and recording morph
+        // Pixel prominent double-ring shutter button with touch feedback, recording morph, and Night Sight progress ring
         CameraShutterButton(
             onClick = onShutterClick,
             isVideoMode = activeMode.isVideo,
             isRecording = isRecording,
             isCountingDown = isCountingDown,
             countdownSeconds = countdownSeconds,
-            captureConfirmationTrigger = captureConfirmationTrigger
+            captureConfirmationTrigger = captureConfirmationTrigger,
+            nightSightProgress = nightSightProgress,
+            onCancelNightSightCapture = onCancelNightSightCapture
         )
 
         // Camera lens switch button with 180° rotation and touch scale feedback
@@ -208,13 +224,16 @@ fun CameraShutterBar(
         ) {
             IconButton(
                 onClick = handleFlipClick,
+                enabled = !nightSightProgress.isActive,
                 interactionSource = flipInteractionSource,
                 modifier = Modifier.size(52.dp)
             ) {
                 Icon(
                     imageVector = Icons.Outlined.Cameraswitch,
                     contentDescription = "Switch front or rear camera",
-                    tint = MaterialTheme.colorScheme.onSurface,
+                    tint = MaterialTheme.colorScheme.onSurface.copy(
+                        alpha = if (nightSightProgress.isActive) 0.4f else 1f
+                    ),
                     modifier = Modifier
                         .size(24.dp)
                         .rotate(animatedRotation)

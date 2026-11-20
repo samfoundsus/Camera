@@ -30,7 +30,7 @@ class ExampleUnitTest {
     fun cameraMode_displayNames() {
         assertEquals("Night Sight", CameraMode.NIGHT_SIGHT.displayName)
         assertEquals("Portrait", CameraMode.PORTRAIT.displayName)
-        assertEquals("Camera", CameraMode.PHOTO.displayName)
+        assertEquals("Photo", CameraMode.PHOTO.displayName)
         assertEquals("HD", CameraMode.HD.displayName)
         assertEquals("Pro", CameraMode.PRO.displayName)
         assertEquals("Video", CameraMode.VIDEO.displayName)
@@ -58,15 +58,23 @@ class ExampleUnitTest {
 
     @Test
     fun photoOutputSize_calculatesMegapixelsAccuratelyWithoutFabrication() {
+        val size26mp = PhotoOutputSize(width = 1856, height = 1392)
+        assertEquals(2.583552f, size26mp.megapixels, 0.001f)
+        assertEquals("2.6 MP", size26mp.formattedMegapixels)
+        assertEquals("2.6 MP (1856 x 1392)", com.example.core.camera.CaptureResolutionResolver.formatMegapixelsWithDimensions(size26mp))
+
         val size12mp = PhotoOutputSize(width = 4032, height = 3024)
         assertEquals(12.19f, size12mp.megapixels, 0.05f)
-        assertEquals("12.2 MP", size12mp.formattedMegapixels)
+        assertEquals("12 MP", size12mp.formattedMegapixels)
         assertEquals("4032 × 3024", size12mp.dimensionsLabel)
 
         val size50mp = PhotoOutputSize(width = 8192, height = 6144, isSensorMaxResolution = true)
         assertEquals(50.33f, size50mp.megapixels, 0.05f)
-        assertEquals("50.3 MP", size50mp.formattedMegapixels)
+        assertEquals("50 MP", size50mp.formattedMegapixels)
         assertTrue(size50mp.isSensorMaxResolution)
+
+        assertEquals(null, com.example.core.camera.CaptureResolutionResolver.formatMegapixels(0, 0))
+        assertEquals(null, com.example.core.camera.CaptureResolutionResolver.formatMegapixelsWithDimensions(0, 1392))
     }
 
     @Test

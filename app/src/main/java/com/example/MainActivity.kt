@@ -16,6 +16,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.core.preferences.CameraPreferences
 import com.example.core.preferences.CameraPreferencesRepository
 import com.example.feature.preview.CameraFoundationScreen
+import com.example.feature.settings.ReorderCameraModesScreen
 import com.example.feature.settings.SettingsScreen
 import com.example.ui.theme.PixelCameraTheme
 
@@ -36,7 +37,8 @@ import kotlinx.coroutines.delay
 
 enum class CameraScreenDestination {
     CAMERA,
-    SETTINGS
+    SETTINGS,
+    REORDER_MODES
 }
 
 class MainActivity : ComponentActivity() {
@@ -75,6 +77,18 @@ class MainActivity : ComponentActivity() {
                     currentScreen = CameraScreenDestination.CAMERA
                 }
             }
+            val navigateToReorderModes: () -> Unit = {
+                if (!isNavigating && currentScreen == CameraScreenDestination.SETTINGS) {
+                    isNavigating = true
+                    currentScreen = CameraScreenDestination.REORDER_MODES
+                }
+            }
+            val navigateBackToSettings: () -> Unit = {
+                if (!isNavigating && currentScreen == CameraScreenDestination.REORDER_MODES) {
+                    isNavigating = true
+                    currentScreen = CameraScreenDestination.SETTINGS
+                }
+            }
 
             LaunchedEffect(currentScreen) {
                 delay(CameraMotionTokens.DURATION_SCREEN_ENTER.toLong())
@@ -88,7 +102,8 @@ class MainActivity : ComponentActivity() {
                 AnimatedContent(
                     targetState = currentScreen,
                     transitionSpec = {
-                        if (targetState == CameraScreenDestination.SETTINGS) {
+                        val isForward = targetState.ordinal > initialState.ordinal
+                        if (isForward) {
                             (slideInHorizontally(
                                 initialOffsetX = { fullWidth -> (fullWidth * 0.16f).toInt() },
                                 animationSpec = CameraMotionTokens.screenEnterTween()
@@ -143,6 +158,8 @@ class MainActivity : ComponentActivity() {
                                 onVideoFpsChanged = { preferencesRepository.setVideoFrameRate(it) },
                                 onVideoStabilizationChanged = { preferencesRepository.setVideoStabilization(it) },
                                 onHdOptionChanged = { preferencesRepository.setHdOutputOption(it) },
+                                onHdrModeChanged = { preferencesRepository.setHdrMode(it) },
+                                onPhotoCaptureSpeedModeChanged = { preferencesRepository.setPhotoCaptureSpeedMode(it) },
                                 onPortraitRetouchChanged = { preferencesRepository.setPortraitRetouch(it) },
                                 onPortraitBlurLevelChanged = { preferencesRepository.setPortraitBlurLevel(it) },
                                 onNightSightExposureChanged = { preferencesRepository.setNightSightExposure(it) },
@@ -159,7 +176,19 @@ class MainActivity : ComponentActivity() {
                                 onProFocusPeakingToggled = { preferencesRepository.setProFocusPeakingEnabled(it) },
                                 onCustomModeLayoutChanged = { visible, hidden -> preferencesRepository.setCustomModeLayout(visible, hidden) },
                                 onResetModeLayout = { preferencesRepository.resetModeLayoutToDefaults() },
+                                onOpenReorderModes = navigateToReorderModes,
                                 onNavigateBack = navigateToCamera
+                            )
+                        }
+                        CameraScreenDestination.REORDER_MODES -> {
+                            ReorderCameraModesScreen(
+                                visibleModeNames = preferences.visibleModeNames,
+                                hiddenModeNames = preferences.hiddenModeNames,
+                                onSaveLayout = { visible, hidden ->
+                                    preferencesRepository.setCustomModeLayout(visible, hidden)
+                                },
+                                onResetDefault = { preferencesRepository.resetModeLayoutToDefaults() },
+                                onNavigateBack = navigateBackToSettings
                             )
                         }
                     }

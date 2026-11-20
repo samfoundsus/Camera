@@ -8,12 +8,18 @@ import android.graphics.RectF
 import android.media.ExifInterface
 import android.media.FaceDetector
 import android.util.Base64
+import android.util.Log
 import com.example.core.camera.PortraitBlurDeviceSupport
 import com.example.core.camera.PortraitDepthSupportPath
 import com.example.core.preferences.AspectRatioMode
 import com.example.core.preferences.PortraitBlurLevel
 import com.example.core.preferences.PortraitRetouch
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.segmentation.subject.SubjectSegmentation
+import com.google.mlkit.vision.segmentation.subject.SubjectSegmenterOptions
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
@@ -125,8 +131,9 @@ sealed interface PortraitProcessingOutcome {
  */
 object PortraitProcessor {
 
-    private const val MAX_ANALYSIS_DIMENSION = 224
-    private const val MAX_BOKEH_BUFFER_DIMENSION = 640
+    private const val TAG = "PortraitProcessor"
+    private const val MAX_ANALYSIS_DIMENSION = 256
+    private const val MAX_BOKEH_BUFFER_DIMENSION = 960
     private const val MAX_DETECTED_FACES = 5
     private const val MAX_BORDER_PALETTE_CLUSTERS = 8
     private const val MAX_FOREGROUND_SEED_CLUSTERS = 4
@@ -432,12 +439,11 @@ object PortraitProcessor {
             if (mask.subjectType == DetectedPortraitSubjectType.NONE || mask.confidence < MIN_SUBJECT_CONFIDENCE) {
                 return PortraitBitmapResult.FallbackOriginal(
                     originalBitmap = sourceBitmap,
-                    reason = "No distinct subject detected for Portrait blur; preserved original photo."
+                    reason = "No subject found — saved original photo."
                 )
             }
 
-            // Compute bokeh buffer dimensions (caps background blur buffer at 640px for fast processing while
-            // keeping the foreground subject at 100% native resolution)
+            // Compute bokeh buffer dimensions scaled proportionally to full image resolution
             val maxDim = max(fullW, fullH)
             val bokehScale = if (maxDim > MAX_BOKEH_BUFFER_DIMENSION) {
                 MAX_BOKEH_BUFFER_DIMENSION.toFloat() / maxDim.toFloat()
@@ -450,24 +456,36 @@ object PortraitProcessor {
             val maxSupported = PortraitBlurDeviceSupport.getMaxSupportedBlurStrength()
             val clampedStrength = effectiveStrength.coerceIn(0.0f, maxSupported)
 
-            val maxRadius = (min(bokehW, bokehH) * 0.10f).coerceIn(20f, 40f)
-            val minRadius = 3.0f
+            val maxRadius = (min(bokehW, bokehH) * 0.085f).coerceIn(14f, 34f)
+            val minRadius = 2.5f
             val norm = if (clampedStrength <= 1.0f) {
-                (0.10f * clampedStrength).coerceIn(0.04f, 0.10f)
+                (0.12f * clampedStrength).coerceIn(0.05f, 0.12f)
             } else {
-                (0.10f + 0.90f * ((clampedStrength - 1.0f) / 15.0f).coerceIn(0f, 1f))
+                (0.12f + 0.88f * ((clampedStrength - 1.0f) / 15.0f).coerceIn(0f, 1f))
             }
-            val bokehRadiusPx = (minRadius + (maxRadius - minRadius) * norm).roundToInt().coerceAtLeast(3)
+            val bokehRadiusPx = (minRadius + (maxRadius - minRadius) * norm).roundToInt().coerceAtLeast(2)
             val fullEquivalentRadiusPx = (bokehRadiusPx / bokehScale).roundToInt().coerceAtLeast(bokehRadiusPx)
 
-            // Build halo-free blurred background buffer with foreground pixels excluded (weight = (1 - alpha)^3)
-            val blurredBgPixels = try {
-                computeHaloFreeBlurredBackground(
+            // Compute depth-like distance falloff from the subject mask boundary so blur increases
+            // naturally with distance away from the subject (no single flat blur across the background).
+            val distanceDepthMap = computeDistanceFromSubjectMask(
+                alphaMatte = mask.alphaMatte,
+                width = mask.width,
+                height = mask.height,
+                hardwareDepthNormalized = hardwareDepthNormalized,
+                hardwareDepthW = hardwareDepthW,
+                hardwareDepthH = hardwareDepthH
+            )
+
+            // Build 3-tier halo-free circular disc bokeh background buffers (near / mid / far)
+            // strictly excluding foreground subject pixels so subject edges have zero color bleed.
+            val bokehTiers = try {
+                computeMultiTierDiscBokehBackground(
                     sourceBitmap = sourceBitmap,
                     mask = mask,
                     bokehW = bokehW,
                     bokehH = bokehH,
-                    blurRadius = bokehRadiusPx,
+                    maxBlurRadius = bokehRadiusPx,
                     blurStrength = clampedStrength
                 )
             } catch (oom: OutOfMemoryError) {
@@ -483,7 +501,8 @@ object PortraitProcessor {
                 )
             }
 
-            // Composite at full native resolution using Guided Filter edge-refined alpha matte
+            // Composite at full native resolution using Guided Filter edge-refined soft alpha matte.
+            // Subject pixels retain 100% original exposure, white balance, and color fidelity.
             val fullPixels = IntArray(fullW * fullH)
             sourceBitmap.getPixels(fullPixels, 0, fullW, 0, 0, fullW, fullH)
 
@@ -502,6 +521,9 @@ object PortraitProcessor {
             val maskH = mask.height
             val coeffA = mask.guideCoeffA
             val coeffB = mask.guideCoeffB
+            val nearTier = bokehTiers.nearPixels
+            val midTier = bokehTiers.midPixels
+            val farTier = bokehTiers.farPixels
 
             for (y in 0 until fullH) {
                 val rowOffset = y * fullW
@@ -512,7 +534,7 @@ object PortraitProcessor {
                 // Subtle ground-plane depth taper at the very bottom 10% of the frame
                 val verticalDepthWeight = if (y > fullH * 0.90f) {
                     val t = (y - fullH * 0.90f) / (fullH * 0.10f).coerceAtLeast(1f)
-                    (1f - 0.20f * t).coerceIn(0.80f, 1f)
+                    (1f - 0.22f * t).coerceIn(0.78f, 1f)
                 } else {
                     1.0f
                 }
@@ -533,23 +555,43 @@ object PortraitProcessor {
                     val bVal = sampleBilinear(coeffB, maskW, maskH, mx, my)
                     val rawAlpha = (aVal * lumaFull + bVal).coerceIn(0f, 1f)
 
-                    // Smoothstep contrast refinement on alpha so subject core is 1.0 and background is 0.0
-                    // while hair & shoulder transitions remain smooth and halo-free
-                    val normT = ((rawAlpha - 0.14f) / 0.72f).coerceIn(0f, 1f)
+                    // Soft feathering across hair/ear/shoulder transitions while locking subject core to 1.0
+                    val normT = ((rawAlpha - 0.10f) / 0.78f).coerceIn(0f, 1f)
                     val refinedAlpha = normT * normT * (3f - 2f * normT)
 
-                    if (refinedAlpha >= 0.97f) {
-                        // Subject core: 100% sharp original/retouched foreground pixel
+                    if (refinedAlpha >= 0.96f) {
+                        // Subject core: 100% sharp, completely untouched exposure & color
                         continue
                     }
 
                     val bx = ((x * (bokehW - 1)) / (fullW - 1).coerceAtLeast(1)).coerceIn(0, bokehW - 1)
-                    val bgColor = blurredBgPixels[bokehRow + bx]
-                    val bgR = (bgColor shr 16) and 0xFF
-                    val bgG = (bgColor shr 8) and 0xFF
-                    val bgB = bgColor and 0xFF
+                    val bokehIdx = bokehRow + bx
 
-                    val effectiveBgMix = ((1f - refinedAlpha) * verticalDepthWeight).coerceIn(0f, 1f)
+                    // Progressive depth-like blur tier selection based on distance from subject mask
+                    val depthFalloff = (sampleBilinear(distanceDepthMap, maskW, maskH, mx, my) * verticalDepthWeight)
+                        .coerceIn(0f, 1f)
+
+                    val bgR: Float
+                    val bgG: Float
+                    val bgB: Float
+                    if (depthFalloff < 0.5f) {
+                        val t = (depthFalloff * 2f).coerceIn(0f, 1f)
+                        val c0 = nearTier[bokehIdx]
+                        val c1 = midTier[bokehIdx]
+                        bgR = ((c0 shr 16) and 0xFF) * (1f - t) + ((c1 shr 16) and 0xFF) * t
+                        bgG = ((c0 shr 8) and 0xFF) * (1f - t) + ((c1 shr 8) and 0xFF) * t
+                        bgB = (c0 and 0xFF) * (1f - t) + (c1 and 0xFF) * t
+                    } else {
+                        val t = ((depthFalloff - 0.5f) * 2f).coerceIn(0f, 1f)
+                        val c0 = midTier[bokehIdx]
+                        val c1 = farTier[bokehIdx]
+                        bgR = ((c0 shr 16) and 0xFF) * (1f - t) + ((c1 shr 16) and 0xFF) * t
+                        bgG = ((c0 shr 8) and 0xFF) * (1f - t) + ((c1 shr 8) and 0xFF) * t
+                        bgB = (c0 and 0xFF) * (1f - t) + (c1 and 0xFF) * t
+                    }
+
+                    // Smooth foreground/background compositing with untouched subject color balance
+                    val effectiveBgMix = (1f - refinedAlpha).coerceIn(0f, 1f)
                     val effectiveFgMix = 1f - effectiveBgMix
 
                     val outR = (fgR * effectiveFgMix + bgR * effectiveBgMix).roundToInt().coerceIn(0, 255)
@@ -644,7 +686,108 @@ object PortraitProcessor {
             borderClusters = borderClusters
         )
 
-        // 3. Evaluate Human Subject Probability Field if one or more faces/biometric anchors are present
+        val hasValidHardwareDepth = hardwareDepthNormalized != null &&
+            hardwareDepthW >= 4 &&
+            hardwareDepthH >= 4 &&
+            hardwareDepthNormalized.size >= hardwareDepthW * hardwareDepthH
+
+        // 2b. Primary Neural Segmentation: ML Kit Subject Segmentation soft foreground confidence mask.
+        // Preserves continuous [0..1] probabilities around hair, ears, and shoulders, then refines
+        // boundaries with the edge-aware Guided Filter so edges never look cut out.
+        val mlKitSoftMask = trySegmentWithMlKit(
+            sourceBitmap = sourceBitmap,
+            targetW = workW,
+            targetH = workH
+        )
+
+        if (mlKitSoftMask != null) {
+            val blendedMlMask = if (hasValidHardwareDepth && hardwareDepthNormalized != null) {
+                FloatArray(totalPixels).also { out ->
+                    for (y in 0 until workH) {
+                        val row = y * workW
+                        val dy = ((y + 0.5f) * hardwareDepthH / workH.toFloat() - 0.5f).coerceIn(0f, (hardwareDepthH - 1).toFloat())
+                        for (x in 0 until workW) {
+                            val dx = ((x + 0.5f) * hardwareDepthW / workW.toFloat() - 0.5f).coerceIn(0f, (hardwareDepthW - 1).toFloat())
+                            val depthCloseness = sampleBilinear(hardwareDepthNormalized, hardwareDepthW, hardwareDepthH, dx, dy).coerceIn(0f, 1f)
+                            out[row + x] = (0.78f * mlKitSoftMask[row + x] + 0.22f * depthCloseness).coerceIn(0f, 1f)
+                        }
+                    }
+                }
+            } else {
+                mlKitSoftMask
+            }
+
+            val guideRadius = max(2, min(workW, workH) / 36)
+            val (coeffA, coeffB, refinedAlpha) = computeGuidedFilterMatte(
+                guidanceLuma = luma,
+                coarseMask = blendedMlMask,
+                width = workW,
+                height = workH,
+                radius = guideRadius,
+                eps = 0.0022f
+            )
+
+            var fgCount = 0
+            var minX = workW
+            var minY = workH
+            var maxX = -1
+            var maxY = -1
+            var fgConfidenceSum = 0f
+
+            for (y in 0 until workH) {
+                val row = y * workW
+                for (x in 0 until workW) {
+                    val a = refinedAlpha[row + x]
+                    if (a >= 0.45f) {
+                        fgCount++
+                        fgConfidenceSum += a
+                        if (x < minX) minX = x
+                        if (x > maxX) maxX = x
+                        if (y < minY) minY = y
+                        if (y > maxY) maxY = y
+                    }
+                }
+            }
+
+            val coverage = fgCount.toFloat() / totalPixels.coerceAtLeast(1)
+            val hasValidCoverage = coverage in 0.012f..0.94f
+            val meanFgStrength = if (fgCount > 0) fgConfidenceSum / fgCount else 0f
+
+            val subjectType = when {
+                !hasValidCoverage || meanFgStrength < 0.35f -> DetectedPortraitSubjectType.NONE
+                faceAnchors.isNotEmpty() -> DetectedPortraitSubjectType.PERSON
+                else -> DetectedPortraitSubjectType.GENERAL_SUBJECT
+            }
+            val overallConfidence = if (subjectType == DetectedPortraitSubjectType.NONE) {
+                0f
+            } else {
+                meanFgStrength.coerceIn(0f, 1f)
+            }
+            val boundsNorm = if (maxX >= minX && maxY >= minY) {
+                RectF(
+                    minX.toFloat() / workW,
+                    minY.toFloat() / workH,
+                    (maxX + 1).toFloat() / workW,
+                    (maxY + 1).toFloat() / workH
+                )
+            } else null
+
+            return SubjectSegmentationMask(
+                width = workW,
+                height = workH,
+                alphaMatte = refinedAlpha,
+                guideCoeffA = coeffA,
+                guideCoeffB = coeffB,
+                subjectType = subjectType,
+                confidence = overallConfidence,
+                subjectCoverageRatio = coverage,
+                detectedFaceCount = faceAnchors.size,
+                subjectBoundsNormalized = boundsNorm,
+                isHardwareDepthDataUsed = hasValidHardwareDepth
+            )
+        }
+
+        // 3. Fallback on-device Human Subject Probability Field if ML Kit is unavailable
         val personProb = FloatArray(totalPixels)
         if (faceAnchors.isNotEmpty()) {
             computePersonProbabilityMask(
@@ -674,11 +817,6 @@ object PortraitProcessor {
         )
 
         // 5. Fuse person, salient subject, and optional hardware depth closeness map
-        val hasValidHardwareDepth = hardwareDepthNormalized != null &&
-            hardwareDepthW >= 4 &&
-            hardwareDepthH >= 4 &&
-            hardwareDepthNormalized.size >= hardwareDepthW * hardwareDepthH
-
         val coarseMask = FloatArray(totalPixels)
         if (hasValidHardwareDepth && hardwareDepthNormalized != null) {
             for (y in 0 until workH) {
@@ -774,6 +912,67 @@ object PortraitProcessor {
             subjectBoundsNormalized = boundsNorm,
             isHardwareDepthDataUsed = hasValidHardwareDepth
         )
+    }
+
+    /**
+     * Runs Google ML Kit Subject Segmentation on [sourceBitmap] and returns a continuous `[0..1]`
+     * soft foreground confidence mask resampled to [targetW] x [targetH].
+     *
+     * Returns `null` safely if Google Play Services / ML Kit model is not yet provisioned or when
+     * executing in offline JVM/Robolectric unit test environments, allowing seamless fallback.
+     */
+    private fun trySegmentWithMlKit(
+        sourceBitmap: Bitmap,
+        targetW: Int,
+        targetH: Int
+    ): FloatArray? {
+        var scaledInput: Bitmap? = null
+        return try {
+            val maxSide = max(sourceBitmap.width, sourceBitmap.height)
+            val mlBitmap = if (maxSide > 768) {
+                val ratio = 768f / maxSide.toFloat()
+                val mw = (sourceBitmap.width * ratio).roundToInt().coerceAtLeast(32)
+                val mh = (sourceBitmap.height * ratio).roundToInt().coerceAtLeast(32)
+                Bitmap.createScaledBitmap(sourceBitmap, mw, mh, true).also { scaledInput = it }
+            } else {
+                sourceBitmap
+            }
+
+            val options = SubjectSegmenterOptions.Builder()
+                .enableForegroundConfidenceMask()
+                .build()
+            val segmenter = SubjectSegmentation.getClient(options)
+            val inputImage = InputImage.fromBitmap(mlBitmap, 0)
+            val result = Tasks.await(segmenter.process(inputImage), 3500L, TimeUnit.MILLISECONDS)
+            val maskBuffer = result.foregroundConfidenceMask ?: return null
+            maskBuffer.rewind()
+
+            val mlW = mlBitmap.width
+            val mlH = mlBitmap.height
+            val expectedCount = mlW * mlH
+            if (maskBuffer.remaining() < expectedCount) return null
+
+            val rawMask = FloatArray(expectedCount)
+            maskBuffer.get(rawMask)
+
+            val outMask = FloatArray(targetW * targetH)
+            for (y in 0 until targetH) {
+                val sy = ((y + 0.5f) * mlH / targetH.toFloat() - 0.5f).coerceIn(0f, (mlH - 1).toFloat())
+                val dstRow = y * targetW
+                for (x in 0 until targetW) {
+                    val sx = ((x + 0.5f) * mlW / targetW.toFloat() - 0.5f).coerceIn(0f, (mlW - 1).toFloat())
+                    outMask[dstRow + x] = sampleBilinear(rawMask, mlW, mlH, sx, sy).coerceIn(0f, 1f)
+                }
+            }
+            outMask
+        } catch (t: Throwable) {
+            Log.d(TAG, "ML Kit Subject Segmentation unavailable (${t.javaClass.simpleName}); using on-device segmenter")
+            null
+        } finally {
+            if (scaledInput != null && scaledInput != sourceBitmap && !scaledInput!!.isRecycled) {
+                try { scaledInput!!.recycle() } catch (_: Exception) {}
+            }
+        }
     }
 
     /**
@@ -1654,20 +1853,115 @@ object PortraitProcessor {
         return out
     }
 
+    private data class MultiTierDiscBokeh(
+        val nearPixels: IntArray,
+        val midPixels: IntArray,
+        val farPixels: IntArray
+    )
+
     /**
-     * Computes a halo-free blurred background image of dimensions [bokehW] x [bokehH] using
-     * foreground-excluded normalized convolution (`weight = (1 - alpha)^3 * bokehHighlightBoost`).
-     * Because foreground subject pixels have near-zero weight, foreground colors never bleed
-     * into the blurred background around hair or shoulders.
+     * Computes a normalized `[0..1]` depth-like blur falloff map using a fast 2-pass Chamfer
+     * distance transform from the foreground subject boundary.
+     *
+     * Background pixels close to the subject receive a softer transition blur (~0.25–0.50),
+     * while pixels further away smoothly ramp up to full lens disc bokeh (`1.0`).
+     * When hardware depth data is available, it blends smoothly with the distance falloff.
      */
-    private fun computeHaloFreeBlurredBackground(
+    internal fun computeDistanceFromSubjectMask(
+        alphaMatte: FloatArray,
+        width: Int,
+        height: Int,
+        hardwareDepthNormalized: FloatArray? = null,
+        hardwareDepthW: Int = 0,
+        hardwareDepthH: Int = 0
+    ): FloatArray {
+        val n = width * height
+        val dist = FloatArray(n)
+        val inf = (width + height).toFloat()
+
+        for (i in 0 until n) {
+            dist[i] = if (alphaMatte[i] >= 0.50f) 0f else inf
+        }
+
+        val diag = 1.4142f
+        // Forward pass
+        for (y in 0 until height) {
+            val row = y * width
+            for (x in 0 until width) {
+                var d = dist[row + x]
+                if (d == 0f) continue
+                if (x > 0) d = min(d, dist[row + x - 1] + 1f)
+                if (y > 0) {
+                    val prevRow = (y - 1) * width
+                    d = min(d, dist[prevRow + x] + 1f)
+                    if (x > 0) d = min(d, dist[prevRow + x - 1] + diag)
+                    if (x + 1 < width) d = min(d, dist[prevRow + x + 1] + diag)
+                }
+                dist[row + x] = d
+            }
+        }
+
+        // Backward pass
+        for (y in height - 1 downTo 0) {
+            val row = y * width
+            for (x in width - 1 downTo 0) {
+                var d = dist[row + x]
+                if (d == 0f) continue
+                if (x + 1 < width) d = min(d, dist[row + x + 1] + 1f)
+                if (y + 1 < height) {
+                    val nextRow = (y + 1) * width
+                    d = min(d, dist[nextRow + x] + 1f)
+                    if (x > 0) d = min(d, dist[nextRow + x - 1] + diag)
+                    if (x + 1 < width) d = min(d, dist[nextRow + x + 1] + diag)
+                }
+                dist[row + x] = d
+            }
+        }
+
+        // Normalize distance so pixels reach full bokeh across ~24% of min(width, height)
+        val maxFalloffDist = (min(width, height) * 0.24f).coerceAtLeast(8f)
+        val hasHwDepth = hardwareDepthNormalized != null &&
+            hardwareDepthW >= 4 &&
+            hardwareDepthH >= 4 &&
+            hardwareDepthNormalized.size >= hardwareDepthW * hardwareDepthH
+
+        val depthMap = FloatArray(n)
+        for (y in 0 until height) {
+            val row = y * width
+            val dy = if (hasHwDepth) {
+                ((y + 0.5f) * hardwareDepthH / height.toFloat() - 0.5f).coerceIn(0f, (hardwareDepthH - 1).toFloat())
+            } else 0f
+            for (x in 0 until width) {
+                val idx = row + x
+                val normDist = (dist[idx] / maxFalloffDist).coerceIn(0f, 1f)
+                // Smoothstep depth curve starting at 0.22 immediately outside the silhouette up to 1.0
+                val smoothDist = normDist * normDist * (3f - 2f * normDist)
+                val geometricFalloff = (0.22f + 0.78f * smoothDist).coerceIn(0f, 1f)
+                depthMap[idx] = if (hasHwDepth && hardwareDepthNormalized != null) {
+                    val dx = ((x + 0.5f) * hardwareDepthW / width.toFloat() - 0.5f).coerceIn(0f, (hardwareDepthW - 1).toFloat())
+                    val hwBgDepth = (1f - sampleBilinear(hardwareDepthNormalized, hardwareDepthW, hardwareDepthH, dx, dy)).coerceIn(0f, 1f)
+                    (0.55f * geometricFalloff + 0.45f * hwBgDepth).coerceIn(0f, 1f)
+                } else {
+                    geometricFalloff
+                }
+            }
+        }
+        return depthMap
+    }
+
+    /**
+     * Computes 3 concentric halo-free circular disc (lens-like bokeh) background buffers
+     * (`near`, `mid`, `far`) with foreground pixels strictly excluded (`weight = (1 - alpha)^3`)
+     * so subject colors never bleed into the background around hair, ears, or shoulders.
+     */
+    private fun computeMultiTierDiscBokehBackground(
         sourceBitmap: Bitmap,
         mask: SubjectSegmentationMask,
         bokehW: Int,
         bokehH: Int,
-        blurRadius: Int,
+        maxBlurRadius: Int,
         blurStrength: Float
-    ): IntArray {
+    ): MultiTierDiscBokeh {
         val n = bokehW * bokehH
         val srcPixels = resampleBitmapPixels(sourceBitmap, bokehW, bokehH)
 
@@ -1693,7 +1987,6 @@ object PortraitProcessor {
                 val g = ((c shr 8) and 0xFF).toFloat()
                 val b = (c and 0xFF).toFloat()
 
-                // Strictly exclude solid foreground pixels from contributing to background blur
                 val bgFactor = (1.0f - fgAlpha).coerceIn(0f, 1f)
                 val baseWeight = if (fgAlpha >= 0.85f) {
                     0.0001f
@@ -1701,11 +1994,15 @@ object PortraitProcessor {
                     bgFactor * bgFactor * bgFactor + 0.0005f
                 }
 
-                // Subtle specular bokeh highlight emphasis on bright out-of-focus background highlights
+                // Optical specular bokeh highlight emphasis so bright points bloom into round discs
                 val lum = (0.299f * r + 0.587f * g + 0.114f * b) / 255f
-                val boostFactor = if (blurStrength <= 1.0f) blurStrength.coerceIn(0.1f, 1.0f) else (blurStrength / 16.0f).coerceIn(0.1f, 1.0f)
-                val highlightBoost = if (fgAlpha < 0.30f && lum > 0.78f) {
-                    1.0f + 1.25f * boostFactor * ((lum - 0.78f) / 0.22f)
+                val boostFactor = if (blurStrength <= 1.0f) {
+                    blurStrength.coerceIn(0.15f, 1.0f)
+                } else {
+                    (blurStrength / 16.0f).coerceIn(0.15f, 1.0f)
+                }
+                val highlightBoost = if (fgAlpha < 0.30f && lum > 0.74f) {
+                    1.0f + 1.45f * boostFactor * ((lum - 0.74f) / 0.26f)
                 } else {
                     1.0f
                 }
@@ -1718,31 +2015,110 @@ object PortraitProcessor {
             }
         }
 
-        // Separable sliding-window passes approximate a smooth circular/Gaussian aperture bokeh kernel
-        var curWR = wR
-        var curWG = wG
-        var curWB = wB
-        var curWSum = wSum
-        val passRadius = max(1, (blurRadius * 0.80f).roundToInt())
-        val numPasses = if (blurStrength >= 2.0f || (blurStrength in 0.75f..1.0f)) 3 else 2
+        val nearRadius = max(2, (maxBlurRadius * 0.38f).roundToInt())
+        val midRadius = max(nearRadius + 1, (maxBlurRadius * 0.70f).roundToInt())
+        val farRadius = max(midRadius + 1, maxBlurRadius)
 
-        repeat(numPasses) {
-            curWR = boxFilter2D(curWR, bokehW, bokehH, passRadius)
-            curWG = boxFilter2D(curWG, bokehW, bokehH, passRadius)
-            curWB = boxFilter2D(curWB, bokehW, bokehH, passRadius)
-            curWSum = boxFilter2D(curWSum, bokehW, bokehH, passRadius)
+        val nearPixels = convolveCircularDiscBokeh(srcPixels, wR, wG, wB, wSum, bokehW, bokehH, nearRadius)
+        val midPixels = convolveCircularDiscBokeh(srcPixels, wR, wG, wB, wSum, bokehW, bokehH, midRadius)
+        val farPixels = convolveCircularDiscBokeh(srcPixels, wR, wG, wB, wSum, bokehW, bokehH, farRadius)
+
+        return MultiTierDiscBokeh(
+            nearPixels = nearPixels,
+            midPixels = midPixels,
+            farPixels = farPixels
+        )
+    }
+
+    /**
+     * Performs a genuine circular disc aperture convolution (`dx^2 + dy^2 <= r^2`) with
+     * anti-aliased disc edges and Poisson-ring sampling for larger radii so full-resolution
+     * captures render round lens-like bokeh discs smoothly without Gaussian muddiness.
+     */
+    private fun convolveCircularDiscBokeh(
+        fallbackSrc: IntArray,
+        wR: FloatArray,
+        wG: FloatArray,
+        wB: FloatArray,
+        wSum: FloatArray,
+        width: Int,
+        height: Int,
+        radius: Int
+    ): IntArray {
+        val r = radius.coerceIn(1, max(1, min(width, height) / 3))
+        // Build compact circular disc sample offsets (exact full disc for r <= 7; concentric rings for larger r)
+        val offsetsDx = mutableListOf<Int>()
+        val offsetsDy = mutableListOf<Int>()
+        val offsetsWeight = mutableListOf<Float>()
+
+        if (r <= 7) {
+            val rFloat = r.toFloat()
+            for (dy in -r..r) {
+                for (dx in -r..r) {
+                    val dist = sqrt((dx * dx + dy * dy).toFloat())
+                    if (dist <= rFloat + 0.5f) {
+                        val edgeAA = ((rFloat + 0.5f) - dist).coerceIn(0f, 1f)
+                        // Subtle annular lens brightness (authentic prime-lens disc falloff)
+                        val lensProfile = 0.90f + 0.14f * (dist / rFloat.coerceAtLeast(1f))
+                        offsetsDx.add(dx)
+                        offsetsDy.add(dy)
+                        offsetsWeight.add(edgeAA * lensProfile)
+                    }
+                }
+            }
+        } else {
+            // Concentric sunflower/ring disc taps (dense circular aperture without O(r^2) blowup)
+            offsetsDx.add(0); offsetsDy.add(0); offsetsWeight.add(0.95f)
+            val ringCount = min(6, max(4, r / 4))
+            for (ring in 1..ringCount) {
+                val ringFrac = ring.toFloat() / ringCount.toFloat()
+                val ringRadius = r * ringFrac
+                val taps = (ring * 8).coerceIn(8, 36)
+                val ringWeight = (0.90f + 0.16f * ringFrac)
+                val angleOffset = (ring % 2) * (Math.PI / taps)
+                for (t in 0 until taps) {
+                    val angle = angleOffset + (2.0 * Math.PI * t / taps)
+                    val dx = (kotlin.math.cos(angle) * ringRadius).roundToInt()
+                    val dy = (kotlin.math.sin(angle) * ringRadius).roundToInt()
+                    offsetsDx.add(dx)
+                    offsetsDy.add(dy)
+                    offsetsWeight.add(ringWeight)
+                }
+            }
         }
 
-        val outPixels = IntArray(n)
-        for (i in 0 until n) {
-            val denom = curWSum[i]
-            if (denom > 1e-4f) {
-                val r = (curWR[i] / denom).roundToInt().coerceIn(0, 255)
-                val g = (curWG[i] / denom).roundToInt().coerceIn(0, 255)
-                val b = (curWB[i] / denom).roundToInt().coerceIn(0, 255)
-                outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            } else {
-                outPixels[i] = srcPixels[i]
+        val dxArr = offsetsDx.toIntArray()
+        val dyArr = offsetsDy.toIntArray()
+        val kwArr = offsetsWeight.toFloatArray()
+        val tapCount = dxArr.size
+
+        val outPixels = IntArray(width * height)
+        for (y in 0 until height) {
+            val outRow = y * width
+            for (x in 0 until width) {
+                var accR = 0f
+                var accG = 0f
+                var accB = 0f
+                var accW = 0f
+                for (k in 0 until tapCount) {
+                    val sx = (x + dxArr[k]).coerceIn(0, width - 1)
+                    val sy = (y + dyArr[k]).coerceIn(0, height - 1)
+                    val sIdx = sy * width + sx
+                    val kw = kwArr[k]
+                    accR += wR[sIdx] * kw
+                    accG += wG[sIdx] * kw
+                    accB += wB[sIdx] * kw
+                    accW += wSum[sIdx] * kw
+                }
+                val idx = outRow + x
+                if (accW > 1e-4f) {
+                    val outR = (accR / accW).roundToInt().coerceIn(0, 255)
+                    val outG = (accG / accW).roundToInt().coerceIn(0, 255)
+                    val outB = (accB / accW).roundToInt().coerceIn(0, 255)
+                    outPixels[idx] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
+                } else {
+                    outPixels[idx] = fallbackSrc[idx]
+                }
             }
         }
         return outPixels

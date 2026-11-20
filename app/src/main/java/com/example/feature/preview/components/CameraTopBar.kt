@@ -1,10 +1,17 @@
 package com.example.feature.preview.components
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -15,7 +22,7 @@ import androidx.compose.material.icons.outlined.FilterVintage
 import androidx.compose.material.icons.outlined.FlashAuto
 import androidx.compose.material.icons.outlined.FlashOff
 import androidx.compose.material.icons.outlined.FlashOn
-import androidx.compose.material.icons.outlined.Highlight
+import androidx.compose.material.icons.outlined.FlashlightOn
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.DropdownMenu
@@ -25,8 +32,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -34,22 +44,28 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.DpOffset
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import com.example.core.preferences.CameraFilterPreset
 import com.example.core.preferences.FlashMode
 import com.example.core.preferences.HdrMode
 import com.example.ui.theme.CameraMotionTokens
+import kotlinx.coroutines.delay
 
 /**
  * Minimal camera top bar inspired by Pixel design.
- * Contains active camera controls (Flash, Quick Controls drawer, Filters, Settings).
+ * Contains active camera controls (Flash with live state indicator, Quick Controls drawer,
+ * Filters with tap/long-press label hint, and Settings).
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun CameraTopBar(
     flashMode: FlashMode,
@@ -69,6 +85,16 @@ fun CameraTopBar(
     onInfoClick: (() -> Unit)? = null
 ) {
     var showFlashMenu by remember { mutableStateOf(false) }
+    var filtersHintTrigger by remember { mutableIntStateOf(0) }
+    var showFiltersHint by remember { mutableStateOf(false) }
+
+    LaunchedEffect(filtersHintTrigger) {
+        if (filtersHintTrigger > 0) {
+            showFiltersHint = true
+            delay(1500L)
+            showFiltersHint = false
+        }
+    }
 
     val effectiveFlashMode = when {
         !isFlashSupported -> FlashMode.OFF
@@ -90,35 +116,39 @@ fun CameraTopBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // Flash Mode Anchor & Button
-            val (flashIcon, flashDesc) = when (effectiveFlashMode) {
-                FlashMode.AUTO -> Pair(Icons.Outlined.FlashAuto, "Flash Auto")
-                FlashMode.ON -> Pair(Icons.Outlined.FlashOn, "Flash On")
-                FlashMode.OFF -> Pair(Icons.Outlined.FlashOff, "Flash Off")
-                FlashMode.TORCH -> Pair(Icons.Outlined.Highlight, "Flash Torch")
+            // Flash Mode Anchor & Pill showing real state (Auto, On, Off, Torch)
+            val flashIcon = when (effectiveFlashMode) {
+                FlashMode.AUTO -> Icons.Outlined.FlashAuto
+                FlashMode.ON -> Icons.Outlined.FlashOn
+                FlashMode.OFF -> Icons.Outlined.FlashOff
+                FlashMode.TORCH -> Icons.Outlined.FlashlightOn
             }
+            val flashStateLabel = effectiveFlashMode.displayName
+            val flashDesc = "Flash: $flashStateLabel"
 
             val flashInteractionSource = remember { MutableInteractionSource() }
             val isFlashPressed by flashInteractionSource.collectIsPressedAsState()
             val flashScale by androidx.compose.animation.core.animateFloatAsState(
-                targetValue = if (isFlashPressed) 0.90f else 1.0f,
+                targetValue = if (isFlashPressed) 0.92f else 1.0f,
                 animationSpec = CameraMotionTokens.touchSpring(),
                 label = "flash_btn_scale"
             )
             val animatedFlashBg by androidx.compose.animation.animateColorAsState(
-                targetValue = if (effectiveFlashMode == FlashMode.OFF) {
-                    MaterialTheme.colorScheme.surfaceContainerHigh
-                } else {
-                    MaterialTheme.colorScheme.primaryContainer
+                targetValue = when (effectiveFlashMode) {
+                    FlashMode.OFF -> MaterialTheme.colorScheme.surfaceContainerHigh
+                    FlashMode.AUTO -> MaterialTheme.colorScheme.secondaryContainer
+                    FlashMode.ON -> MaterialTheme.colorScheme.primaryContainer
+                    FlashMode.TORCH -> MaterialTheme.colorScheme.tertiaryContainer
                 },
                 animationSpec = CameraMotionTokens.controlTween(),
                 label = "flash_bg"
             )
-            val animatedFlashIconTint by androidx.compose.animation.animateColorAsState(
-                targetValue = if (effectiveFlashMode == FlashMode.OFF) {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                } else {
-                    MaterialTheme.colorScheme.onPrimaryContainer
+            val animatedFlashContentColor by androidx.compose.animation.animateColorAsState(
+                targetValue = when (effectiveFlashMode) {
+                    FlashMode.OFF -> MaterialTheme.colorScheme.onSurfaceVariant
+                    FlashMode.AUTO -> MaterialTheme.colorScheme.onSecondaryContainer
+                    FlashMode.ON -> MaterialTheme.colorScheme.onPrimaryContainer
+                    FlashMode.TORCH -> MaterialTheme.colorScheme.onTertiaryContainer
                 },
                 animationSpec = CameraMotionTokens.controlTween(),
                 label = "flash_icon_tint"
@@ -127,33 +157,49 @@ fun CameraTopBar(
             Box(
                 contentAlignment = Alignment.Center
             ) {
-                IconButton(
-                    onClick = {
-                        showFlashMenu = true
-                    },
-                    interactionSource = flashInteractionSource,
+                Box(
                     modifier = Modifier
-                        .size(48.dp)
+                        .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                         .scale(flashScale)
-                        .testTag("top_bar_flash_button")
+                        .clip(CircleShape)
+                        .clickable(
+                            interactionSource = flashInteractionSource,
+                            indication = ripple(bounded = true),
+                            role = Role.Button,
+                            onClick = { showFlashMenu = true }
+                        )
+                        .padding(horizontal = 4.dp)
+                        .testTag("top_bar_flash_button"),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Box(
+                    Row(
                         modifier = Modifier
-                            .size(38.dp)
-                            .clip(CircleShape)
-                            .background(animatedFlashBg),
-                        contentAlignment = Alignment.Center
+                            .height(38.dp)
+                            .clip(RoundedCornerShape(19.dp))
+                            .background(animatedFlashBg)
+                            .padding(horizontal = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
                         Icon(
                             imageVector = flashIcon,
                             contentDescription = flashDesc,
-                            tint = animatedFlashIconTint,
-                            modifier = Modifier.size(20.dp)
+                            tint = animatedFlashContentColor,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = flashStateLabel,
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.SemiBold
+                            ),
+                            color = animatedFlashContentColor,
+                            maxLines = 1,
+                            modifier = Modifier.testTag("top_bar_flash_state_label")
                         )
                     }
                 }
 
-                // Compact Flash Popup anchored directly to the flash icon
+                // Compact Flash Popup anchored directly to the flash button
                 MaterialTheme(
                     shapes = MaterialTheme.shapes.copy(extraSmall = RoundedCornerShape(16.dp))
                 ) {
@@ -181,7 +227,7 @@ fun CameraTopBar(
                                 FlashMode.AUTO -> Icons.Outlined.FlashAuto
                                 FlashMode.ON -> Icons.Outlined.FlashOn
                                 FlashMode.OFF -> Icons.Outlined.FlashOff
-                                FlashMode.TORCH -> Icons.Outlined.Highlight
+                                FlashMode.TORCH -> Icons.Outlined.FlashlightOn
                             }
 
                             val animatedItemBg by androidx.compose.animation.animateColorAsState(
@@ -216,7 +262,7 @@ fun CameraTopBar(
                                 leadingIcon = {
                                     Icon(
                                         imageVector = itemIcon,
-                                        contentDescription = null,
+                                        contentDescription = "Flash ${mode.displayName}",
                                         tint = when {
                                             isSelected -> MaterialTheme.colorScheme.primary
                                             !isOptionEnabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
@@ -312,41 +358,81 @@ fun CameraTopBar(
                     label = "filter_btn_tint"
                 )
 
-                IconButton(
-                    onClick = onFiltersClick,
-                    interactionSource = filterInteractionSource,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .scale(filterScale)
-                        .testTag("top_bar_filters_button")
-                ) {
+                val hintOffsetYPx = with(LocalDensity.current) { 52.dp.roundToPx() }
+
+                Box(contentAlignment = Alignment.Center) {
                     Box(
                         modifier = Modifier
-                            .size(38.dp)
+                            .size(48.dp)
+                            .scale(filterScale)
                             .clip(CircleShape)
-                            .background(animatedFilterBg),
+                            .combinedClickable(
+                                interactionSource = filterInteractionSource,
+                                indication = ripple(bounded = true, radius = 24.dp),
+                                role = Role.Button,
+                                onClick = {
+                                    filtersHintTrigger++
+                                    onFiltersClick()
+                                },
+                                onLongClick = {
+                                    filtersHintTrigger++
+                                }
+                            )
+                            .testTag("top_bar_filters_button"),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(
-                            imageVector = Icons.Outlined.FilterVintage,
-                            contentDescription = if (selectedFilter.isOriginal) {
-                                "Color filters"
-                            } else {
-                                "Color filter: ${selectedFilter.displayName}"
-                            },
-                            tint = animatedFilterTint,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        if (!selectedFilter.isOriginal) {
-                            Box(
-                                modifier = Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(6.dp)
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(MaterialTheme.colorScheme.primary)
-                                    .testTag("top_bar_filter_active_dot")
+                        Box(
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(animatedFilterBg),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.FilterVintage,
+                                contentDescription = if (selectedFilter.isOriginal) {
+                                    "Filters"
+                                } else {
+                                    "Filters: ${selectedFilter.displayName}"
+                                },
+                                tint = animatedFilterTint,
+                                modifier = Modifier.size(20.dp)
                             )
+                            if (!selectedFilter.isOriginal) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(6.dp)
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.primary)
+                                        .testTag("top_bar_filter_active_dot")
+                                )
+                            }
+                        }
+                    }
+
+                    if (showFiltersHint) {
+                        Popup(
+                            alignment = Alignment.TopCenter,
+                            offset = IntOffset(x = 0, y = hintOffsetYPx),
+                            properties = PopupProperties(focusable = false)
+                        ) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.inverseSurface,
+                                contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+                                shape = RoundedCornerShape(10.dp),
+                                shadowElevation = 3.dp,
+                                modifier = Modifier.testTag("top_bar_filters_hint_label")
+                            ) {
+                                Text(
+                                    text = "Filters",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.Medium
+                                    ),
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -377,7 +463,7 @@ fun CameraTopBar(
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.Settings,
-                        contentDescription = "Open Settings",
+                        contentDescription = "Camera settings",
                         tint = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.size(20.dp)
                     )

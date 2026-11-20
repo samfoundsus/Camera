@@ -18,10 +18,60 @@ import java.util.Locale
  * Physical or logical camera lenses on the device.
  */
 enum class CameraLens(val id: String, val displayName: String, val facing: LensFacing, val defaultZoom: Float = 1.0f) {
-    BACK_ULTRAWIDE("1", "Ultrawide (0.5x)", LensFacing.BACK, 0.5f),
-    BACK_MAIN("0", "Main Camera (1×)", LensFacing.BACK, 1.0f),
-    BACK_TELEPHOTO("2", "Telephoto (5x)", LensFacing.BACK, 5.0f),
+    BACK_ULTRAWIDE("1", "Rear Camera (Ultrawide)", LensFacing.BACK, 0.5f),
+    BACK_MAIN("0", "Rear Camera", LensFacing.BACK, 1.0f),
+    BACK_TELEPHOTO("2", "Rear Camera (Telephoto)", LensFacing.BACK, 5.0f),
     FRONT("3", "Front Camera", LensFacing.FRONT, 1.0f)
+}
+
+/**
+ * Derives a clean, non-hardcoded camera display label directly from Camera2 hardware metadata
+ * (lens facing, focal length, camera ID, and physical sub-camera IDs).
+ * Never hardcodes marketing names like "Wide Main (1x)"; falls back to "Rear Camera" / "Front Camera".
+ */
+fun resolveCameraLabelFromMetadata(
+    facing: LensFacing,
+    focalLengthMm: Float?,
+    cameraId: String? = null,
+    physicalCameraIds: List<String> = emptyList(),
+    allSameFacingFocalLengths: List<Float> = emptyList()
+): String {
+    val facingPrefix = if (facing == LensFacing.FRONT) "Front Camera" else "Rear Camera"
+    if (focalLengthMm == null || !focalLengthMm.isFinite() || focalLengthMm <= 0f) {
+        return if (!cameraId.isNullOrBlank() && physicalCameraIds.size >= 2) {
+            "$facingPrefix (ID $cameraId)"
+        } else {
+            facingPrefix
+        }
+    }
+    val focalStr = String.format(Locale.US, "%.1fmm", focalLengthMm)
+    val distinctFocals = allSameFacingFocalLengths
+        .filter { it.isFinite() && it > 0f }
+        .distinct()
+        .sorted()
+
+    val roleSuffix = if (facing == LensFacing.BACK && distinctFocals.size >= 2) {
+        val minFocal = distinctFocals.first()
+        val maxFocal = distinctFocals.last()
+        when {
+            focalLengthMm <= minFocal + 0.25f && focalLengthMm < 3.0f -> "Ultrawide"
+            focalLengthMm >= maxFocal - 0.25f && focalLengthMm >= 6.5f -> "Telephoto"
+            else -> null
+        }
+    } else {
+        null
+    }
+
+    return buildString {
+        append(facingPrefix)
+        if (roleSuffix != null) {
+            append(" · $roleSuffix")
+        }
+        append(" ($focalStr)")
+        if (!cameraId.isNullOrBlank()) {
+            append(" · ID $cameraId")
+        }
+    }
 }
 
 /**
@@ -58,7 +108,168 @@ enum class VideoFrameRate(val fps: Int, val displayName: String) {
     FPS_480(480, "480 FPS");
 
     companion object {
-        val VIDEO_MODE_OPTIONS = listOf(FPS_24, FPS_30, FPS_60)
+        val VIDEO_MODE_OPTIONS = listOf(FPS_24, FPS_30, FPS_60, FPS_120)
+    }
+}
+
+/**
+ * Calculates a bitrate scaled proportionally to the selected [resolution] and [fps].
+ * Higher frame rates (e.g. 60 FPS vs 30 FPS) and higher resolutions receive proportionally higher bitrates.
+ */
+fun calculateTargetVideoBitrate(resolution: VideoResolution, fps: Int): Int {
+    val base30FpsBitrate = when (resolution) {
+        VideoResolution.HD_720P -> 8_000_000
+        VideoResolution.FHD_1080P -> 16_000_000
+        VideoResolution.QHD_2K -> 28_000_000
+        VideoResolution.UHD_4K -> 45_000_000
+    }
+    val fpsMultiplier = when {
+        fps >= 120 -> 2.4f
+        fps >= 60 -> 1.55f
+        fps <= 24 -> 0.88f
+        else -> 1.0f
+    }
+    return (base30FpsBitrate * fpsMultiplier).toInt().coerceIn(4_000_000, 100_000_000)
+}
+
+/**
+ * Selects a valid Camera2 AE target FPS range from [availableRanges] for [targetFps].
+ * Prefers an exact fixed range [targetFps, targetFps] (e.g. [60, 60] or [30, 30]),
+ * then a dynamic range peaking at [targetFps] with highest lower bound (e.g. [30, 60] or [15, 60]),
+ * then the narrowest range containing [targetFps].
+ */
+fun selectBestVideoAeFpsRange(
+    availableRanges: List<Pair<Int, Int>>,
+    targetFps: Int
+): Pair<Int, Int> {
+    if (availableRanges.isEmpty()) return targetFps to targetFps
+    val exactFixed = availableRanges.firstOrNull { it.first == targetFps && it.second == targetFps }
+    if (exactFixed != null) return exactFixed
+
+    val matchingUpper = availableRanges
+        .filter { it.second == targetFps }
+        .maxByOrNull { it.first }
+    if (matchingUpper != null) return matchingUpper
+
+    val containing = availableRanges
+        .filter { targetFps in it.first..it.second }
+        .minByOrNull { it.second - it.first }
+    if (containing != null) return containing
+
+    val highest = availableRanges.maxWithOrNull(
+        compareBy<Pair<Int, Int>> { it.second }.thenBy { it.first }
+    )
+    return highest ?: (targetFps to targetFps)
+}
+
+/**
+ * Identifies the exact Camera2 stream source for the single largest still-photo size in HD mode,
+ * including whether it requires API 31+ `SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION` or a specific physical camera ID.
+ */
+data class HdMaxPhotoCaptureSource(
+    val cameraId: String,
+    val width: Int,
+    val height: Int,
+    val requiresMaxResPixelMode: Boolean = false,
+    val isPhysicalSubCamera: Boolean = false,
+    val sourceTag: String = "JPEG"
+) {
+    val totalPixels: Long get() = width.toLong() * height
+    val megapixels: Float get() = totalPixels / 1_000_000f
+}
+
+/**
+ * Single video stream size entry with computed max FPS (`1e9 / minFrameDuration`) for the hidden hardware debug screen.
+ */
+data class VideoSizeFpsDebugEntry(
+    val width: Int,
+    val height: Int,
+    val maxFps: Double,
+    val minFrameDurationNanos: Long
+)
+
+/**
+ * Complete raw Camera2 hardware report for a single camera ID (logical or physical),
+ * displayed in the hidden Settings debug screen (long-press app version).
+ */
+data class CameraIdDebugInfo(
+    val cameraId: String,
+    val isPhysicalOnly: Boolean,
+    val parentLogicalId: String?,
+    val facingLabel: String,
+    val metadataLabel: String,
+    val physicalCameraIds: List<String>,
+    val focalLengthsMm: List<Float>,
+    val pixelArraySize: String,
+    val activeArraySize: String,
+    val videoSizesWithMaxFps: List<VideoSizeFpsDebugEntry>,
+    val highSpeedVideoEntries: List<String>,
+    val standardJpegSizes: List<String>,
+    val highResJpegSizes: List<String>,
+    val maxResJpegSizes: List<String>,
+    val videoStabilizationModes: List<String>,
+    val opticalStabilizationModes: List<String>,
+    val aeFpsRanges: List<String>,
+    val ispQualitySummary: String = "",
+    val supportedExtensions: List<String> = emptyList()
+)
+
+/**
+ * Aggregated hardware debug report across every camera ID on the device.
+ */
+data class CameraHardwareDebugReport(
+    val deviceModel: String,
+    val androidVersionLabel: String,
+    val cameras: List<CameraIdDebugInfo>
+) {
+    fun formatPlainText(): String = buildString {
+        appendLine("Device: $deviceModel ($androidVersionLabel)")
+        appendLine("Total Camera IDs inspected: ${cameras.size}")
+        val recentLatencies = CaptureLatencyTracker.getRecentRecords()
+        if (recentLatencies.isNotEmpty()) {
+            appendLine()
+            appendLine("=== Recent Capture Latency (Shutter -> Saved) ===")
+            recentLatencies.forEach { rec ->
+                appendLine("  • ${rec.formatSummaryLine()}")
+            }
+        }
+        appendLine()
+        for (cam in cameras) {
+            appendLine("=== Camera ID ${cam.cameraId} (${cam.facingLabel}${if (cam.isPhysicalOnly) ", Physical of ${cam.parentLogicalId}" else ""}) ===")
+            appendLine("Label: ${cam.metadataLabel}")
+            if (cam.physicalCameraIds.isNotEmpty()) {
+                appendLine("Physical IDs: ${cam.physicalCameraIds.joinToString(", ")}")
+            }
+            if (cam.focalLengthsMm.isNotEmpty()) {
+                appendLine("Focal Lengths: ${cam.focalLengthsMm.joinToString(", ") { String.format(Locale.US, "%.2fmm", it) }}")
+            }
+            appendLine("Sensor Pixel Array: ${cam.pixelArraySize} | Active Array: ${cam.activeArraySize}")
+            if (cam.ispQualitySummary.isNotBlank()) {
+                appendLine("ISP Quality / ZSL: ${cam.ispQualitySummary}")
+            }
+            if (cam.supportedExtensions.isNotEmpty()) {
+                appendLine("CameraX Extensions: ${cam.supportedExtensions.joinToString(", ")}")
+            }
+            appendLine("AE FPS Ranges: ${cam.aeFpsRanges.ifEmpty { listOf("None") }.joinToString(", ")}")
+            appendLine("Video Stabilization Modes: ${cam.videoStabilizationModes.ifEmpty { listOf("None") }.joinToString(", ")}")
+            appendLine("Optical Stabilization Modes: ${cam.opticalStabilizationModes.ifEmpty { listOf("None") }.joinToString(", ")}")
+            appendLine("Video Sizes (MediaRecorder):")
+            if (cam.videoSizesWithMaxFps.isEmpty()) {
+                appendLine("  (none)")
+            } else {
+                cam.videoSizesWithMaxFps.forEach { v ->
+                    val fpsStr = if (v.maxFps > 0.0) String.format(Locale.US, "%.1f FPS", v.maxFps) else "n/a"
+                    appendLine("  ${v.width}x${v.height} -> max $fpsStr (minDur=${v.minFrameDurationNanos}ns)")
+                }
+            }
+            if (cam.highSpeedVideoEntries.isNotEmpty()) {
+                appendLine("High-Speed Video (Slow-Mo only): ${cam.highSpeedVideoEntries.joinToString(", ")}")
+            }
+            appendLine("JPEG Standard Sizes (${cam.standardJpegSizes.size}): ${cam.standardJpegSizes.ifEmpty { listOf("none") }.joinToString(", ")}")
+            appendLine("JPEG High-Res Sizes (${cam.highResJpegSizes.size}): ${cam.highResJpegSizes.ifEmpty { listOf("none") }.joinToString(", ")}")
+            appendLine("JPEG Max-Res Sizes API31+ (${cam.maxResJpegSizes.size}): ${cam.maxResJpegSizes.ifEmpty { listOf("none") }.joinToString(", ")}")
+            appendLine()
+        }
     }
 }
 
@@ -84,7 +295,10 @@ data class PhotoOutputSize(
 ) {
     val totalPixels: Long get() = width.toLong() * height
     val megapixels: Float get() = totalPixels / 1_000_000f
-    val formattedMegapixels: String get() = String.format(Locale.US, "%.1f MP", megapixels)
+    val formattedMegapixels: String
+        get() = CaptureResolutionResolver.formatMegapixels(width, height).orEmpty()
+    val compactRoundedMegapixels: String
+        get() = CaptureResolutionResolver.formatMegapixels(width, height).orEmpty()
     val dimensionsLabel: String get() = "$width × $height"
 }
 
@@ -698,15 +912,41 @@ data class LensCapabilities(
     val isTorchSupported: Boolean = false,
     val isFullSensorResolutionExposed: Boolean = false,
     val sensorPixelArraySize: PhotoOutputSize? = null,
+    val sensorActiveArraySize: PhotoOutputSize? = null,
+    val hdMaxPhotoCaptureSource: HdMaxPhotoCaptureSource? = null,
     val camera2CameraId: String? = null,
     val physicalCameraIds: List<String> = emptyList(),
     val focalLengthMm: Float? = null,
     val sensorOrientationDegrees: Int = if (lens.facing == LensFacing.FRONT) 270 else 90,
     val sensorDescription: String? = null,
-    val manualCapabilities: ManualSensorCapabilities = ManualSensorCapabilities()
+    val manualCapabilities: ManualSensorCapabilities = ManualSensorCapabilities(),
+    val extensionAvailability: CameraExtensionAvailability = CameraExtensionAvailability(),
+    val ispQualityCapabilities: IspQualityCapabilities = IspQualityCapabilities()
 ) {
     val resolvedHardwareLabel: String
         get() = sensorDescription?.takeIf { it.isNotBlank() } ?: lens.displayName
+
+    /**
+     * Dynamically computed HD mode button label derived strictly from the highest exposed still size
+     * (e.g. "HD · 108 MP" or "HD · 12 MP"). Never hardcoded.
+     */
+    val hdModeButtonLabel: String
+        get() = CaptureResolutionResolver.formatHdModeButtonLabel(this)
+
+    /**
+     * True when the hardware does not expose full high-resolution sensor output to third-party apps
+     * (e.g., max exposed stream is around 12 MP binned or significantly smaller than sensorPixelArraySize).
+     */
+    val isSensorFullResolutionRestricted: Boolean
+        get() {
+            val exposed = highestNativeStillSize ?: supportedPhotoSizes.maxByOrNull { it.totalPixels } ?: return false
+            val pixelArray = sensorPixelArraySize
+            if (pixelArray != null && pixelArray.totalPixels > 0L && exposed.totalPixels < (pixelArray.totalPixels * 85L) / 100L) {
+                return true
+            }
+            // Also flag when rear main sensor only exposes <= ~12.6 MP binned output
+            return lens.facing == LensFacing.BACK && exposed.megapixels <= 12.6f && !isFullSensorResolutionExposed
+        }
 
     fun isSlowMoRateSupported(rate: VideoFrameRate): Boolean = rate in supportedSlowMoRates
 
@@ -768,11 +1008,17 @@ data class LensCapabilities(
     val isHardwareHdrSceneModeSupported: Boolean
         get() = manualCapabilities.isHardwareHdrSceneModeSupported
 
+    val isRealHdrSupported: Boolean
+        get() = extensionAvailability.isHdrAvailable ||
+            isHardwareHdrSceneModeSupported ||
+            isExposureCompensationSupported
+
     val hdrSupportPath: HdrSupportPath
-        get() = if (isHardwareHdrSceneModeSupported) {
-            HdrSupportPath.HARDWARE_SCENE_MODE_HDR
-        } else {
-            HdrSupportPath.SOFTWARE_MULTI_FRAME_HDR
+        get() = when {
+            extensionAvailability.isHdrAvailable -> HdrSupportPath.COMPATIBLE_EXTENSION
+            isHardwareHdrSceneModeSupported -> HdrSupportPath.HARDWARE_SCENE_MODE_HDR
+            isExposureCompensationSupported -> HdrSupportPath.SOFTWARE_MULTI_FRAME_HDR
+            else -> HdrSupportPath.UNAVAILABLE
         }
 
     val isHardwareDepthSupported: Boolean
@@ -909,6 +1155,19 @@ data class LensCapabilities(
 
     fun isFrameRateSupported(res: VideoResolution, fps: VideoFrameRate): Boolean =
         fps in getSupportedVideoModeFrameRates(res)
+
+    /**
+     * True if ANY supported video resolution/FPS combination on this lens supports video stabilization.
+     * Prevents hiding the stabilization toggle globally just because one specific resolution (e.g. 4K60) lacks EIS.
+     */
+    val isStabilizationAvailableForAnyResolution: Boolean
+        get() = isStabilizationSupported ||
+            isDigitalVideoStabilizationSupported ||
+            isPreviewStabilizationSupported ||
+            isOpticalStabilizationSupported ||
+            supportedStabilizationModesByConfig.values.any { modes ->
+                modes.any { it != VideoStabilizationMode.OFF }
+            }
 
     fun getSupportedStabilizationModes(
         res: VideoResolution = VideoResolution.FHD_1080P,
@@ -1397,11 +1656,14 @@ fun buildNonProResetCamera2CaptureRequestOptions(
     supportsExtendedBokehStill: Boolean = false,
     enableHardwareFaceDetect: Boolean = false,
     exposureCompensationIndex: Int = 0,
-    overrideAfMode: Boolean = true
+    overrideAfMode: Boolean = true,
+    lockAe: Boolean = false,
+    ispQualityCapabilities: IspQualityCapabilities? = null,
+    preferHighQualityIsp: Boolean = false
 ): CaptureRequestOptions {
     val builder = CaptureRequestOptions.Builder()
         .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, false)
+        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, lockAe)
         .setCaptureRequestOption(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureCompensationIndex)
         .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
         .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, false)
@@ -1409,7 +1671,7 @@ fun buildNonProResetCamera2CaptureRequestOptions(
     if (!isVideoMode && enableHardwareNightSceneMode) {
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_NIGHT)
-    } else if (!isVideoMode && enableHardwareHdrSceneMode && exposureCompensationIndex == 0) {
+    } else if (!isVideoMode && enableHardwareHdrSceneMode && exposureCompensationIndex == 0 && !lockAe) {
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
     } else {
@@ -1448,6 +1710,13 @@ fun buildNonProResetCamera2CaptureRequestOptions(
         }
         builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, afMode)
     }
+
+    // Apply ISP quality keys: FAST for live preview/fast mode, HIGH_QUALITY only when explicitly requested
+    CameraCaptureQualityPolicy.applyIspQualityToCaptureRequestOptions(
+        builder = builder,
+        ispCaps = ispQualityCapabilities,
+        preferHighQuality = preferHighQualityIsp
+    )
     return builder.build()
 }
 
@@ -1499,12 +1768,20 @@ fun buildVerifiedVideoCapabilityProfile(
     isCameraXVideoStabilizationSupported: Boolean = false,
     isCameraXPreviewStabilizationSupported: Boolean = false
 ): VerifiedVideoCapabilityProfile {
-    val maxAeFps = aeFpsRanges.maxOfOrNull { it.second } ?: 30
-    val has24FpsAe = aeFpsRanges.any { (lower, upper) ->
-        upper == 24 || (lower <= 24 && upper >= 24)
+    fun hasValidAeRangeForFps(targetFps: Int): Boolean {
+        if (aeFpsRanges.isEmpty()) return targetFps == 30
+        return aeFpsRanges.any { (lower, upper) ->
+            upper == targetFps || (lower <= targetFps && upper >= targetFps)
+        }
     }
-    val has60FpsAe = maxAeFps >= 60
 
+    val maxAeFps = aeFpsRanges.maxOfOrNull { it.second } ?: 30
+    val has24FpsAe = hasValidAeRangeForFps(24)
+    val has30FpsAe = aeFpsRanges.isEmpty() || hasValidAeRangeForFps(30)
+    val has60FpsAe = hasValidAeRangeForFps(60)
+    val has120FpsAe = hasValidAeRangeForFps(120)
+
+    // Keep recognizable standard resolutions only (720p, 1080p, 2K, 4K); odd stream sizes are hidden.
     val candidateResolutions = listOf(
         VideoResolution.HD_720P,
         VideoResolution.FHD_1080P,
@@ -1523,58 +1800,75 @@ fun buildVerifiedVideoCapabilityProfile(
                 maxD == res.width && minD == res.height
             }
         val inCameraX = res in cameraXSupportedResolutions
-        val inCamcorder = (camcorderMaxFpsByResolution[res] ?: 0) > 0
+        val profileMaxFps = camcorderMaxFpsByResolution[res] ?: 0
+        val inCamcorder = profileMaxFps > 0
         val codecMaxFps = codecMaxFpsByResolution[res] ?: 0.0
-        val isEncoderCapableFor30 = codecMaxFps >= 29.0 || inCamcorder || inCameraX
 
-        // A resolution is supported if the camera stream map exposes it (and encoder can encode it)
-        // or CameraX / CamcorderProfile explicitly validates it on this lens.
-        if (!((hasExactStreamSize && isEncoderCapableFor30) || inCameraX || inCamcorder)) {
+        // Require the camera to expose this resolution (via StreamConfigurationMap, CamcorderProfile, or CameraX)
+        // AND require the hardware video encoder (or standard CamcorderProfile) to support encoding it.
+        val isEncoderCapableForBase = codecMaxFps >= 23.0 || inCamcorder || (codecMaxFpsByResolution.isEmpty() && inCameraX)
+        if (!((hasExactStreamSize && isEncoderCapableForBase) || inCamcorder || (inCameraX && isEncoderCapableForBase))) {
             continue
         }
 
+        // Compute per-size max FPS from SCALER_STREAM_CONFIGURATION_MAP minFrameDuration (FPS = 1e9 / minFrameDuration)
+        val minDurationNs = minFrameDurationNanosByResolution[res] ?: 0L
+        val streamMaxFpsFromDuration = if (minDurationNs > 0L) {
+            1_000_000_000.0 / minDurationNs.toDouble()
+        } else {
+            0.0
+        }
+
         val rates = mutableListOf<VideoFrameRate>()
-        if (has24FpsAe) {
+
+        // 24 FPS: valid AE range covering 24 FPS + stream & encoder support >= 23 FPS
+        val streamSupports24 = streamMaxFpsFromDuration == 0.0 || streamMaxFpsFromDuration >= 23.0 || profileMaxFps >= 24
+        val encoderSupports24 = codecMaxFps >= 23.0 || profileMaxFps >= 24 || codecMaxFpsByResolution.isEmpty()
+        if (has24FpsAe && streamSupports24 && encoderSupports24) {
             rates.add(VideoFrameRate.FPS_24)
         }
-        rates.add(VideoFrameRate.FPS_30)
 
-        // Check whether 60 FPS is genuinely supported for THIS specific resolution:
-        // 1. Sensor/stream readout check: minFrameDuration <= 18.5ms (~54+ FPS) OR highSpeed map >= 60
-        //    OR CamcorderProfile/EncoderProfiles explicitly advertises >= 59 FPS for this resolution.
-        val minDurationNs = minFrameDurationNanosByResolution[res] ?: 0L
-        val highSpeedMaxFps = highSpeedSizeToMaxFps[exactPair]
-            ?: highSpeedSizeToMaxFps.entries
-                .firstOrNull { (dim, _) -> maxOf(dim.first, dim.second) == res.width && minOf(dim.first, dim.second) == res.height }
-                ?.value
-            ?: 0
-        val profileMaxFps = camcorderMaxFpsByResolution[res] ?: 0
+        // 30 FPS: valid AE range covering 30 FPS + stream & encoder support >= 29 FPS
+        val streamSupports30 = streamMaxFpsFromDuration == 0.0 || streamMaxFpsFromDuration >= 28.5 || profileMaxFps >= 29
+        val encoderSupports30 = codecMaxFps >= 28.5 || profileMaxFps >= 29 || codecMaxFpsByResolution.isEmpty()
+        if (has30FpsAe && streamSupports30 && encoderSupports30) {
+            rates.add(VideoFrameRate.FPS_30)
+        }
 
-        // Note: QHD_2K (2560x1440) is capped at 30 FPS unless both profile/high-speed AND encoder explicitly support 60 FPS,
-        // matching the target 2K @ 30 FPS requirement and avoiding unstable 2K60 configurations.
-        val sensorReadoutSupports60 = when {
+        // 60 FPS (normal Video mode ONLY — do NOT use highSpeedSizeToMaxFps here; high-speed stays in Slow Motion!):
+        // Requires:
+        // 1. A valid AE FPS range that reaches 60 FPS (e.g. [60,60], [30,60], [15,60]) OR standard CamcorderProfile >= 59 FPS
+        // 2. Per-size minFrameDuration allows >= 57.5 FPS (<= ~17.4ms, allowing small HAL rounding tolerance)
+        //    OR standard CamcorderProfile >= 59 FPS
+        //    OR minDurationNs == 0L (HAL didn't report duration) for 720p/1080p when AE range reaches 60 FPS
+        // 3. Hardware encoder (H.264 or HEVC) supports >= 57.5 FPS at this resolution (or CamcorderProfile >= 59 FPS)
+        val streamSupports60 = when {
             profileMaxFps >= 59 -> true
-            highSpeedMaxFps >= 60 -> true
-            minDurationNs in 1L..18_500_000L && has60FpsAe -> true
-            // When minDurationNs is not reported (0L) for a standard HD/FHD stream on a Camera2 HAL that exposes
-            // a 60 FPS AE target range and hardware encoder support for 60 FPS at 720p/1080p:
-            minDurationNs == 0L && has60FpsAe && (res == VideoResolution.HD_720P || res == VideoResolution.FHD_1080P) -> true
+            streamMaxFpsFromDuration >= 57.5 -> true
+            streamMaxFpsFromDuration in 1.0..57.49 -> false
+            // minDurationNs == 0L: allow 720p/1080p when AE range explicitly includes 60 FPS;
+            // for 2K/4K, require explicit stream duration or CamcorderProfile proof.
+            res == VideoResolution.HD_720P || res == VideoResolution.FHD_1080P -> has60FpsAe
             else -> false
         }
-
-        val encoderSupports60 = codecMaxFps >= 58.0 || profileMaxFps >= 59 || highSpeedMaxFps >= 60
-
-        val is60FpsSupportedForRes = if (res == VideoResolution.QHD_2K) {
-            profileMaxFps >= 59 && codecMaxFps >= 58.0 && minDurationNs in 1L..17_500_000L && has60FpsAe
-        } else {
-            sensorReadoutSupports60 && encoderSupports60 && (has60FpsAe || highSpeedMaxFps >= 60 || profileMaxFps >= 59)
-        }
-
-        if (is60FpsSupportedForRes) {
+        val encoderSupports60 = codecMaxFps >= 57.5 || profileMaxFps >= 59 || (codecMaxFpsByResolution.isEmpty() && profileMaxFps >= 59)
+        if (streamSupports60 && encoderSupports60 && (has60FpsAe || profileMaxFps >= 59)) {
             rates.add(VideoFrameRate.FPS_60)
         }
 
-        supportedVideoQualities[res] = rates
+        // 120 FPS in normal Video mode ONLY if genuinely exposed as a standard (non-high-speed) stream + AE range + encoder
+        val streamSupports120 = streamMaxFpsFromDuration >= 115.0 || profileMaxFps >= 118
+        val encoderSupports120 = codecMaxFps >= 115.0 || profileMaxFps >= 118
+        if (has120FpsAe && streamSupports120 && encoderSupports120) {
+            rates.add(VideoFrameRate.FPS_120)
+        }
+
+        if (rates.isEmpty() && isEncoderCapableForBase) {
+            rates.add(VideoFrameRate.FPS_30)
+        }
+        if (rates.isNotEmpty()) {
+            supportedVideoQualities[res] = rates.distinct()
+        }
     }
 
     if (supportedVideoQualities.isEmpty()) {
@@ -1582,7 +1876,7 @@ fun buildVerifiedVideoCapabilityProfile(
         supportedVideoQualities[VideoResolution.FHD_1080P] = listOf(VideoFrameRate.FPS_30)
     }
 
-    // Slow-motion (120 / 240 / 360 / 480 FPS) discovery per resolution
+    // Slow-motion (120 / 240 / 360 / 480 FPS) discovery strictly separated from normal Video mode
     val slowMoCandidates = listOf(
         VideoFrameRate.FPS_120,
         VideoFrameRate.FPS_240,
@@ -1621,9 +1915,8 @@ fun buildVerifiedVideoCapabilityProfile(
         }
     }
 
-    // Stabilization capability detection:
-    // Mode 1 = CONTROL_VIDEO_STABILIZATION_MODE_ON
-    // Mode 2 = CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION (API 33+)
+    // Stabilization capability detection from CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES
+    // and LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, evaluated per resolution/FPS.
     val hasDigitalVideoStab = availableVideoStabilizationModes.contains(
         CameraCharacteristics.CONTROL_VIDEO_STABILIZATION_MODE_ON
     ) || isCameraXVideoStabilizationSupported
@@ -1642,17 +1935,13 @@ fun buildVerifiedVideoCapabilityProfile(
             val isStandardSupportedForCombo = when (res) {
                 VideoResolution.HD_720P -> hasDigitalVideoStab || hasPreviewStab || hasOis
                 VideoResolution.FHD_1080P -> {
-                    if (fps == VideoFrameRate.FPS_60) {
-                        hasDigitalVideoStab || hasPreviewStab || hasOis
-                    } else {
-                        hasDigitalVideoStab || hasPreviewStab || hasOis
-                    }
+                    if (fps.fps >= 120) hasOis else (hasDigitalVideoStab || hasPreviewStab || hasOis)
                 }
                 VideoResolution.QHD_2K -> {
-                    (fps != VideoFrameRate.FPS_60 && (hasDigitalVideoStab || hasPreviewStab)) || hasOis
+                    (fps.fps <= 30 && (hasDigitalVideoStab || hasPreviewStab)) || hasOis
                 }
                 VideoResolution.UHD_4K -> {
-                    hasOis || (fps != VideoFrameRate.FPS_60 && hasPreviewStab)
+                    hasOis || (fps.fps <= 30 && (hasPreviewStab || hasDigitalVideoStab))
                 }
             }
             if (isStandardSupportedForCombo) {
@@ -1660,7 +1949,7 @@ fun buildVerifiedVideoCapabilityProfile(
             }
             if (isActiveStabilizationSupported &&
                 (res == VideoResolution.HD_720P || res == VideoResolution.FHD_1080P) &&
-                fps != VideoFrameRate.FPS_60
+                fps.fps <= 30
             ) {
                 modes.add(VideoStabilizationMode.ACTIVE)
             }
@@ -1673,7 +1962,7 @@ fun buildVerifiedVideoCapabilityProfile(
         supportedSlowMoRates = supportedSlowMoRates,
         supportedSlowMoResolutionsByRate = supportedSlowMoResolutionsByRate,
         supportedStabilizationModesByConfig = supportedStabilizationModesByConfig,
-        isStabilizationSupported = hasDigitalVideoStab || hasPreviewStab,
+        isStabilizationSupported = isAnyStabilizationSupported,
         isDigitalVideoStabilizationSupported = hasDigitalVideoStab,
         isPreviewStabilizationSupported = hasPreviewStab,
         isOpticalStabilizationSupported = hasOis,

@@ -69,6 +69,16 @@ enum class HdOutputOption(val displayName: String, val subtitle: String) {
 }
 
 /**
+ * Photo capture speed vs quality strategy.
+ * - FAST: Zero-shutter-lag / minimum-latency CameraX capture with direct JPEG write and FAST ISP preview.
+ * - QUALITY: Maximum-quality ISP pipeline (HIGH_QUALITY NR/Edge/Tonemap/Aberration) + 3–5 frame streaming noise reduction.
+ */
+enum class PhotoCaptureSpeedMode(val displayName: String, val subtitle: String) {
+    FAST("Fast", "Minimum latency / ZSL with direct JPEG save"),
+    QUALITY("Quality", "Max-quality ISP + 3–5 frame streaming noise reduction")
+}
+
+/**
  * Astrophotography capture duration options.
  */
 enum class AstroDuration(
@@ -383,6 +393,8 @@ data class CameraPreferences(
     val videoStabilization: VideoStabilizationMode = VideoStabilizationMode.STANDARD,
     // HD mode preferences
     val hdOutputOption: HdOutputOption = HdOutputOption.MAX_NATIVE,
+    // Photo capture speed vs quality strategy
+    val photoCaptureSpeedMode: PhotoCaptureSpeedMode = PhotoCaptureSpeedMode.FAST,
     // HDR computational mode
     val hdrMode: HdrMode = HdrMode.AUTO,
     // Mode-specific options

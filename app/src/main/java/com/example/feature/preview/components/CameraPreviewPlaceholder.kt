@@ -60,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.core.camera.CameraLens
 import com.example.core.camera.LensCapabilities
+import com.example.core.camera.NightSightProgressState
 import com.example.core.camera.NightSightSupportPath
 import com.example.core.camera.PortraitBlurDeviceSupport
 import com.example.core.camera.PortraitDepthSupportPath
@@ -215,6 +216,8 @@ fun CameraPreviewPlaceholder(
     onCancelPanoramaCapture: (() -> Unit)? = null,
     onStepPanoramaCapture: (() -> Unit)? = null,
     hdrMode: com.example.core.preferences.HdrMode = com.example.core.preferences.HdrMode.AUTO,
+    photoCaptureSpeedMode: com.example.core.preferences.PhotoCaptureSpeedMode = com.example.core.preferences.PhotoCaptureSpeedMode.FAST,
+    showSavedConfirmationBadge: Boolean = false,
     selectedFilter: com.example.core.preferences.CameraFilterPreset = com.example.core.preferences.CameraFilterPreset.ORIGINAL,
     onFilterBadgeClick: (() -> Unit)? = null,
     nightSightSupportPath: NightSightSupportPath = NightSightSupportPath.MULTI_FRAME_LOW_LIGHT_FUSION,
@@ -231,6 +234,8 @@ fun CameraPreviewPlaceholder(
     onRecordingDurationChanged: ((Long) -> Unit)? = null,
     onRecordingSuccess: ((Uri) -> Unit)? = null,
     onRecordingError: ((String) -> Unit)? = null,
+    nightSightCancelTrigger: Int = 0,
+    onNightSightProgressChanged: ((NightSightProgressState) -> Unit)? = null,
     onCountdownStateChanged: ((Boolean, Int) -> Unit)? = null,
     modifier: Modifier = Modifier,
     onPreviewClick: (() -> Unit)? = null
@@ -647,6 +652,7 @@ fun CameraPreviewPlaceholder(
                     onPanoramaStateChanged = onPanoramaStateChanged,
                     selectedFilter = effectiveFilter,
                     hdrMode = hdrMode,
+                    photoCaptureSpeedMode = photoCaptureSpeedMode,
                     focusTouchRequest = if (isTapToFocusEnabledForMode(activeMode)) activeFocusRequest else null,
                     autoExposureIndex = if (isFocusEvEnabledForMode) autoExposureIndex else 0,
                     proEv = proEv,
@@ -679,6 +685,8 @@ fun CameraPreviewPlaceholder(
                     onRecordingDurationChanged = onRecordingDurationChanged,
                     onRecordingSuccess = onRecordingSuccess,
                     onRecordingError = onRecordingError,
+                    nightSightCancelTrigger = nightSightCancelTrigger,
+                    onNightSightProgressChanged = onNightSightProgressChanged,
                     onCountdownStateChanged = onCountdownStateChanged,
                     modifier = Modifier.fillMaxSize()
                 )
@@ -848,6 +856,30 @@ fun CameraPreviewPlaceholder(
                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                         color = Color.White,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            // Instant "Saved" confirmation pill shown as soon as a captured photo is written
+            AnimatedVisibility(
+                visible = showSavedConfirmationBadge && !isRecording,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 14.dp)
+            ) {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.78f),
+                    shape = RoundedCornerShape(999.dp),
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
+                    modifier = Modifier.testTag("capture_saved_confirmation_badge")
+                ) {
+                    Text(
+                        text = "Saved",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                        color = Color.White,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
                     )
                 }
             }

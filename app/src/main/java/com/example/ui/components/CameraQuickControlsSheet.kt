@@ -56,6 +56,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.core.camera.CameraCapabilitiesState
+import com.example.core.camera.CameraLens
+import com.example.core.camera.CaptureResolutionResolver
+import com.example.core.camera.LensCapabilities
+import com.example.core.camera.LensFacing
 import com.example.core.camera.VideoFrameRate
 import com.example.core.camera.VideoResolution
 import com.example.core.model.CameraMode
@@ -206,22 +210,18 @@ fun CameraQuickControlsSheet(
                 }
                 is CameraCapabilitiesState.Verified -> {
                     val lensCaps = capabilitiesState.currentLensCapabilities
-                    val activeHardwareLabel = lensCaps?.resolvedHardwareLabel
-                        ?: capabilitiesState.activeLens.displayName
-                    val videoResSummary = lensCaps?.getSupportedVideoModeResolutions()
-                        ?.joinToString("/") { it.id }
-                        ?.takeIf { it.isNotBlank() }
-                        ?: "720p/1080p"
-                    val maxVideoFps = lensCaps?.supportedVideoQualities
-                        ?.values
-                        ?.flatten()
-                        ?.maxOfOrNull { it.fps } ?: 30
-                    val stabHardwareSummary = when {
-                        lensCaps?.isActiveStabilizationSupported == true -> "EIS+OIS"
-                        lensCaps?.isPreviewStabilizationSupported == true -> "Preview EIS"
-                        lensCaps?.isDigitalVideoStabilizationSupported == true -> "Hardware EIS"
-                        lensCaps?.isOpticalStabilizationSupported == true -> "Hardware OIS"
-                        else -> "No HW EIS/OIS"
+                    val detailsLine = if (lensCaps != null) {
+                        buildQuickSettingsCameraDetailsLine(
+                            lensCaps = lensCaps,
+                            activeMode = activeMode,
+                            preferences = preferences
+                        )
+                    } else {
+                        if (capabilitiesState.activeLens.facing == LensFacing.FRONT) {
+                            "Front Camera"
+                        } else {
+                            "Rear Camera"
+                        }
                     }
                     Surface(
                         color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f),
@@ -240,9 +240,10 @@ fun CameraQuickControlsSheet(
                                 modifier = Modifier.size(20.dp)
                             )
                             Text(
-                                text = "$activeHardwareLabel • $videoResSummary up to ${maxVideoFps}fps • $stabHardwareSummary",
+                                text = detailsLine,
                                 style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.testTag("quick_settings_camera_details_line")
                             )
                         }
                     }
@@ -254,6 +255,8 @@ fun CameraQuickControlsSheet(
                 is CameraCapabilitiesState.Verified -> capabilitiesState.activeLens
                 is CameraCapabilitiesState.PendingDiscovery -> capabilitiesState.activeLens
             }
+            val activeHardwareName = verifiedLensCaps?.let { formatCameraBaseLabelWithoutFocalLength(it) }
+                ?: activeLens.displayName
             val isTorchHardwareSupported = when (capabilitiesState) {
                 is CameraCapabilitiesState.Verified -> verifiedLensCaps?.isTorchSupported == true
                 is CameraCapabilitiesState.PendingDiscovery -> activeLens.facing != com.example.core.camera.LensFacing.FRONT
@@ -277,7 +280,7 @@ fun CameraQuickControlsSheet(
                         isOptionEnabled = { mode -> mode == FlashMode.OFF || isTorchHardwareSupported },
                         optionTestTag = { "quick_photo_flash_${it.name.lowercase()}" },
                         supportingNote = if (!isTorchHardwareSupported) {
-                            "Flash hardware unavailable on ${activeLens.displayName}"
+                            "Flash hardware unavailable on $activeHardwareName"
                         } else null,
                         onOptionSelected = onFlashChanged
                     )
@@ -304,16 +307,59 @@ fun CameraQuickControlsSheet(
                         onOptionSelected = onAspectRatioChanged
                     )
 
-                    // HDR+
-                    QuickControlPillSection(
-                        label = "HDR+ Computational",
-                        icon = Icons.Outlined.HighQuality,
-                        options = HdrMode.entries,
-                        selectedOption = preferences.hdrMode,
-                        optionLabel = { it.displayName },
-                        optionTestTag = { "quick_hdr_${it.name.lowercase()}" },
-                        onOptionSelected = onHdrModeChanged
-                    )
+                    // HDR+ (shown only when CameraX HDR Extension, Camera2 Hardware Scene HDR, or real EV-bracketed HDR is available)
+                    val isHdrAvailableOnLens = verifiedLensCaps == null || verifiedLensCaps.isRealHdrSupported
+                    if (isHdrAvailableOnLens) {
+                        val hdrPathNote = when (verifiedLensCaps?.hdrSupportPath) {
+                            com.example.core.camera.HdrSupportPath.COMPATIBLE_EXTENSION ->
+                                "Using device CameraX HDR Extension"
+                            com.example.core.camera.HdrSupportPath.HARDWARE_SCENE_MODE_HDR ->
+                                "Using Camera2 Hardware HDR + EV fusion"
+                            com.example.core.camera.HdrSupportPath.SOFTWARE_MULTI_FRAME_HDR ->
+                                "Using real 3-frame EV-bracketed HDR fusion"
+                            else -> null
+                        }
+                        QuickControlPillSection(
+                            label = "HDR+",
+                            icon = Icons.Outlined.HighQuality,
+                            options = HdrMode.entries,
+                            selectedOption = preferences.hdrMode,
+                            optionLabel = { it.displayName },
+                            optionTestTag = { "quick_hdr_${it.name.lowercase()}" },
+                            supportingNote = hdrPathNote,
+                            onOptionSelected = onHdrModeChanged
+                        )
+                    }
+
+                    // Show genuinely available CameraX OEM Extensions for this lens (never list unsupported extensions)
+                    val availableExtNames = verifiedLensCaps?.extensionAvailability?.supportedExtensionNames.orEmpty()
+                    if (availableExtNames.isNotEmpty()) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("quick_extensions_info_card")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Info,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = "CameraX Extensions available: ${availableExtNames.joinToString(", ")}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
 
                     // Grid
                     QuickControlPillSection(
@@ -392,12 +438,19 @@ fun CameraQuickControlsSheet(
                 }
 
                 CameraMode.HD -> {
-                    val hasDistinctHighResTier = verifiedLensCaps?.let { caps ->
-                        val maxPixels = caps.highestNativeStillSize?.totalPixels ?: 0L
-                        val minStandardPixels = caps.supportedPhotoSizes.filter { it.totalPixels >= 8_000_000L }
-                            .minOfOrNull { it.totalPixels } ?: maxPixels
-                        maxPixels > 16_500_000L && maxPixels > (minStandardPixels * 3L) / 2L
-                    } ?: true
+                    val hdActiveCaptureSize = CaptureResolutionResolver.resolveActualCaptureSize(
+                        lensCaps = verifiedLensCaps,
+                        activeMode = CameraMode.HD,
+                        aspectRatioMode = preferences.aspectRatioMode,
+                        hdOutputOption = preferences.hdOutputOption
+                    )
+                    val hdMaxCaptureSize = CaptureResolutionResolver.resolveActualCaptureSize(
+                        lensCaps = verifiedLensCaps,
+                        activeMode = CameraMode.HD,
+                        aspectRatioMode = preferences.aspectRatioMode,
+                        hdOutputOption = HdOutputOption.MAX_NATIVE
+                    )
+                    val hdMaxFormattedWithDims = CaptureResolutionResolver.formatMegapixelsWithDimensions(hdMaxCaptureSize)
 
                     // HD Output Option
                     QuickControlPillSection(
@@ -406,10 +459,12 @@ fun CameraQuickControlsSheet(
                         options = HdOutputOption.entries,
                         selectedOption = preferences.hdOutputOption,
                         optionLabel = { it.displayName },
-                        supportingNote = if (verifiedLensCaps != null && !hasDistinctHighResTier && verifiedLensCaps.sensorPixelArraySize != null &&
-                            verifiedLensCaps.sensorPixelArraySize.totalPixels > (verifiedLensCaps.highestNativeStillSize?.totalPixels ?: 0L) * 2L
-                        ) {
-                            "Public Camera2 HAL exposes ${verifiedLensCaps.highestNativeStillSize?.formattedMegapixels ?: "12.0 MP"} pixel-binned output from the ${verifiedLensCaps.sensorPixelArraySize.formattedMegapixels} physical sensor."
+                        supportingNote = if (verifiedLensCaps?.isSensorFullResolutionRestricted == true) {
+                            if (hdMaxFormattedWithDims != null) {
+                                "This device doesn't expose full sensor resolution to apps. Max available: $hdMaxFormattedWithDims."
+                            } else {
+                                "This device doesn't expose full sensor resolution to apps."
+                            }
                         } else null,
                         onOptionSelected = onHdOptionChanged
                     )
@@ -425,35 +480,45 @@ fun CameraQuickControlsSheet(
                             verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             Text(
-                                text = "Highest Supported Native Output",
+                                text = if (verifiedLensCaps != null) {
+                                    CaptureResolutionResolver.formatHdModeButtonLabel(
+                                        lensCaps = verifiedLensCaps,
+                                        aspectRatioMode = preferences.aspectRatioMode,
+                                        hdOutputOption = preferences.hdOutputOption
+                                    )
+                                } else {
+                                    "Highest Supported Native Output"
+                                },
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                color = MaterialTheme.colorScheme.onSurface
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.testTag("hd_resolution_card_title")
                             )
                             Text(
                                 text = when (capabilitiesState) {
                                     is CameraCapabilitiesState.Verified -> {
                                         val caps = capabilitiesState.currentLensCapabilities
-                                        val selectedSize = caps?.selectOptimalPhotoOutputSize(
-                                            aspectRatioMode = preferences.aspectRatioMode,
-                                            preferMaxNative = preferences.hdOutputOption == HdOutputOption.MAX_NATIVE
-                                        ) ?: caps?.highestNativeStillSize
-                                        val arraySize = caps?.sensorPixelArraySize
-                                        if (selectedSize != null) {
-                                            if (arraySize != null && arraySize.totalPixels > selectedSize.totalPixels * 2L && !caps.isFullSensorResolutionExposed) {
-                                                "Target output: ${selectedSize.formattedMegapixels} (${selectedSize.dimensionsLabel}) max Camera2 stream (${arraySize.formattedMegapixels} physical array pixel-binned)."
-                                            } else {
-                                                "Target output: ${selectedSize.formattedMegapixels} (${selectedSize.dimensionsLabel}) native sensor capture."
+                                        val formattedOutput = CaptureResolutionResolver.formatMegapixelsWithDimensions(hdActiveCaptureSize)
+                                        val sensorArrayMp = CaptureResolutionResolver.formatMegapixels(caps?.sensorPixelArraySize)
+                                        if (formattedOutput != null) {
+                                            when {
+                                                preferences.hdOutputOption == HdOutputOption.STANDARD_BINNED ->
+                                                    "Target output: $formattedOutput standard binned capture."
+                                                caps?.isSensorFullResolutionRestricted == true && sensorArrayMp != null ->
+                                                    "Target output: $formattedOutput. This device doesn't expose full sensor resolution to apps ($sensorArrayMp sensor)."
+                                                else ->
+                                                    "Target output: $formattedOutput native sensor capture."
                                             }
                                         } else {
-                                            "Target output: Dynamic highest native output for ${capabilitiesState.activeLens.displayName}."
+                                            "Target output: Dynamic native output for $activeHardwareName."
                                         }
                                     }
                                     is CameraCapabilitiesState.PendingDiscovery -> {
-                                        "Target output will dynamically discover and select the camera lens's highest native resolution without artificial upscaling (Phase 2)."
+                                        "Target output will dynamically discover and select the camera lens's highest native resolution without artificial upscaling."
                                     }
                                 },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.testTag("hd_resolution_card_body")
                             )
                         }
                     }
@@ -607,7 +672,7 @@ fun CameraQuickControlsSheet(
 
                     val unsupportedResolutions = VideoResolution.VIDEO_MODE_OPTIONS.filter { it !in displayedResolutions }
                     val resolutionNote = if (capabilitiesState is CameraCapabilitiesState.Verified && unsupportedResolutions.isNotEmpty()) {
-                        "Supported on ${activeLens.displayName}: ${displayedResolutions.joinToString { it.displayName }}"
+                        "Supported on $activeHardwareName: ${displayedResolutions.joinToString { it.displayName }}"
                     } else null
 
                     QuickControlPillSection(
@@ -645,7 +710,6 @@ fun CameraQuickControlsSheet(
                                 ?: listOf(VideoFrameRate.FPS_30)
                         }
                         is CameraCapabilitiesState.PendingDiscovery -> {
-                            // Never display 24 or 60 FPS as verified before hardware capability inspection
                             listOf(VideoFrameRate.FPS_30)
                         }
                     }
@@ -667,7 +731,7 @@ fun CameraQuickControlsSheet(
                     val fpsNote = if (capabilitiesState is CameraCapabilitiesState.Verified &&
                         VideoFrameRate.FPS_60 !in displayedFpsOptions
                     ) {
-                        "60 FPS unavailable for ${effectiveResolution.displayName} on ${activeLens.displayName}"
+                        "60 FPS unavailable for ${effectiveResolution.displayName} on $activeHardwareName"
                     } else null
 
                     QuickControlPillSection(
@@ -693,57 +757,65 @@ fun CameraQuickControlsSheet(
                         }
                     )
 
-                    // Video Stabilization: Standard, Active, Off
-                    val isStabSupported: (VideoStabilizationMode) -> Boolean = { mode ->
-                        when (capabilitiesState) {
+                    // Video Stabilization: show toggle only when EIS or OIS is actually available on this camera,
+                    // checking per resolution/FPS so unsupported single resolutions don't falsely mark the whole camera unsupported.
+                    val showStabilizationSection = when (capabilitiesState) {
+                        is CameraCapabilitiesState.Verified -> verifiedLensCaps?.isStabilizationAvailableForAnyResolution == true
+                        is CameraCapabilitiesState.PendingDiscovery -> true
+                    }
+
+                    if (showStabilizationSection) {
+                        val isStabSupported: (VideoStabilizationMode) -> Boolean = { mode ->
+                            when (capabilitiesState) {
+                                is CameraCapabilitiesState.Verified -> {
+                                    verifiedLensCaps?.isStabilizationModeSupported(mode, effectiveResolution, effectiveFps)
+                                        ?: (mode == VideoStabilizationMode.OFF)
+                                }
+                                is CameraCapabilitiesState.PendingDiscovery -> {
+                                    mode != VideoStabilizationMode.ACTIVE
+                                }
+                            }
+                        }
+
+                        val effectiveStabilization = when (capabilitiesState) {
                             is CameraCapabilitiesState.Verified -> {
-                                verifiedLensCaps?.isStabilizationModeSupported(mode, effectiveResolution, effectiveFps)
-                                    ?: (mode == VideoStabilizationMode.OFF)
+                                verifiedLensCaps?.resolveSupportedStabilization(
+                                    effectiveResolution,
+                                    effectiveFps,
+                                    preferences.videoStabilization
+                                ) ?: VideoStabilizationMode.OFF
                             }
                             is CameraCapabilitiesState.PendingDiscovery -> {
-                                mode != VideoStabilizationMode.ACTIVE
+                                if (isStabSupported(preferences.videoStabilization)) {
+                                    preferences.videoStabilization
+                                } else {
+                                    VideoStabilizationMode.STANDARD
+                                }
                             }
                         }
-                    }
 
-                    val effectiveStabilization = when (capabilitiesState) {
-                        is CameraCapabilitiesState.Verified -> {
-                            verifiedLensCaps?.resolveSupportedStabilization(
-                                effectiveResolution,
-                                effectiveFps,
-                                preferences.videoStabilization
-                            ) ?: VideoStabilizationMode.OFF
-                        }
-                        is CameraCapabilitiesState.PendingDiscovery -> {
-                            if (isStabSupported(preferences.videoStabilization)) {
-                                preferences.videoStabilization
-                            } else {
-                                VideoStabilizationMode.STANDARD
+                        val stabNote = if (capabilitiesState is CameraCapabilitiesState.Verified) {
+                            when {
+                                !isStabSupported(VideoStabilizationMode.STANDARD) && !isStabSupported(VideoStabilizationMode.ACTIVE) ->
+                                    "Stabilization unavailable at ${effectiveResolution.displayName} ${effectiveFps.fps} FPS"
+                                !isStabSupported(VideoStabilizationMode.ACTIVE) ->
+                                    "Active stabilization requires OIS + EIS at 1080p/720p 30 FPS"
+                                else -> null
                             }
-                        }
+                        } else null
+
+                        QuickControlPillSection(
+                            label = "Stabilization",
+                            icon = Icons.Outlined.Videocam,
+                            options = VideoStabilizationMode.entries,
+                            selectedOption = effectiveStabilization,
+                            optionLabel = { it.displayName },
+                            isOptionEnabled = isStabSupported,
+                            optionTestTag = { "video_stab_option_${it.name.lowercase()}" },
+                            supportingNote = stabNote,
+                            onOptionSelected = onVideoStabilizationChanged
+                        )
                     }
-
-                    val stabNote = if (capabilitiesState is CameraCapabilitiesState.Verified) {
-                        when {
-                            !isStabSupported(VideoStabilizationMode.STANDARD) && !isStabSupported(VideoStabilizationMode.ACTIVE) ->
-                                "Hardware video stabilization unavailable on ${activeLens.displayName}"
-                            !isStabSupported(VideoStabilizationMode.ACTIVE) ->
-                                "Active stabilization requires OIS + EIS at 1080p/720p 30 FPS"
-                            else -> null
-                        }
-                    } else null
-
-                    QuickControlPillSection(
-                        label = "Stabilization",
-                        icon = Icons.Outlined.Videocam,
-                        options = VideoStabilizationMode.entries,
-                        selectedOption = effectiveStabilization,
-                        optionLabel = { it.displayName },
-                        isOptionEnabled = isStabSupported,
-                        optionTestTag = { "video_stab_option_${it.name.lowercase()}" },
-                        supportingNote = stabNote,
-                        onOptionSelected = onVideoStabilizationChanged
-                    )
 
                     // Flash / Torch: Off and Torch
                     val effectiveTorchMode = if (isTorchHardwareSupported && preferences.flashMode == FlashMode.TORCH) {
@@ -752,7 +824,7 @@ fun CameraQuickControlsSheet(
                         FlashMode.OFF
                     }
                     val torchNote = if (capabilitiesState is CameraCapabilitiesState.Verified && !isTorchHardwareSupported) {
-                        "Torch hardware unavailable on ${activeLens.displayName}"
+                        "Torch hardware unavailable on $activeHardwareName"
                     } else null
 
                     QuickControlPillSection(
@@ -1137,4 +1209,141 @@ private fun <T> QuickControlPillSection(
             )
         }
     }
+}
+
+/**
+ * Formats the camera facing and optional lens role without any focal length (mm).
+ */
+internal fun formatCameraBaseLabelWithoutFocalLength(lensCaps: LensCapabilities): String {
+    val facingPrefix = if (lensCaps.lens.facing == LensFacing.FRONT) "Front Camera" else "Rear Camera"
+    val desc = lensCaps.sensorDescription.orEmpty()
+    val roleSuffix = when {
+        lensCaps.lens == CameraLens.BACK_ULTRAWIDE || desc.contains("Ultrawide", ignoreCase = true) -> "Ultrawide"
+        lensCaps.lens == CameraLens.BACK_TELEPHOTO || desc.contains("Telephoto", ignoreCase = true) -> "Telephoto"
+        else -> null
+    }
+    return if (roleSuffix != null && lensCaps.lens.facing == LensFacing.BACK) {
+        "$facingPrefix · $roleSuffix"
+    } else {
+        facingPrefix
+    }
+}
+
+internal fun formatShortVideoResolutionLabel(resolution: VideoResolution): String = when (resolution) {
+    VideoResolution.HD_720P -> "720p"
+    VideoResolution.FHD_1080P -> "1080p"
+    VideoResolution.QHD_2K -> "2K"
+    VideoResolution.UHD_4K -> "4K"
+}
+
+/**
+ * Resolves the highest detected video resolution and the highest FPS available at that resolution.
+ * For Slow Motion, prefers the real detected high-speed Slow Motion table.
+ */
+internal fun resolveVideoCapabilitySummary(
+    lensCaps: LensCapabilities,
+    activeMode: CameraMode
+): String? {
+    if (activeMode == CameraMode.SLOW_MOTION && lensCaps.supportedSlowMoResolutionsByRate.isNotEmpty()) {
+        val maxFpsBySlowMoRes = LinkedHashMap<VideoResolution, Int>()
+        for ((rate, resolutions) in lensCaps.supportedSlowMoResolutionsByRate) {
+            for (res in resolutions) {
+                val existing = maxFpsBySlowMoRes[res] ?: 0
+                if (rate.fps > existing) {
+                    maxFpsBySlowMoRes[res] = rate.fps
+                }
+            }
+        }
+        val highestSlowMoRes = maxFpsBySlowMoRes.keys.maxByOrNull { it.width.toLong() * it.height.toLong() }
+        if (highestSlowMoRes != null) {
+            val maxFpsAtRes = maxFpsBySlowMoRes[highestSlowMoRes]
+            if (maxFpsAtRes != null && maxFpsAtRes > 0) {
+                return "${formatShortVideoResolutionLabel(highestSlowMoRes)} up to ${maxFpsAtRes}fps"
+            }
+        }
+    }
+
+    val supportedResolutions = lensCaps.getSupportedVideoModeResolutions()
+    val highestRes = supportedResolutions.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: return null
+    val maxFpsAtHighest = lensCaps.getSupportedVideoModeFrameRates(highestRes)
+        .maxOfOrNull { it.fps }
+        ?.takeIf { it > 0 }
+        ?: return null
+    return "${formatShortVideoResolutionLabel(highestRes)} up to ${maxFpsAtHighest}fps"
+}
+
+/**
+ * Reports EIS and/or OIS strictly when the selected camera actually reports them in hardware capabilities.
+ * In Video mode, also reflects whether stabilization is available at the currently selected resolution & FPS.
+ */
+internal fun resolveStabilizationSummary(
+    lensCaps: LensCapabilities,
+    activeMode: CameraMode,
+    preferences: CameraPreferences
+): String? {
+    val reportsEis = lensCaps.isDigitalVideoStabilizationSupported || lensCaps.isPreviewStabilizationSupported
+    val reportsOis = lensCaps.isOpticalStabilizationSupported
+
+    val showEis: Boolean
+    val showOis: Boolean
+    if (activeMode == CameraMode.VIDEO) {
+        val effectiveRes = lensCaps.resolveSupportedResolution(preferences.videoResolution)
+        val effectiveFps = lensCaps.resolveSupportedFrameRate(effectiveRes, preferences.videoFrameRate)
+        val comboModes = lensCaps.getSupportedStabilizationModes(effectiveRes, effectiveFps)
+        val comboHasStab = comboModes.any { it != VideoStabilizationMode.OFF }
+        val eisEligibleAtCombo = when (effectiveRes) {
+            VideoResolution.HD_720P -> true
+            VideoResolution.FHD_1080P -> effectiveFps.fps < 120
+            VideoResolution.QHD_2K, VideoResolution.UHD_4K -> effectiveFps.fps <= 30
+        }
+        showEis = reportsEis && comboHasStab && eisEligibleAtCombo
+        showOis = reportsOis && comboHasStab
+    } else {
+        showEis = reportsEis
+        showOis = reportsOis
+    }
+
+    return when {
+        showEis && showOis -> "EIS+OIS"
+        showEis -> "EIS"
+        showOis -> "OIS"
+        else -> null
+    }
+}
+
+/**
+ * Builds the mode-aware camera details line displayed at the top of Quick Settings.
+ * Still modes read strictly from [CaptureResolutionResolver.resolveActualCaptureSize] and
+ * [CaptureResolutionResolver.formatMegapixels] so the header always matches the HD card,
+ * HD button, Settings, and Debug screen.
+ *
+ * Examples:
+ * - Still modes (Photo, HD, Portrait, Night Sight, Pro, Panorama, Astrophotography):
+ *   "Rear Camera · ID 0 · 2.6 MP · EIS" or "Rear Camera · ID 0 · 108 MP · EIS+OIS"
+ * - Video modes (Video, Slow Motion, Time Lapse):
+ *   "Rear Camera · ID 0 · 2K up to 60fps · EIS+OIS"
+ */
+internal fun buildQuickSettingsCameraDetailsLine(
+    lensCaps: LensCapabilities,
+    activeMode: CameraMode,
+    preferences: CameraPreferences
+): String {
+    val parts = mutableListOf<String>()
+    parts.add(formatCameraBaseLabelWithoutFocalLength(lensCaps))
+    lensCaps.camera2CameraId?.takeIf { it.isNotBlank() }?.let { camId ->
+        parts.add("ID $camId")
+    }
+    if (activeMode.isVideo) {
+        resolveVideoCapabilitySummary(lensCaps, activeMode)?.let { parts.add(it) }
+    } else {
+        val captureSize = CaptureResolutionResolver.resolveActualCaptureSize(
+            lensCaps = lensCaps,
+            activeMode = activeMode,
+            aspectRatioMode = preferences.aspectRatioMode,
+            hdOutputOption = preferences.hdOutputOption
+        )
+        CaptureResolutionResolver.formatMegapixels(captureSize)?.let { parts.add(it) }
+    }
+    resolveStabilizationSummary(lensCaps, activeMode, preferences)?.let { parts.add(it) }
+    return parts.joinToString(" · ")
 }

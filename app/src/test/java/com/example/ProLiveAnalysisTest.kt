@@ -146,7 +146,7 @@ class ProLiveAnalysisTest {
 
         // Verify non-Pro modes do not share Pro settings state
         assertFalse(CameraMode.PHOTO.isVideo)
-        assertEquals("Camera", CameraMode.PHOTO.displayName)
+        assertEquals("Photo", CameraMode.PHOTO.displayName)
         assertEquals("Pro", CameraMode.PRO.displayName)
     }
 }

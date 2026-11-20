@@ -33,13 +33,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.core.model.CameraMode
-import androidx.compose.ui.draw.scale
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.material3.ripple
@@ -60,6 +65,7 @@ fun CameraModeSelector(
     modifier: Modifier = Modifier,
     visibleModes: List<CameraMode> = CameraMode.entries,
     hiddenModes: List<CameraMode> = emptyList(),
+    modeLabelOverrides: Map<CameraMode, String> = emptyMap(),
     onMoreClick: () -> Unit = {}
 ) {
     // If selectedMode is in hiddenModes, temporarily append it so it stays accessible & centered
@@ -163,6 +169,24 @@ fun CameraModeSelector(
             state = lazyListState,
             modifier = Modifier
                 .fillMaxWidth()
+                .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
+                .drawWithContent {
+                    drawContent()
+                    val fadeFraction = if (size.width > 0f) {
+                        (40.dp.toPx() / size.width).coerceIn(0.06f, 0.22f)
+                    } else {
+                        0.12f
+                    }
+                    drawRect(
+                        brush = Brush.horizontalGradient(
+                            0f to Color.Transparent,
+                            fadeFraction to Color.Black,
+                            (1f - fadeFraction) to Color.Black,
+                            1f to Color.Transparent
+                        ),
+                        blendMode = BlendMode.DstIn
+                    )
+                }
                 .testTag("mode_selector_lazy_row"),
             contentPadding = PaddingValues(start = halfViewportWidth, end = halfViewportWidth),
             verticalAlignment = Alignment.CenterVertically
@@ -213,7 +237,7 @@ fun CameraModeSelector(
                     color = animatedBgColor
                 ) {
                     Text(
-                        text = mode.displayName,
+                        text = modeLabelOverrides[mode] ?: mode.displayName,
                         style = MaterialTheme.typography.labelLarge.copy(
                             fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                             letterSpacing = 0.2.sp

@@ -98,6 +98,15 @@ class CameraPreferencesRepository(context: Context) {
             HdOutputOption.MAX_NATIVE
         }
 
+        val photoCaptureSpeedMode = try {
+            PhotoCaptureSpeedMode.valueOf(
+                prefs.getString(KEY_PHOTO_CAPTURE_SPEED_MODE, PhotoCaptureSpeedMode.FAST.name)
+                    ?: PhotoCaptureSpeedMode.FAST.name
+            )
+        } catch (_: Exception) {
+            PhotoCaptureSpeedMode.FAST
+        }
+
         val hdrMode = try {
             HdrMode.valueOf(
                 prefs.getString(KEY_HDR_MODE, HdrMode.AUTO.name) ?: HdrMode.AUTO.name
@@ -246,6 +255,7 @@ class CameraPreferencesRepository(context: Context) {
             videoFrameRate = videoFps,
             videoStabilization = videoStab,
             hdOutputOption = hdOption,
+            photoCaptureSpeedMode = photoCaptureSpeedMode,
             hdrMode = hdrMode,
             portraitRetouch = portraitRetouch,
             portraitBlurLevel = portraitBlurLevel,
@@ -351,6 +361,11 @@ class CameraPreferencesRepository(context: Context) {
     fun setHdOutputOption(option: HdOutputOption) {
         prefs.edit().putString(KEY_HD_OPTION, option.name).apply()
         _preferences.value = _preferences.value.copy(hdOutputOption = option)
+    }
+
+    fun setPhotoCaptureSpeedMode(mode: PhotoCaptureSpeedMode) {
+        prefs.edit().putString(KEY_PHOTO_CAPTURE_SPEED_MODE, mode.name).apply()
+        _preferences.value = _preferences.value.copy(photoCaptureSpeedMode = mode)
     }
 
     fun setHdrMode(mode: HdrMode) {
@@ -542,6 +557,7 @@ class CameraPreferencesRepository(context: Context) {
         private const val KEY_VIDEO_FPS = "key_video_fps"
         private const val KEY_VIDEO_STAB = "key_video_stabilization"
         private const val KEY_HD_OPTION = "key_hd_option"
+        private const val KEY_PHOTO_CAPTURE_SPEED_MODE = "key_photo_capture_speed_mode"
         private const val KEY_HDR_MODE = "key_hdr_mode"
         private const val KEY_PORTRAIT_RETOUCH = "key_portrait_retouch"
         private const val KEY_PORTRAIT_BLUR_LEVEL = "key_portrait_blur_level"

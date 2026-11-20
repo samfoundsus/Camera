@@ -54,7 +54,7 @@ object HdrProcessor {
         mirrorHorizontally: Boolean = false,
         hdrMode: HdrMode = HdrMode.AUTO,
         supportPath: HdrSupportPath = HdrSupportPath.SOFTWARE_MULTI_FRAME_HDR,
-        jpegQuality: Int = 95
+        jpegQuality: Int = 100
     ): HdrProcessingOutcome {
         val startTime = System.currentTimeMillis()
 
@@ -85,6 +85,9 @@ object HdrProcessor {
             }
         }
 
+        val allDecodedBitmaps = mutableListOf<Bitmap>()
+        var fusedBitmap: Bitmap? = null
+        var transformedBitmap: Bitmap? = null
         return try {
             val decodeOptions = BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -98,12 +101,14 @@ object HdrProcessor {
                     jpegQuality = jpegQuality,
                     reason = "Primary frame JPEG decoding returned null"
                 )
+            allDecodedBitmaps.add(primaryBitmap)
 
             val additionalBitmaps = additionalFramesBytes.mapNotNull { bytes ->
                 runCatching {
                     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions)
                 }.getOrNull()
-            }.filter { it.width == primaryBitmap.width && it.height == primaryBitmap.height }
+            }.also { allDecodedBitmaps.addAll(it) }
+                .filter { it.width == primaryBitmap.width && it.height == primaryBitmap.height }
 
             val allFrames = mutableListOf<Bitmap>()
             val evOffsets = mutableListOf<Float>()
@@ -162,12 +167,12 @@ object HdrProcessor {
                 exposureEvOffsets = evOffsets
             )
 
-            val fusedBitmap = when (fusionResult) {
+            fusedBitmap = when (fusionResult) {
                 is ProcessingResult.Success -> fusionResult.outputBitmap
                 else -> processor.fuseWithSafeFallback(allFrames, evOffsets)
             }
 
-            val transformedBitmap = transformBitmap(
+            transformedBitmap = transformBitmap(
                 bitmap = fusedBitmap,
                 rotationDegrees = rotationDegrees,
                 aspectRatioMode = aspectRatioMode,
@@ -175,7 +180,7 @@ object HdrProcessor {
             )
 
             val baos = ByteArrayOutputStream()
-            transformedBitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
+            transformedBitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality.coerceIn(90, 100), baos)
             val outputBytes = baos.toByteArray()
 
             val duration = System.currentTimeMillis() - startTime
@@ -201,6 +206,16 @@ object HdrProcessor {
                 jpegQuality = jpegQuality,
                 reason = "HDR fusion threw exception: ${t.localizedMessage}"
             )
+        } finally {
+            transformedBitmap?.let { tb ->
+                if (tb != fusedBitmap && !tb.isRecycled) runCatching { tb.recycle() }
+            }
+            fusedBitmap?.let { fb ->
+                if (fb !in allDecodedBitmaps && !fb.isRecycled) runCatching { fb.recycle() }
+            }
+            allDecodedBitmaps.forEach { bmp ->
+                if (!bmp.isRecycled) runCatching { bmp.recycle() }
+            }
         }
     }
 

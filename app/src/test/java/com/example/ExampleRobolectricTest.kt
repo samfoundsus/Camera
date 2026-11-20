@@ -57,7 +57,7 @@ class ExampleRobolectricTest {
 
     @Test
     fun cameraModes_configuredCorrectly() {
-        assertEquals("Camera", CameraMode.PHOTO.displayName)
+        assertEquals("Photo", CameraMode.PHOTO.displayName)
         assertEquals(CameraMode.PHOTO, CameraMode.defaultMode)
         assertTrue(CameraMode.VIDEO.isVideo)
         assertFalse(CameraMode.ASTRO.isVideo)
@@ -78,7 +78,7 @@ class ExampleRobolectricTest {
         assertEquals(names.distinct().size, names.size)
         assertTrue(names.contains("Night Sight"))
         assertTrue(names.contains("Portrait"))
-        assertTrue(names.contains("Camera"))
+        assertTrue(names.contains("Photo"))
         assertTrue(names.contains("HD"))
         assertTrue(names.contains("Pro"))
         assertTrue(names.contains("Video"))
@@ -569,7 +569,7 @@ class ExampleRobolectricTest {
         }
 
         val expectedModes = listOf(
-            "Night Sight", "Portrait", "Camera", "Video",
+            "Night Sight", "Portrait", "Photo", "Video",
             "Astrophotography", "Slow Motion", "Time Lapse", "Panorama", "HD", "Pro"
         )
         assertEquals(10, expectedModes.size)
