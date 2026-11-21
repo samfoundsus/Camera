@@ -12,6 +12,7 @@ import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalZeroShutterLag
 import androidx.camera.core.ImageCapture
 import androidx.camera.extensions.ExtensionMode
 import androidx.camera.extensions.ExtensionsManager
@@ -265,6 +266,7 @@ object CameraCaptureQualityPolicy {
      *   otherwise `CAPTURE_MODE_MINIMIZE_LATENCY`
      * - Panorama -> `CAPTURE_MODE_MINIMIZE_LATENCY`
      */
+    @androidx.annotation.OptIn(ExperimentalZeroShutterLag::class)
     fun resolveCameraXCaptureMode(
         activeMode: CameraMode,
         photoCaptureSpeedMode: PhotoCaptureSpeedMode,

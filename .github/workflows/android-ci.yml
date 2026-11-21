@@ -51,14 +51,32 @@ jobs:
           retention-days: 14
 
       - name: Run Android Lint
+        id: android_lint
         run: ./gradlew lintDebug
+
+      - name: Print Android Lint Errors
+        if: failure() && steps.android_lint.outcome == 'failure'
+        run: |
+          LINT_TEXT_REPORT="app/build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/lint-results-debug.txt"
+          if [ -f "$LINT_TEXT_REPORT" ]; then
+            echo "=== Android Lint Report ($LINT_TEXT_REPORT) ==="
+            cat "$LINT_TEXT_REPORT"
+          elif [ -f "app/build/reports/lint-results-debug.txt" ]; then
+            echo "=== Android Lint Report (app/build/reports/lint-results-debug.txt) ==="
+            cat "app/build/reports/lint-results-debug.txt"
+          else
+            echo "Android Lint text report not found. Searching build directory..."
+            find app/build -name "lint-results-debug*.txt" -exec sh -c 'echo "=== {} ==="; cat "{}"' \;
+          fi
 
       - name: Upload Lint Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lint-reports
-          path: app/build/reports/lint-results-debug.html
+          path: |
+            app/build/reports/lint-results-debug.html
+            app/build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/lint-results-debug.txt
           retention-days: 14
 
       - name: Assemble Debug APK

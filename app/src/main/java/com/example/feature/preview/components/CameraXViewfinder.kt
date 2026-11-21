@@ -23,7 +23,9 @@ import android.graphics.BitmapFactory
 import androidx.camera.core.ImageProxy
 import com.example.core.processing.AspectCropUtils
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalZeroShutterLag
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -165,6 +167,22 @@ import com.example.core.processing.PortraitProcessor
 import java.util.concurrent.TimeUnit
 
 private const val TAG = "CameraXViewfinder"
+
+@OptIn(ExperimentalZeroShutterLag::class)
+private fun resolveStillCaptureModeForExtension(
+    resolvedStillCaptureMode: Int,
+    candidateExtensionMode: Int
+): Int = if (candidateExtensionMode != androidx.camera.extensions.ExtensionMode.NONE &&
+    resolvedStillCaptureMode == ImageCapture.CAPTURE_MODE_ZERO_SHUTTER_LAG
+) {
+    ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
+} else {
+    resolvedStillCaptureMode
+}
+
+@OptIn(ExperimentalZeroShutterLag::class)
+private fun isCameraInfoZslSupported(cameraInfo: CameraInfo): Boolean =
+    runCatching { cameraInfo.isZslSupported }.getOrDefault(false)
 
 fun VideoResolution.toCameraXQuality(): Quality = when (this) {
     VideoResolution.HD_720P -> Quality.HD
@@ -1093,13 +1111,10 @@ fun CameraXViewfinder(
                         baseSelector = cameraSelector,
                         extensionMode = desiredExtensionMode
                     )
-                    val initialCaptureMode = if (candidateExtMode != androidx.camera.extensions.ExtensionMode.NONE &&
-                        resolvedStillCaptureMode == ImageCapture.CAPTURE_MODE_ZERO_SHUTTER_LAG
-                    ) {
-                        ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
-                    } else {
-                        resolvedStillCaptureMode
-                    }
+                    val initialCaptureMode = resolveStillCaptureModeForExtension(
+                        resolvedStillCaptureMode = resolvedStillCaptureMode,
+                        candidateExtensionMode = candidateExtMode
+                    )
                     val imageCapture = buildImageCaptureForMode(
                         captureModeToUse = initialCaptureMode,
                         applyHighQualityIsp = preferHighQualityIsp
@@ -4557,7 +4572,7 @@ fun queryDeviceCameraCapabilities(
                     )
                     val matchingCameraInfo = selector.filter(cameraProvider.availableCameraInfos).firstOrNull()
                     if (matchingCameraInfo != null) {
-                        isCameraXZslSupported = runCatching { matchingCameraInfo.isZslSupported }.getOrDefault(false)
+                        isCameraXZslSupported = isCameraInfoZslSupported(matchingCameraInfo)
                         val codecVideoCaps = Recorder.getVideoCapabilities(
                             matchingCameraInfo,
                             Recorder.VIDEO_CAPABILITIES_SOURCE_CODEC_CAPABILITIES
