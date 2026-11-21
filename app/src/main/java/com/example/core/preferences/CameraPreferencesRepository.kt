@@ -176,6 +176,9 @@ class CameraPreferencesRepository(context: Context) {
         val timeLapse = TimeLapseSpeed.fromStoredName(
             prefs.getString(KEY_TIME_LAPSE_SPEED, TimeLapseSpeed.SPEED_30X.name)
         )
+        val timeLapseDurationLimit = TimeLapseDurationLimit.fromStoredName(
+            prefs.getString(KEY_TIME_LAPSE_DURATION_LIMIT, TimeLapseDurationLimit.UNLIMITED.name)
+        )
 
         val slowMo = try {
             SlowMoSpeed.valueOf(
@@ -266,6 +269,7 @@ class CameraPreferencesRepository(context: Context) {
             astroStrategy = astroStrategy,
             astroRawEnabled = astroRaw,
             timeLapseSpeed = timeLapse,
+            timeLapseDurationLimit = timeLapseDurationLimit,
             slowMoSpeed = slowMo,
             panoramaDirection = panoramaDir,
             proIso = proIso,
@@ -442,6 +446,11 @@ class CameraPreferencesRepository(context: Context) {
         _preferences.value = _preferences.value.copy(timeLapseSpeed = speed)
     }
 
+    fun setTimeLapseDurationLimit(limit: TimeLapseDurationLimit) {
+        prefs.edit().putString(KEY_TIME_LAPSE_DURATION_LIMIT, limit.name).apply()
+        _preferences.value = _preferences.value.copy(timeLapseDurationLimit = limit)
+    }
+
     fun setSlowMoSpeed(speed: SlowMoSpeed) {
         prefs.edit().putString(KEY_SLOW_MO_SPEED, speed.name).apply()
         _preferences.value = _preferences.value.copy(slowMoSpeed = speed)
@@ -568,6 +577,7 @@ class CameraPreferencesRepository(context: Context) {
         private const val KEY_ASTRO_STRATEGY = "key_astro_strategy"
         private const val KEY_ASTRO_RAW = "key_astro_raw"
         private const val KEY_TIME_LAPSE_SPEED = "key_time_lapse_speed"
+        private const val KEY_TIME_LAPSE_DURATION_LIMIT = "key_time_lapse_duration_limit"
         private const val KEY_SLOW_MO_SPEED = "key_slow_mo_speed"
         private const val KEY_PANORAMA_DIRECTION = "key_panorama_direction"
         private const val KEY_PRO_ISO = "key_pro_iso"

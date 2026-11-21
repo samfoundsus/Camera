@@ -257,6 +257,29 @@ enum class TimeLapseSpeed(
 }
 
 /**
+ * Optional recording duration target for Time Lapse mode.
+ * When [targetDurationSeconds] is null ([UNLIMITED]), the shutter ring pulses on each captured frame.
+ * When a duration is chosen, the ring fills proportionally and stops automatically when reached.
+ */
+enum class TimeLapseDurationLimit(
+    val displayName: String,
+    val targetDurationSeconds: Long?
+) {
+    UNLIMITED("No limit", null),
+    MIN_1("1 min", 60L),
+    MIN_5("5 min", 300L),
+    MIN_15("15 min", 900L),
+    MIN_30("30 min", 1800L);
+
+    companion object {
+        fun fromStoredName(stored: String?): TimeLapseDurationLimit {
+            if (stored.isNullOrBlank()) return UNLIMITED
+            return entries.firstOrNull { it.name.equals(stored, ignoreCase = true) } ?: UNLIMITED
+        }
+    }
+}
+
+/**
  * Slow motion playback speed options.
  */
 enum class SlowMoSpeed(val displayName: String, val expectedFps: Int, val slowDownFactor: Float) {
@@ -407,6 +430,7 @@ data class CameraPreferences(
     val astroStrategy: AstroStrategy = AstroStrategy.AUTO,
     val astroRawEnabled: Boolean = false,
     val timeLapseSpeed: TimeLapseSpeed = TimeLapseSpeed.SPEED_30X,
+    val timeLapseDurationLimit: TimeLapseDurationLimit = TimeLapseDurationLimit.UNLIMITED,
     val slowMoSpeed: SlowMoSpeed = SlowMoSpeed.SPEED_1_4X,
     val panoramaDirection: PanoramaDirection = PanoramaDirection.LEFT_TO_RIGHT,
     // Pro mode manual preferences

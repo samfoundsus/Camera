@@ -481,7 +481,7 @@ object CameraCaptureQualityPolicy {
         val flashNeeded = flashMode == FlashMode.ON ||
             (flashMode == FlashMode.AUTO && aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED)
         if (flashNeeded) return true
-        if (activeMode == CameraMode.PORTRAIT || hasActiveTapFocus) return true
+        if (hasActiveTapFocus) return true
         return !is3AConverged(aeState, afState, awbState)
     }
 }
@@ -847,3 +847,94 @@ class StreamingQualityFrameMerger private constructor(
         }
     }
 }
+
+/**
+ * Per-stage latency telemetry for a single Portrait mode capture so bottlenecks across
+ * capture, decode, downscaled segmentation, downscaled blur, compositing, JPEG encode,
+ * and MediaStore save are immediately visible in Logcat and the hidden debug screen.
+ */
+data class PortraitStageTimings(
+    val timestampMs: Long = System.currentTimeMillis(),
+    val captureMs: Long = 0L,
+    val decodeMs: Long = 0L,
+    val segmentationMs: Long = 0L,
+    val blurMs: Long = 0L,
+    val compositingMs: Long = 0L,
+    val encodeMs: Long = 0L,
+    val saveMs: Long = 0L,
+    val totalMs: Long = 0L,
+    val backend: String = "CPU-MultiThread",
+    val width: Int = 0,
+    val height: Int = 0,
+    val segmentationSizeLabel: String = "",
+    val blurSizeLabel: String = "",
+    val subjectType: String = "Subject",
+    val wasFallback: Boolean = false
+) {
+    val slowestStageLabel: String
+        get() {
+            val stages = listOf(
+                "capture" to captureMs,
+                "decode" to decodeMs,
+                "segmentation" to segmentationMs,
+                "blur" to blurMs,
+                "compositing" to compositingMs,
+                "encode" to encodeMs,
+                "save" to saveMs
+            )
+            val maxStage = stages.maxByOrNull { it.second } ?: return "n/a"
+            return "${maxStage.first} (${maxStage.second}ms)"
+        }
+
+    fun formatSummaryLine(): String {
+        val res = if (width > 0 && height > 0) "${width}x${height}" else "n/a"
+        val fallbackTag = if (wasFallback) " [Fallback]" else ""
+        return "total=${totalMs}ms | cap=${captureMs}ms dec=${decodeMs}ms seg=${segmentationMs}ms blur=${blurMs}ms comp=${compositingMs}ms enc=${encodeMs}ms save=${saveMs}ms | $backend | $res$fallbackTag"
+    }
+
+    fun formatMultilineBreakdown(): String = buildString {
+        val res = if (width > 0 && height > 0) "${width}x${height}" else "n/a"
+        val fallbackTag = if (wasFallback) " (Fallback)" else ""
+        appendLine("Total: ${totalMs}ms • $backend • $res$fallbackTag")
+        appendLine("  capture=${captureMs}ms  decode=${decodeMs}ms  seg=${segmentationMs}ms")
+        appendLine("  blur=${blurMs}ms  comp=${compositingMs}ms  encode=${encodeMs}ms  save=${saveMs}ms")
+        val sizeInfo = buildList {
+            if (segmentationSizeLabel.isNotBlank()) add("seg=$segmentationSizeLabel")
+            if (blurSizeLabel.isNotBlank()) add("blur=$blurSizeLabel")
+        }.joinToString(", ")
+        if (sizeInfo.isNotBlank()) {
+            append("  slowest=$slowestStageLabel • $sizeInfo")
+        } else {
+            append("  slowest=$slowestStageLabel")
+        }
+    }
+}
+
+/**
+ * Thread-safe in-memory tracker retaining recent Portrait per-stage timings and logging them
+ * to Logcat under `PortraitTiming`.
+ */
+object PortraitStageTimingTracker {
+    private const val TAG = "PortraitTiming"
+    private const val MAX_RECORDS = 12
+    private val records = ArrayDeque<PortraitStageTimings>(MAX_RECORDS)
+
+    @Synchronized
+    fun record(timings: PortraitStageTimings): PortraitStageTimings {
+        while (records.size >= MAX_RECORDS) {
+            records.removeFirst()
+        }
+        records.addLast(timings)
+        Log.i(TAG, timings.formatSummaryLine())
+        return timings
+    }
+
+    @Synchronized
+    fun getRecentRecords(): List<PortraitStageTimings> = records.toList().reversed()
+
+    @Synchronized
+    fun clear() {
+        records.clear()
+    }
+}
+

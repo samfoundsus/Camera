@@ -65,6 +65,7 @@ import com.example.core.camera.NightSightSupportPath
 import com.example.core.camera.PortraitBlurDeviceSupport
 import com.example.core.camera.PortraitDepthSupportPath
 import com.example.core.camera.ReconciledVideoSettings
+import com.example.core.camera.ShutterProgressState
 import com.example.core.camera.VideoFrameRate
 import com.example.core.camera.VideoResolution
 import com.example.core.model.CameraMode
@@ -81,6 +82,7 @@ import com.example.core.preferences.PortraitRetouch
 import com.example.core.preferences.ProFocusMode
 import com.example.core.preferences.ProRawFormat
 import com.example.core.preferences.TimerMode
+import com.example.core.preferences.TimeLapseDurationLimit
 import com.example.core.preferences.TimeLapseSpeed
 import com.example.core.preferences.PanoramaDirection
 import com.example.core.preferences.VideoStabilizationMode
@@ -202,6 +204,7 @@ fun CameraPreviewPlaceholder(
     hdOutputOption: HdOutputOption = HdOutputOption.MAX_NATIVE,
     slowMoSpeed: SlowMoSpeed = SlowMoSpeed.SPEED_1_4X,
     timeLapseSpeed: TimeLapseSpeed = TimeLapseSpeed.SPEED_30X,
+    timeLapseDurationLimit: TimeLapseDurationLimit = TimeLapseDurationLimit.UNLIMITED,
     onTimeLapseSpeedChanged: ((TimeLapseSpeed) -> Unit)? = null,
     panoramaDirection: PanoramaDirection = PanoramaDirection.LEFT_TO_RIGHT,
     onPanoramaDirectionChanged: ((PanoramaDirection) -> Unit)? = null,
@@ -229,6 +232,7 @@ fun CameraPreviewPlaceholder(
     onFocusTapRequested: ((FocusTouchRequest) -> Unit)? = null,
     onExposureIndexChanged: ((Int) -> Unit)? = null,
     onCaptureSuccess: ((Uri) -> Unit)? = null,
+    onInstantPreviewThumbnail: ((android.graphics.Bitmap?) -> Unit)? = null,
     onCaptureError: ((String) -> Unit)? = null,
     onRecordingStateChanged: ((Boolean) -> Unit)? = null,
     onRecordingDurationChanged: ((Long) -> Unit)? = null,
@@ -236,6 +240,9 @@ fun CameraPreviewPlaceholder(
     onRecordingError: ((String) -> Unit)? = null,
     nightSightCancelTrigger: Int = 0,
     onNightSightProgressChanged: ((NightSightProgressState) -> Unit)? = null,
+    astroStopAndSaveTrigger: Int = 0,
+    astroDiscardTrigger: Int = 0,
+    onShutterProgressChanged: ((ShutterProgressState) -> Unit)? = null,
     onCountdownStateChanged: ((Boolean, Int) -> Unit)? = null,
     modifier: Modifier = Modifier,
     onPreviewClick: (() -> Unit)? = null
@@ -644,6 +651,7 @@ fun CameraPreviewPlaceholder(
                     hdOutputOption = hdOutputOption,
                     slowMoSpeed = slowMoSpeed,
                     timeLapseSpeed = timeLapseSpeed,
+                    timeLapseDurationLimit = timeLapseDurationLimit,
                     panoramaDirection = panoramaDirection,
                     isPanoramaCapturingRequested = isPanoramaCapturingRequested,
                     panoramaFinishTrigger = panoramaFinishTrigger,
@@ -680,6 +688,7 @@ fun CameraPreviewPlaceholder(
                         }
                     },
                     onCaptureSuccess = onCaptureSuccess,
+                    onInstantPreviewThumbnail = onInstantPreviewThumbnail,
                     onCaptureError = onCaptureError,
                     onRecordingStateChanged = onRecordingStateChanged,
                     onRecordingDurationChanged = onRecordingDurationChanged,
@@ -687,6 +696,9 @@ fun CameraPreviewPlaceholder(
                     onRecordingError = onRecordingError,
                     nightSightCancelTrigger = nightSightCancelTrigger,
                     onNightSightProgressChanged = onNightSightProgressChanged,
+                    astroStopAndSaveTrigger = astroStopAndSaveTrigger,
+                    astroDiscardTrigger = astroDiscardTrigger,
+                    onShutterProgressChanged = onShutterProgressChanged,
                     onCountdownStateChanged = onCountdownStateChanged,
                     modifier = Modifier.fillMaxSize()
                 )

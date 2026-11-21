@@ -312,11 +312,8 @@ fun SettingsScreen(
 
                     val hdVerifiedCaps = (capabilitiesState as? CameraCapabilitiesState.Verified)?.currentLensCapabilities
 
-                    val hdSubtitle = if (hdVerifiedCaps?.isSensorFullResolutionRestricted == true) {
-                        "This device doesn't expose full sensor resolution to apps."
-                    } else {
-                        "Choose between the full native sensor resolution and standard binned output"
-                    }
+                    val hdSubtitle = hdVerifiedCaps?.hdRestrictedResolutionNote
+                        ?: "Choose between the full native sensor resolution and standard binned output"
 
                     SettingsRow(
                         title = "HD Mode Output",
@@ -1049,6 +1046,9 @@ fun SettingsScreen(
         val recentLatencies = remember(showHardwareDebugDialog) {
             com.example.core.camera.CaptureLatencyTracker.getRecentRecords()
         }
+        val recentPortraitTimings = remember(showHardwareDebugDialog) {
+            com.example.core.camera.PortraitStageTimingTracker.getRecentRecords()
+        }
 
         CameraHardwareDebugDialog(
             report = debugReport,
@@ -1058,6 +1058,7 @@ fun SettingsScreen(
             activeExtensionsSummary = activeExtensionsSummary,
             activeIspSummary = activeIspSummary,
             recentLatencyRecords = recentLatencies,
+            recentPortraitTimings = recentPortraitTimings,
             copied = copiedBanner,
             onCopyReport = {
                 clipboardManager.setText(AnnotatedString(formatHardwareDebugReportText(debugReport)))
@@ -1077,6 +1078,7 @@ internal fun CameraHardwareDebugDialog(
     activeExtensionsSummary: String,
     activeIspSummary: String?,
     recentLatencyRecords: List<com.example.core.camera.CaptureLatencyRecord>,
+    recentPortraitTimings: List<com.example.core.camera.PortraitStageTimings> = emptyList(),
     copied: Boolean,
     onCopyReport: () -> Unit,
     onDismiss: () -> Unit
@@ -1183,6 +1185,38 @@ internal fun CameraHardwareDebugDialog(
                         }
                     }
                 }
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("hardware_debug_portrait_timings_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "Portrait Pipeline Timings (Per Stage)",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        if (recentPortraitTimings.isEmpty()) {
+                            Text(
+                                text = "No Portrait photos captured yet in this session.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            recentPortraitTimings.forEach { pt ->
+                                Text(
+                                    text = pt.formatMultilineBreakdown(),
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                                )
+                            }
+                        }
+                    }
+                }
                 if (report.cameras.isEmpty()) {
                     Text(
                         text = "No Camera2 camera IDs reported by CameraManager on this environment.",
@@ -1217,6 +1251,14 @@ internal fun CameraHardwareDebugDialog(
                                 text = "Sensor Pixel Array: ${cam.pixelArraySize} | Active Array: ${cam.activeArraySize}",
                                 style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
                             )
+                            Text(
+                                text = "Ultra-High-Res Sensor Cap (API 31+): ${if (cam.supportsUltraHighResSensorCapability) "YES" else "NO"}",
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            )
+                            Text(
+                                text = "CameraX Extensions: ${cam.supportedExtensions.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: cam.extensionsStatusLabel}",
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            )
                             if (cam.ispQualitySummary.isNotBlank()) {
                                 Text(
                                     text = "ISP Quality / ZSL: ${cam.ispQualitySummary}",
@@ -1224,6 +1266,28 @@ internal fun CameraHardwareDebugDialog(
                                 )
                             }
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                            Text(
+                                text = "Video Resolution + FPS Evaluation (PASS/FAIL):",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
+                            )
+                            Text(
+                                text = cam.videoComboEvaluations.joinToString("\n") {
+                                    "  • ${it.formatDebugLine()}"
+                                }.ifBlank { "  (none)" },
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            )
+
+                            if (cam.encoderCapabilitiesSummary.isNotEmpty()) {
+                                Text(
+                                    text = "Video Encoder Limits (getSupportedFrameRatesFor):",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
+                                )
+                                Text(
+                                    text = cam.encoderCapabilitiesSummary.joinToString("\n") { "  • $it" },
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                                )
+                            }
 
                             Text(
                                 text = "Video Sizes & Max FPS:",
@@ -1276,6 +1340,28 @@ internal fun CameraHardwareDebugDialog(
                             )
 
                             Text(
+                                text = "YUV_420_888 Sizes (Std / HiRes / MaxRes API 31+):",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
+                            )
+                            Text(
+                                text = "Std: ${cam.standardYuvSizes.joinToString(", ").ifBlank { "(none)" }}\n" +
+                                    "HiRes: ${cam.highResYuvSizes.joinToString(", ").ifBlank { "(none)" }}\n" +
+                                    "MaxRes: ${cam.maxResYuvSizes.joinToString(", ").ifBlank { "(none)" }}",
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            )
+
+                            Text(
+                                text = "RAW_SENSOR Sizes (Std / HiRes / MaxRes API 31+):",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
+                            )
+                            Text(
+                                text = "Std: ${cam.standardRawSizes.joinToString(", ").ifBlank { "(none)" }}\n" +
+                                    "HiRes: ${cam.highResRawSizes.joinToString(", ").ifBlank { "(none)" }}\n" +
+                                    "MaxRes: ${cam.maxResRawSizes.joinToString(", ").ifBlank { "(none)" }}",
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            )
+
+                            Text(
                                 text = "Stabilization Modes:",
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
                             )
@@ -1310,8 +1396,17 @@ internal fun CameraHardwareDebugDialog(
     )
 }
 
-private fun formatHardwareDebugReportText(report: CameraHardwareDebugReport): String =
-    report.formatPlainText()
+internal fun formatHardwareDebugReportText(report: CameraHardwareDebugReport): String = buildString {
+    append(report.formatPlainText())
+    val portraitRecords = com.example.core.camera.PortraitStageTimingTracker.getRecentRecords()
+    if (portraitRecords.isNotEmpty()) {
+        appendLine()
+        appendLine("=== Portrait Pipeline Timings (Per Stage) ===")
+        portraitRecords.forEach { pt ->
+            appendLine("  • ${pt.formatSummaryLine()} (slowest=${pt.slowestStageLabel})")
+        }
+    }
+}
 
 @Composable
 private fun SettingsSectionHeader(title: String) {

@@ -6,7 +6,10 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
+import android.graphics.YuvImage
+import android.hardware.HardwareBuffer
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -17,7 +20,10 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.CamcorderProfile
+import android.media.Image
 import android.media.ImageReader
+import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -30,9 +36,14 @@ import android.util.Log
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.CameraSelector
+import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import com.example.core.preferences.FlashMode
 import com.example.core.preferences.VideoStabilizationMode
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -45,27 +56,200 @@ import java.util.concurrent.atomic.AtomicReference
 private const val HW_TAG = "Camera2Hardware"
 
 /**
+ * Aggregated hardware video encoder capabilities queried from [MediaCodecList]
+ * via [android.media.MediaCodecInfo.VideoCapabilities.getSupportedFrameRatesFor] and
+ * [android.media.MediaCodecInfo.VideoCapabilities.areSizeAndRateSupported].
+ */
+data class HardwareEncoderVideoInfo(
+    val maxFpsByResolution: Map<VideoResolution, Double>,
+    val summaryLines: List<String>
+)
+
+/**
+ * Queries hardware/regular MediaCodec H.264 (AVC) and HEVC video encoders to determine
+ * the exact maximum supported frame rate for each standard [VideoResolution].
+ */
+fun queryHardwareEncoderVideoCapabilities(): HardwareEncoderVideoInfo {
+    val maxFpsByRes = LinkedHashMap<VideoResolution, Double>()
+    val bestCodecByRes = LinkedHashMap<VideoResolution, String>()
+    val supportedRatesByRes = LinkedHashMap<VideoResolution, MutableSet<Int>>()
+    try {
+        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        val videoMimeTypes = setOf(
+            MediaFormat.MIMETYPE_VIDEO_AVC,
+            MediaFormat.MIMETYPE_VIDEO_HEVC
+        )
+        val testRates = listOf(24, 30, 60, 120)
+        for (info in codecList.codecInfos) {
+            if (!info.isEncoder) continue
+            for (type in info.supportedTypes) {
+                val matchedMime = videoMimeTypes.firstOrNull { it.equals(type, ignoreCase = true) } ?: continue
+                val caps = runCatching { info.getCapabilitiesForType(matchedMime)?.videoCapabilities }.getOrNull() ?: continue
+                for (res in VideoResolution.VIDEO_MODE_OPTIONS) {
+                    val w = res.width
+                    val h = res.height
+                    val landscapeOk = runCatching { caps.isSizeSupported(w, h) }.getOrDefault(false)
+                    val portraitOk = runCatching { caps.isSizeSupported(h, w) }.getOrDefault(false)
+                    if (!landscapeOk && !portraitOk) continue
+
+                    val r1 = if (landscapeOk) {
+                        runCatching { caps.getSupportedFrameRatesFor(w, h)?.upper ?: 0.0 }.getOrDefault(0.0)
+                    } else 0.0
+                    val r2 = if (portraitOk) {
+                        runCatching { caps.getSupportedFrameRatesFor(h, w)?.upper ?: 0.0 }.getOrDefault(0.0)
+                    } else 0.0
+                    var effectiveMax = maxOf(r1, r2)
+
+                    val rateSet = supportedRatesByRes.getOrPut(res) { LinkedHashSet() }
+                    for (fps in testRates) {
+                        val rateOk = runCatching {
+                            (landscapeOk && caps.areSizeAndRateSupported(w, h, fps.toDouble())) ||
+                                (portraitOk && caps.areSizeAndRateSupported(h, w, fps.toDouble()))
+                        }.getOrDefault(false)
+                        if (rateOk || effectiveMax >= fps - 0.5) {
+                            rateSet.add(fps)
+                            if (rateOk && fps.toDouble() > effectiveMax) {
+                                effectiveMax = fps.toDouble()
+                            }
+                        }
+                    }
+
+                    val current = maxFpsByRes[res] ?: 0.0
+                    if (effectiveMax > current) {
+                        maxFpsByRes[res] = effectiveMax
+                        bestCodecByRes[res] = "${info.name} (${matchedMime.substringAfter("/")})"
+                    }
+                }
+            }
+        }
+    } catch (e: Exception) {
+        Log.w(HW_TAG, "Unable to query MediaCodecList video encoder limits", e)
+    }
+
+    val summaryLines = VideoResolution.VIDEO_MODE_OPTIONS.map { res ->
+        val maxFps = maxFpsByRes[res]
+        val codec = bestCodecByRes[res]
+        val rates = supportedRatesByRes[res].orEmpty().sorted()
+        if (maxFps != null && maxFps > 0.0) {
+            val fpsStr = String.format(Locale.US, "%.1f", maxFps)
+            val ratesStr = if (rates.isNotEmpty()) rates.joinToString("/") else "none"
+            "${res.id} (${res.width}x${res.height}): max ${fpsStr}fps [$ratesStr] via ${codec ?: "encoder"}"
+        } else {
+            "${res.id} (${res.width}x${res.height}): NOT SUPPORTED by AVC/HEVC encoders"
+        }
+    }
+    return HardwareEncoderVideoInfo(
+        maxFpsByResolution = maxFpsByRes,
+        summaryLines = summaryLines
+    )
+}
+
+/**
+ * Matches actual `EncoderProfiles` / `CamcorderProfile` video frame dimensions against standard
+ * [VideoResolution] tiers strictly by real width x height (never by unverified quality codes).
+ */
+fun queryCamcorderProfileMaxFpsByResolution(cameraId: String): Map<VideoResolution, Int> {
+    val camcorderMaxFpsByRes = mutableMapOf<VideoResolution, Int>()
+    val camIdInt = cameraId.toIntOrNull() ?: return camcorderMaxFpsByRes
+    val candidateQualityCodes = listOf(
+        CamcorderProfile.QUALITY_720P,
+        CamcorderProfile.QUALITY_1080P,
+        11, // QUALITY_QHD (2560x1440)
+        12, // QUALITY_2K (2048x1080)
+        CamcorderProfile.QUALITY_2160P
+    )
+    fun matchResolution(w: Int, h: Int): VideoResolution? {
+        val maxD = maxOf(w, h)
+        val minD = minOf(w, h)
+        return when {
+            maxD == 1280 && minD == 720 -> VideoResolution.HD_720P
+            maxD == 1920 && (minD == 1080 || minD == 1088) -> VideoResolution.FHD_1080P
+            maxD == 2560 && minD == 1440 -> VideoResolution.QHD_2K
+            maxD == 3840 && minD == 2160 -> VideoResolution.UHD_4K
+            else -> null
+        }
+    }
+
+    for (qCode in candidateQualityCodes) {
+        runCatching {
+            if (!CamcorderProfile.hasProfile(camIdInt, qCode)) return@runCatching
+            var recorded = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val encProfiles = runCatching { CamcorderProfile.getAll(cameraId, qCode) }.getOrNull()
+                encProfiles?.videoProfiles?.forEach { vp ->
+                    val matched = matchResolution(vp.width, vp.height)
+                    if (matched != null && vp.frameRate > 0) {
+                        val prev = camcorderMaxFpsByRes[matched] ?: 0
+                        if (vp.frameRate > prev) camcorderMaxFpsByRes[matched] = vp.frameRate
+                        recorded = true
+                    }
+                }
+            }
+            if (!recorded) {
+                val legacyProf = runCatching {
+                    @Suppress("DEPRECATION")
+                    CamcorderProfile.get(camIdInt, qCode)
+                }.getOrNull()
+                if (legacyProf != null) {
+                    val matched = matchResolution(legacyProf.videoFrameWidth, legacyProf.videoFrameHeight)
+                    if (matched != null && legacyProf.videoFrameRate > 0) {
+                        val prev = camcorderMaxFpsByRes[matched] ?: 0
+                        if (legacyProf.videoFrameRate > prev) camcorderMaxFpsByRes[matched] = legacyProf.videoFrameRate
+                    }
+                }
+            }
+        }
+    }
+    return camcorderMaxFpsByRes
+}
+
+/**
  * Per-camera cached verifier that probes Camera2 `SessionConfiguration` support for every candidate
- * `(VideoResolution, VideoFrameRate)` combination so unsupported configurations are hidden before
- * the user sees them, without re-probing on every rebind.
+ * `(VideoResolution, VideoFrameRate)` combination using valid `OutputConfiguration` surfaces
+ * (`SurfaceTexture` preview + `ImageFormat.PRIVATE / USAGE_VIDEO_ENCODE` video surface) so unsupported
+ * configurations are hidden without falsely rejecting valid 1080p or 60 FPS combinations.
  */
 object VideoSessionConfigVerifier {
 
-    private val verifiedCache = ConcurrentHashMap<String, Map<VideoResolution, List<VideoFrameRate>>>()
+    private data class CachedVerificationEntry(
+        val signature: String,
+        val verifiedQualities: Map<VideoResolution, List<VideoFrameRate>>,
+        val evaluations: List<VideoComboEvaluationResult>
+    )
+
+    private val verifiedCache = ConcurrentHashMap<String, CachedVerificationEntry>()
     private val failedCombosByCamera = ConcurrentHashMap<String, MutableSet<Pair<VideoResolution, VideoFrameRate>>>()
 
-    fun getCached(cameraId: String): Map<VideoResolution, List<VideoFrameRate>>? = verifiedCache[cameraId]
+    fun getCached(cameraId: String): Map<VideoResolution, List<VideoFrameRate>>? =
+        verifiedCache[cameraId]?.verifiedQualities
+
+    fun getCachedEvaluations(cameraId: String): List<VideoComboEvaluationResult>? =
+        verifiedCache[cameraId]?.evaluations
 
     fun markComboFailed(cameraId: String, resolution: VideoResolution, frameRate: VideoFrameRate) {
         val set = failedCombosByCamera.getOrPut(cameraId) { java.util.Collections.synchronizedSet(mutableSetOf()) }
         set.add(resolution to frameRate)
         verifiedCache[cameraId]?.let { existing ->
             val updated = LinkedHashMap<VideoResolution, List<VideoFrameRate>>()
-            for ((res, rates) in existing) {
+            for ((res, rates) in existing.verifiedQualities) {
                 val filtered = rates.filter { !(res == resolution && it == frameRate) }
                 if (filtered.isNotEmpty()) updated[res] = filtered
             }
-            if (updated.isNotEmpty()) verifiedCache[cameraId] = updated
+            val updatedEvals = existing.evaluations.map { eval ->
+                if (eval.resolution == resolution && eval.frameRate == frameRate) {
+                    eval.copy(
+                        passed = false,
+                        failureReasons = (eval.failureReasons + "runtime capture session failed").distinct(),
+                        sessionStatus = "FAIL: runtime session failed"
+                    )
+                } else eval
+            }
+            if (updated.isNotEmpty()) {
+                verifiedCache[cameraId] = existing.copy(
+                    verifiedQualities = updated,
+                    evaluations = updatedEvals
+                )
+            }
         }
     }
 
@@ -74,12 +258,98 @@ object VideoSessionConfigVerifier {
         failedCombosByCamera.clear()
     }
 
+    private fun buildCandidateSignature(
+        candidates: Map<VideoResolution, List<VideoFrameRate>>,
+        aeFpsRanges: List<Pair<Int, Int>>,
+        allowDeviceOpenProbe: Boolean
+    ): String {
+        val candPart = candidates.entries.joinToString("|") { (r, rates) ->
+            "${r.id}:${rates.joinToString(",") { it.fps.toString() }}"
+        }
+        val aePart = aeFpsRanges.joinToString(",") { "${it.first}-${it.second}" }
+        return "$candPart#$aePart#$allowDeviceOpenProbe"
+    }
+
     /**
-     * Verifies candidate `(VideoResolution, VideoFrameRate)` combinations for [cameraId] by testing
-     * Camera2 `SessionConfiguration` support (API 35+ directly on [CameraCharacteristics], API 29-34
-     * via deferred `OutputConfiguration(size, MediaRecorder::class.java)` + preview surface when a
-     * camera device can be queried). Caches the result per [cameraId].
+     * Verifies candidate `(VideoResolution, VideoFrameRate)` combinations for [cameraId] and returns
+     * both the verified qualities map and updated per-combo PASS/FAIL diagnostic evaluations.
      */
+    @SuppressLint("MissingPermission")
+    fun verifyAndCacheVideoCombinationsWithDiagnostics(
+        context: Context,
+        cameraId: String,
+        candidates: Map<VideoResolution, List<VideoFrameRate>>,
+        staticEvaluations: List<VideoComboEvaluationResult>,
+        aeFpsRanges: List<Pair<Int, Int>>,
+        allowDeviceOpenProbe: Boolean = false
+    ): Pair<Map<VideoResolution, List<VideoFrameRate>>, List<VideoComboEvaluationResult>> {
+        if (candidates.isEmpty()) return candidates to staticEvaluations
+        val signature = buildCandidateSignature(candidates, aeFpsRanges, allowDeviceOpenProbe)
+        val failedSet = failedCombosByCamera[cameraId].orEmpty()
+
+        verifiedCache[cameraId]?.let { cached ->
+            if (cached.signature == signature) {
+                val filtered = if (failedSet.isEmpty()) cached.verifiedQualities else filterOutFailed(cached.verifiedQualities, failedSet)
+                return filtered to cached.evaluations
+            }
+        }
+
+        val cameraManager = runCatching {
+            context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+        }.getOrNull()
+        val characteristics = cameraManager?.let {
+            runCatching { it.getCameraCharacteristics(cameraId) }.getOrNull()
+        }
+        if (cameraManager == null || characteristics == null) {
+            val fallbackFiltered = filterOutFailed(candidates, failedSet)
+            val fallbackEvals = staticEvaluations.map { eval ->
+                if (eval.passed) eval.copy(sessionStatus = "SKIPPED (no CameraCharacteristics)") else eval
+            }
+            return fallbackFiltered to fallbackEvals
+        }
+
+        // API 35+ supports CameraCharacteristics.isSessionConfigurationSupported without opening the camera.
+        if (Build.VERSION.SDK_INT >= 35 && !isRobolectricRuntime()) {
+            val (verified, updatedEvals) = probeWithCharacteristicsApi35(
+                characteristics = characteristics,
+                candidates = candidates,
+                staticEvaluations = staticEvaluations,
+                aeFpsRanges = aeFpsRanges
+            )
+            if (verified.isNotEmpty()) {
+                val filtered = filterOutFailed(verified, failedSet)
+                verifiedCache[cameraId] = CachedVerificationEntry(signature, filtered, updatedEvals)
+                return filtered to updatedEvals
+            }
+        }
+
+        // API 29-34: probe via CameraDevice.isSessionConfigurationSupported only when explicitly allowed
+        val hasCameraPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        if (allowDeviceOpenProbe && hasCameraPerm && !isRobolectricRuntime()) {
+            val probeResult = probeWithTemporaryCameraDevice(
+                cameraManager = cameraManager,
+                cameraId = cameraId,
+                characteristics = characteristics,
+                candidates = candidates,
+                staticEvaluations = staticEvaluations,
+                aeFpsRanges = aeFpsRanges
+            )
+            if (probeResult != null && probeResult.first.isNotEmpty()) {
+                val filtered = filterOutFailed(probeResult.first, failedSet)
+                verifiedCache[cameraId] = CachedVerificationEntry(signature, filtered, probeResult.second)
+                return filtered to probeResult.second
+            }
+        }
+
+        val fallbackFiltered = filterOutFailed(candidates, failedSet)
+        val fallbackEvals = staticEvaluations.map { eval ->
+            if (eval.passed) eval.copy(sessionStatus = "PASS (static stream+AE+encoder verified)") else eval
+        }
+        verifiedCache[cameraId] = CachedVerificationEntry(signature, fallbackFiltered, fallbackEvals)
+        return fallbackFiltered to fallbackEvals
+    }
+
     @SuppressLint("MissingPermission")
     fun verifyAndCacheVideoCombinations(
         context: Context,
@@ -88,45 +358,14 @@ object VideoSessionConfigVerifier {
         aeFpsRanges: List<Pair<Int, Int>>,
         allowDeviceOpenProbe: Boolean = false
     ): Map<VideoResolution, List<VideoFrameRate>> {
-        if (candidates.isEmpty()) return candidates
-        verifiedCache[cameraId]?.let { cached ->
-            val failed = failedCombosByCamera[cameraId].orEmpty()
-            return if (failed.isEmpty()) cached else filterOutFailed(cached, failed)
-        }
-
-        val failedSet = failedCombosByCamera[cameraId].orEmpty()
-        val cameraManager = runCatching {
-            context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
-        }.getOrNull() ?: return filterOutFailed(candidates, failedSet)
-
-        val characteristics = runCatching { cameraManager.getCameraCharacteristics(cameraId) }.getOrNull()
-            ?: return filterOutFailed(candidates, failedSet)
-
-        // API 35+ supports CameraCharacteristics.isSessionConfigurationSupported without even opening the camera!
-        if (Build.VERSION.SDK_INT >= 35) {
-            val verified = probeWithCharacteristicsApi35(characteristics, candidates, aeFpsRanges)
-            if (verified.isNotEmpty()) {
-                val filtered = filterOutFailed(verified, failedSet)
-                verifiedCache[cameraId] = filtered
-                return filtered
-            }
-        }
-
-        // API 29-34: optionally probe via CameraDevice.isSessionConfigurationSupported before CameraX binds
-        val hasCameraPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
-            PackageManager.PERMISSION_GRANTED
-        if (allowDeviceOpenProbe && hasCameraPerm && !isRobolectricRuntime()) {
-            val probed = probeWithTemporaryCameraDevice(cameraManager, cameraId, characteristics, candidates, aeFpsRanges)
-            if (probed != null && probed.isNotEmpty()) {
-                val filtered = filterOutFailed(probed, failedSet)
-                verifiedCache[cameraId] = filtered
-                return filtered
-            }
-        }
-
-        val fallbackFiltered = filterOutFailed(candidates, failedSet)
-        verifiedCache[cameraId] = fallbackFiltered
-        return fallbackFiltered
+        return verifyAndCacheVideoCombinationsWithDiagnostics(
+            context = context,
+            cameraId = cameraId,
+            candidates = candidates,
+            staticEvaluations = emptyList(),
+            aeFpsRanges = aeFpsRanges,
+            allowDeviceOpenProbe = allowDeviceOpenProbe
+        ).first
     }
 
     private fun filterOutFailed(
@@ -147,24 +386,48 @@ object VideoSessionConfigVerifier {
             Build.MODEL.contains("robolectric", ignoreCase = true)
     }
 
-    private fun pickPreviewSizeForVideo(characteristics: CameraCharacteristics, videoRes: VideoResolution): Size {
+    private fun pickCandidatePreviewSizesForVideo(characteristics: CameraCharacteristics, videoRes: VideoResolution): List<Size> {
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: return Size(1280, 720)
+        val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: return listOf(Size(1280, 720))
         val targetRatio = videoRes.width.toFloat() / videoRes.height.toFloat()
-        return previewSizes
+        val ordered = LinkedHashSet<Size>()
+        // Prefer exact matching preview size when <= 1080p (required by some MediaTek HALs for 1080p60)
+        if (videoRes.width <= 1920 && videoRes.height <= 1080) {
+            previewSizes.firstOrNull { sz ->
+                maxOf(sz.width, sz.height) == videoRes.width && minOf(sz.width, sz.height) == videoRes.height
+            }?.let { ordered.add(it) }
+        }
+        // Also try 1280x720 (or closest 16:9 preview <= 1080p)
+        previewSizes
             .filter { maxOf(it.width, it.height) <= 1920 && minOf(it.width, it.height) <= 1080 }
             .minByOrNull { sz ->
                 val r = maxOf(sz.width, sz.height).toFloat() / minOf(sz.width, sz.height).coerceAtLeast(1).toFloat()
                 kotlin.math.abs(r - targetRatio) * 1000f + kotlin.math.abs(maxOf(sz.width, sz.height) - 1280) * 0.1f
-            } ?: Size(1280, 720)
+            }?.let { ordered.add(it) }
+        if (ordered.isEmpty()) ordered.add(Size(1280, 720))
+        return ordered.toList()
+    }
+
+    private fun createVideoProbeImageReader(videoSize: Size): ImageReader? {
+        return runCatching {
+            ImageReader.newInstance(
+                videoSize.width,
+                videoSize.height,
+                ImageFormat.PRIVATE,
+                2,
+                HardwareBuffer.USAGE_VIDEO_ENCODE
+            )
+        }.getOrNull()
     }
 
     private fun probeWithCharacteristicsApi35(
         characteristics: CameraCharacteristics,
         candidates: Map<VideoResolution, List<VideoFrameRate>>,
+        staticEvaluations: List<VideoComboEvaluationResult>,
         aeFpsRanges: List<Pair<Int, Int>>
-    ): Map<VideoResolution, List<VideoFrameRate>> {
+    ): Pair<Map<VideoResolution, List<VideoFrameRate>>, List<VideoComboEvaluationResult>> {
         val result = LinkedHashMap<VideoResolution, List<VideoFrameRate>>()
+        val statusByCombo = LinkedHashMap<Pair<VideoResolution, VideoFrameRate>, Pair<Boolean, String>>()
         val probeExecutor = Executors.newSingleThreadExecutor()
         try {
             val isSupportedMethod = runCatching {
@@ -172,45 +435,106 @@ object VideoSessionConfigVerifier {
                     "isSessionConfigurationSupported",
                     SessionConfiguration::class.java
                 )
-            }.getOrNull() ?: return emptyMap()
+            }.getOrNull() ?: return emptyMap<VideoResolution, List<VideoFrameRate>>() to staticEvaluations
+
+            var anyHalUnsupported = false
+            var passedCount = 0
+            var totalTested = 0
 
             for ((res, rates) in candidates) {
-                val previewSize = pickPreviewSizeForVideo(characteristics, res)
+                val previewSizes = pickCandidatePreviewSizesForVideo(characteristics, res)
                 val videoSize = Size(res.width, res.height)
-                val outputs = listOf(
-                    OutputConfiguration(previewSize, SurfaceTexture::class.java),
-                    OutputConfiguration(videoSize, MediaRecorder::class.java)
-                )
-                val config = SessionConfiguration(
-                    SessionConfiguration.SESSION_REGULAR,
-                    outputs,
-                    probeExecutor,
-                    object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigured(session: CameraCaptureSession) {}
-                        override fun onConfigureFailed(session: CameraCaptureSession) {}
+                val reader = createVideoProbeImageReader(videoSize)
+                if (reader == null) {
+                    for (rate in rates) {
+                        statusByCombo[res to rate] = true to "PASS (video probe surface unavailable)"
                     }
-                )
-                val supported = runCatching {
-                    (isSupportedMethod.invoke(characteristics, config) as? Boolean) == true
-                }.getOrDefault(true)
-                if (supported) {
-                    val keptRates = rates.filter { rate ->
-                        val chosenRange = selectBestVideoAeFpsRange(aeFpsRanges, rate.fps)
-                        chosenRange.second >= rate.fps || rate == VideoFrameRate.FPS_30
+                    result[res] = rates
+                    continue
+                }
+                try {
+                    var streamPairSupported = false
+                    var lastErr: String? = null
+                    for (previewSize in previewSizes) {
+                        val check = runCatching {
+                            val outputs = listOf(
+                                OutputConfiguration(previewSize, SurfaceTexture::class.java),
+                                OutputConfiguration(reader.surface)
+                            )
+                            val config = SessionConfiguration(
+                                SessionConfiguration.SESSION_REGULAR,
+                                outputs,
+                                probeExecutor,
+                                object : CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(session: CameraCaptureSession) {}
+                                    override fun onConfigureFailed(session: CameraCaptureSession) {}
+                                }
+                            )
+                            (isSupportedMethod.invoke(characteristics, config) as? Boolean) == true
+                        }
+                        if (check.isSuccess && check.getOrDefault(false)) {
+                            streamPairSupported = true
+                            break
+                        } else if (check.isFailure) {
+                            val cause = check.exceptionOrNull()?.cause ?: check.exceptionOrNull()
+                            if (cause is UnsupportedOperationException) {
+                                anyHalUnsupported = true
+                                streamPairSupported = true
+                                break
+                            }
+                            lastErr = cause?.javaClass?.simpleName ?: "exception"
+                        }
+                    }
+
+                    val keptRates = mutableListOf<VideoFrameRate>()
+                    for (rate in rates) {
+                        totalTested++
+                        if (streamPairSupported) {
+                            passedCount++
+                            keptRates.add(rate)
+                            statusByCombo[res to rate] = true to if (anyHalUnsupported) "UNSUPPORTED_BY_HAL" else "PASS"
+                        } else {
+                            statusByCombo[res to rate] = false to "FAIL: API 35 session config rejected (${lastErr ?: "unsupported"})"
+                        }
                     }
                     if (keptRates.isNotEmpty()) {
                         result[res] = keptRates
                     }
-                } else {
-                    Log.w(HW_TAG, "SessionConfiguration rejected for ${res.displayName} via API 35 probe")
+                } finally {
+                    runCatching { reader.close() }
                 }
             }
+
+            // Safeguard: if HAL rejected every single candidate (even standard 720p/1080p@30),
+            // treat HAL query as unsupported rather than dropping all valid resolutions.
+            if (totalTested > 0 && passedCount == 0) {
+                val safeEvals = staticEvaluations.map { eval ->
+                    if (eval.passed) eval.copy(sessionStatus = "UNSUPPORTED_BY_HAL (all rejected; kept static)") else eval
+                }
+                return candidates to safeEvals
+            }
+
+            val updatedEvals = staticEvaluations.map { eval ->
+                val pair = statusByCombo[eval.resolution to eval.frameRate]
+                if (pair != null) {
+                    if (pair.first) {
+                        eval.copy(sessionStatus = pair.second)
+                    } else {
+                        eval.copy(
+                            passed = false,
+                            failureReasons = (eval.failureReasons + pair.second).distinct(),
+                            sessionStatus = pair.second
+                        )
+                    }
+                } else eval
+            }
+            return result to updatedEvals
         } catch (t: Throwable) {
             Log.w(HW_TAG, "API 35 session config probe skipped: ${t.localizedMessage}")
+            return emptyMap<VideoResolution, List<VideoFrameRate>>() to staticEvaluations
         } finally {
             probeExecutor.shutdown()
         }
-        return result
     }
 
     @SuppressLint("MissingPermission")
@@ -219,8 +543,9 @@ object VideoSessionConfigVerifier {
         cameraId: String,
         characteristics: CameraCharacteristics,
         candidates: Map<VideoResolution, List<VideoFrameRate>>,
+        staticEvaluations: List<VideoComboEvaluationResult>,
         aeFpsRanges: List<Pair<Int, Int>>
-    ): Map<VideoResolution, List<VideoFrameRate>>? {
+    ): Pair<Map<VideoResolution, List<VideoFrameRate>>, List<VideoComboEvaluationResult>>? {
         val thread = HandlerThread("VideoSessionProbe").apply { start() }
         val handler = Handler(thread.looper)
         val probeExecutor = Executors.newSingleThreadExecutor()
@@ -252,49 +577,132 @@ object VideoSessionConfigVerifier {
             }
             val device = openedDeviceRef.get() ?: return null
             val verified = LinkedHashMap<VideoResolution, List<VideoFrameRate>>()
+            val statusByCombo = LinkedHashMap<Pair<VideoResolution, VideoFrameRate>, Triple<Boolean, String, Pair<Int, Int>?>>()
+            var totalTested = 0
+            var passedCount = 0
+
             for ((res, rates) in candidates) {
-                val previewSize = pickPreviewSizeForVideo(characteristics, res)
+                val previewSizes = pickCandidatePreviewSizesForVideo(characteristics, res)
                 val videoSize = Size(res.width, res.height)
-                val keptRates = mutableListOf<VideoFrameRate>()
-                for (rate in rates) {
-                    val fpsPair = selectBestVideoAeFpsRange(aeFpsRanges, rate.fps)
-                    val supported = runCatching {
-                        val outputs = listOf(
-                            OutputConfiguration(previewSize, SurfaceTexture::class.java),
-                            OutputConfiguration(videoSize, MediaRecorder::class.java)
-                        )
-                        val sessionConfig = SessionConfiguration(
-                            SessionConfiguration.SESSION_REGULAR,
-                            outputs,
-                            probeExecutor,
-                            object : CameraCaptureSession.StateCallback() {
-                                override fun onConfigured(session: CameraCaptureSession) {}
-                                override fun onConfigureFailed(session: CameraCaptureSession) {}
-                            }
-                        )
-                        val reqBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                        reqBuilder.set(
-                            CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                            Range(fpsPair.first, fpsPair.second)
-                        )
-                        sessionConfig.sessionParameters = reqBuilder.build()
-                        device.isSessionConfigurationSupported(sessionConfig)
-                    }.getOrElse { exc ->
-                        // UnsupportedOperationException means HAL doesn't implement isSessionConfigurationSupported;
-                        // do not drop valid candidates when HAL doesn't implement the query.
-                        if (exc is UnsupportedOperationException) true else false
+                val reader = createVideoProbeImageReader(videoSize)
+                if (reader == null) {
+                    verified[res] = rates
+                    rates.forEach { rate ->
+                        statusByCombo[res to rate] = Triple(true, "PASS (probe surface unavailable)", selectBestVideoAeFpsRange(aeFpsRanges, rate.fps))
                     }
-                    if (supported) {
-                        keptRates.add(rate)
-                    } else {
-                        Log.i(HW_TAG, "Hidden unsupported video session config on camera $cameraId: ${res.displayName} @ ${rate.displayName} (AE range $fpsPair)")
-                    }
+                    continue
                 }
-                if (keptRates.isNotEmpty()) {
-                    verified[res] = keptRates
+                try {
+                    val keptRates = mutableListOf<VideoFrameRate>()
+                    for (rate in rates) {
+                        totalTested++
+                        val candidateRanges = selectAllValidVideoAeFpsRanges(aeFpsRanges, rate.fps)
+                            .ifEmpty { listOf(selectBestVideoAeFpsRange(aeFpsRanges, rate.fps)) }
+
+                        var comboPassed = false
+                        var matchedRange: Pair<Int, Int>? = candidateRanges.firstOrNull()
+                        var statusNote = "FAIL: session configuration rejected"
+
+                        outer@ for (previewSize in previewSizes) {
+                            for (fpsPair in candidateRanges) {
+                                val probeOutcome = runCatching {
+                                    val outputs = listOf(
+                                        OutputConfiguration(previewSize, SurfaceTexture::class.java),
+                                        OutputConfiguration(reader.surface)
+                                    )
+                                    val sessionConfig = SessionConfiguration(
+                                        SessionConfiguration.SESSION_REGULAR,
+                                        outputs,
+                                        probeExecutor,
+                                        object : CameraCaptureSession.StateCallback() {
+                                            override fun onConfigured(session: CameraCaptureSession) {}
+                                            override fun onConfigureFailed(session: CameraCaptureSession) {}
+                                        }
+                                    )
+                                    val reqBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                                    reqBuilder.set(
+                                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                                        Range(fpsPair.first, fpsPair.second)
+                                    )
+                                    sessionConfig.sessionParameters = reqBuilder.build()
+                                    device.isSessionConfigurationSupported(sessionConfig)
+                                }
+                                if (probeOutcome.isSuccess) {
+                                    if (probeOutcome.getOrDefault(false)) {
+                                        comboPassed = true
+                                        matchedRange = fpsPair
+                                        statusNote = "PASS (${previewSize.width}x${previewSize.height} + ${videoSize.width}x${videoSize.height} @ [${fpsPair.first},${fpsPair.second}])"
+                                        break@outer
+                                    } else {
+                                        statusNote = "FAIL: session config rejected (${previewSize.width}x${previewSize.height} + ${videoSize.width}x${videoSize.height} @ [${fpsPair.first},${fpsPair.second}])"
+                                    }
+                                } else {
+                                    val exc = probeOutcome.exceptionOrNull()
+                                    if (exc is UnsupportedOperationException) {
+                                        comboPassed = true
+                                        matchedRange = fpsPair
+                                        statusNote = "UNSUPPORTED_BY_HAL"
+                                        break@outer
+                                    }
+                                    // IllegalArgumentException on deferred OutputConfiguration means the probe itself wasn't accepted by HAL
+                                    if (exc is IllegalArgumentException) {
+                                        comboPassed = true
+                                        matchedRange = fpsPair
+                                        statusNote = "PROBE_UNSUPPORTED (IAE)"
+                                        break@outer
+                                    }
+                                    statusNote = "FAIL: ${exc?.javaClass?.simpleName ?: "error"}"
+                                }
+                            }
+                        }
+
+                        if (comboPassed) {
+                            passedCount++
+                            keptRates.add(rate)
+                        } else {
+                            Log.i(HW_TAG, "Session probe rejected camera $cameraId: ${res.displayName} @ ${rate.displayName} ($statusNote)")
+                        }
+                        statusByCombo[res to rate] = Triple(comboPassed, statusNote, matchedRange)
+                    }
+                    if (keptRates.isNotEmpty()) {
+                        verified[res] = keptRates
+                    }
+                } finally {
+                    runCatching { reader.close() }
                 }
             }
-            return verified
+
+            // Safeguard: MediaTek and some vendor HALs return false for ALL isSessionConfigurationSupported
+            // calls when sessionParameters or ImageFormat.PRIVATE surfaces are used. Never wipe out all
+            // valid resolutions (e.g. if 720p@30 AND 1080p@30 both failed the probe).
+            val standard30Failed = (VideoResolution.HD_720P in candidates && VideoResolution.HD_720P !in verified) &&
+                (VideoResolution.FHD_1080P in candidates && VideoResolution.FHD_1080P !in verified)
+            if ((totalTested > 0 && passedCount == 0) || standard30Failed) {
+                val safeEvals = staticEvaluations.map { eval ->
+                    if (eval.passed) eval.copy(sessionStatus = "UNSUPPORTED_BY_HAL (probe rejected baseline; kept static)") else eval
+                }
+                return candidates to safeEvals
+            }
+
+            val updatedEvals = staticEvaluations.map { eval ->
+                val outcome = statusByCombo[eval.resolution to eval.frameRate]
+                if (outcome != null) {
+                    if (outcome.first) {
+                        eval.copy(
+                            chosenAeFpsRange = outcome.third ?: eval.chosenAeFpsRange,
+                            sessionStatus = outcome.second
+                        )
+                    } else {
+                        eval.copy(
+                            passed = false,
+                            failureReasons = (eval.failureReasons + outcome.second).distinct(),
+                            chosenAeFpsRange = outcome.third ?: eval.chosenAeFpsRange,
+                            sessionStatus = outcome.second
+                        )
+                    }
+                } else eval
+            }
+            return verified to updatedEvals
         } catch (t: Throwable) {
             Log.w(HW_TAG, "Temporary CameraDevice session probe skipped for camera $cameraId: ${t.localizedMessage}")
             return null
@@ -306,14 +714,62 @@ object VideoSessionConfigVerifier {
     }
 }
 
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+private fun queryExtensionsForCameraId(
+    context: Context,
+    cameraProvider: ProcessCameraProvider?,
+    cameraId: String,
+    lensFacing: LensFacing,
+    isPrimaryForFacing: Boolean
+): Pair<List<String>, String> {
+    if (cameraProvider == null) return emptyList<String>() to "CameraProvider unavailable"
+    return try {
+        val selectorById = CameraSelector.Builder()
+            .addCameraFilter { cameraInfos ->
+                cameraInfos.filter { info ->
+                    runCatching { Camera2CameraInfo.from(info).cameraId == cameraId }.getOrDefault(false)
+                }
+            }
+            .build()
+        val hasExactMatch = runCatching {
+            selectorById.filter(cameraProvider.availableCameraInfos).isNotEmpty()
+        }.getOrDefault(false)
+        val selector = when {
+            hasExactMatch -> selectorById
+            isPrimaryForFacing -> if (lensFacing == LensFacing.FRONT) {
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            } else {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            }
+            else -> return emptyList<String>() to "Not bound as CameraX logical camera"
+        }
+        val avail = CameraExtensionsHelper.queryAvailability(context, cameraProvider, selector)
+        val names = avail.supportedExtensionNames
+        names to (names.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: "None")
+    } catch (t: Throwable) {
+        emptyList<String>() to "Query error (${t.javaClass.simpleName})"
+    }
+}
+
 /**
- * Inspects EVERY camera ID on the device (logical + physical sub-cameras) and collects all raw
- * video sizes with max FPS, JPEG sizes (standard, high-res, API 31+ maximum-resolution),
- * stabilization modes, and AE FPS ranges for the hidden Settings debug screen.
+ * Inspects EVERY camera ID on the device (logical from `getCameraIdList()` + physical sub-cameras from
+ * `getPhysicalCameraIds()`) and collects:
+ * - Every candidate Video Resolution + FPS combination with PASS/FAIL + exact failure reason
+ * - Hardware encoder `VideoCapabilities.getSupportedFrameRatesFor` limits
+ * - Raw MediaRecorder/MediaCodec video sizes & min frame durations
+ * - JPEG, YUV_420_888, and RAW_SENSOR sizes for Standard, High-Res, and API 31+ Maximum-Resolution
+ * - `SENSOR_INFO_PIXEL_ARRAY_SIZE`, `SENSOR_INFO_ACTIVE_ARRAY_SIZE`, and Ultra-High-Res capability flag
+ * - CameraX Extensions availability per camera
+ * - Stabilization modes & AE FPS ranges
  */
 fun collectCameraHardwareDebugReport(context: Context): CameraHardwareDebugReport {
     val cameraManager = runCatching {
         context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+    }.getOrNull()
+
+    val encoderInfo = queryHardwareEncoderVideoCapabilities()
+    val cameraProvider = runCatching {
+        ProcessCameraProvider.getInstance(context).get(1200L, TimeUnit.MILLISECONDS)
     }.getOrNull()
 
     val entries = mutableListOf<CameraIdDebugInfo>()
@@ -338,13 +794,18 @@ fun collectCameraHardwareDebugReport(context: Context): CameraHardwareDebugRepor
             }
         }
 
-        // Pre-collect focal lengths per facing so labels can distinguish ultrawide vs telephoto from metadata
         val backFocals = mutableListOf<Float>()
         val frontFocals = mutableListOf<Float>()
-        for ((cid, _, _) in idsToInspect) {
+        var firstBackId: String? = null
+        var firstFrontId: String? = null
+        for ((cid, isPhysOnly, _) in idsToInspect) {
             runCatching {
                 val c = cameraManager.getCameraCharacteristics(cid)
                 val f = c.get(CameraCharacteristics.LENS_FACING)
+                if (!isPhysOnly) {
+                    if (f == CameraCharacteristics.LENS_FACING_BACK && firstBackId == null) firstBackId = cid
+                    if (f == CameraCharacteristics.LENS_FACING_FRONT && firstFrontId == null) firstFrontId = cid
+                }
                 val fl = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
                 if (fl != null) {
                     if (f == CameraCharacteristics.LENS_FACING_FRONT) frontFocals.add(fl) else backFocals.add(fl)
@@ -384,16 +845,54 @@ fun collectCameraHardwareDebugReport(context: Context): CameraHardwareDebugRepor
                     CaptureResolutionResolver.formatMegapixelsWithDimensions(it.width(), it.height())
                 } ?: "n/a"
 
+                val reqCaps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() ?: emptyList()
+                val supportsUltraHighRes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    reqCaps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR)
+                } else false
+
                 val scMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                val videoSizes = scMap?.getOutputSizes(MediaRecorder::class.java)
-                    ?.sortedByDescending { it.width.toLong() * it.height.toLong() }
-                    ?.map { sz ->
+                val recSizes = scMap?.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
+                val codecSizes = scMap?.getOutputSizes(MediaCodec::class.java) ?: emptyArray()
+                val combinedVideoSizes = if (recSizes.isNotEmpty()) {
+                    (recSizes + codecSizes).distinct()
+                } else {
+                    val texSizes = scMap?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
+                    (codecSizes + texSizes).distinct()
+                }
+
+                val videoSizes = recSizes
+                    .sortedByDescending { it.width.toLong() * it.height.toLong() }
+                    .map { sz ->
                         val minDur = runCatching {
-                            scMap.getOutputMinFrameDuration(MediaRecorder::class.java, sz)
+                            scMap?.getOutputMinFrameDuration(MediaRecorder::class.java, sz) ?: 0L
                         }.getOrDefault(0L)
                         val maxFps = if (minDur > 0L) 1_000_000_000.0 / minDur.toDouble() else 0.0
                         VideoSizeFpsDebugEntry(sz.width, sz.height, maxFps, minDur)
-                    } ?: emptyList()
+                    }
+
+                val streamVideoSizePairs = LinkedHashSet<Pair<Int, Int>>()
+                for (sz in combinedVideoSizes) {
+                    if (sz.width > 0 && sz.height > 0) {
+                        streamVideoSizePairs.add(maxOf(sz.width, sz.height) to minOf(sz.width, sz.height))
+                    }
+                }
+                val minFrameDurationByRes = mutableMapOf<VideoResolution, Long>()
+                for (res in VideoResolution.VIDEO_MODE_OPTIONS) {
+                    val exactSize = combinedVideoSizes.firstOrNull { sz ->
+                        (sz.width == res.width && sz.height == res.height) ||
+                            (sz.width == res.height && sz.height == res.width)
+                    } ?: if (res == VideoResolution.FHD_1080P) {
+                        combinedVideoSizes.firstOrNull { sz ->
+                            (sz.width == 1920 && sz.height == 1088) || (sz.width == 1088 && sz.height == 1920)
+                        }
+                    } else null
+                    if (exactSize != null && scMap != null) {
+                        val recDur = runCatching { scMap.getOutputMinFrameDuration(MediaRecorder::class.java, exactSize) }.getOrDefault(0L)
+                        val codecDur = runCatching { scMap.getOutputMinFrameDuration(MediaCodec::class.java, exactSize) }.getOrDefault(0L)
+                        val bestDur = listOf(recDur, codecDur).filter { it > 0L }.minOrNull() ?: 0L
+                        if (bestDur > 0L) minFrameDurationByRes[res] = bestDur
+                    }
+                }
 
                 val highSpeedEntries = buildList {
                     val hsSizes = runCatching { scMap?.highSpeedVideoSizes ?: emptyArray() }.getOrDefault(emptyArray())
@@ -403,26 +902,48 @@ fun collectCameraHardwareDebugReport(context: Context): CameraHardwareDebugRepor
                         add("${sz.width}x${sz.height}@$rangeStr")
                     }
                 }
+                val highSpeedMap = mutableMapOf<Pair<Int, Int>, Int>()
+                runCatching { scMap?.highSpeedVideoSizes ?: emptyArray() }.getOrDefault(emptyArray()).forEach { sz ->
+                    val maxFps = runCatching { scMap?.getHighSpeedVideoFpsRangesFor(sz) ?: emptyArray() }
+                        .getOrDefault(emptyArray()).maxOfOrNull { it.upper } ?: 0
+                    if (maxFps > 0) {
+                        val key = maxOf(sz.width, sz.height) to minOf(sz.width, sz.height)
+                        if (maxFps > (highSpeedMap[key] ?: 0)) highSpeedMap[key] = maxFps
+                    }
+                }
 
                 fun formatSizeList(sizes: Array<Size>?): List<String> =
                     sizes?.sortedByDescending { it.width.toLong() * it.height.toLong() }?.mapNotNull { sz ->
                         CaptureResolutionResolver.formatMegapixelsWithDimensions(sz.width, sz.height)
                     } ?: emptyList()
 
-                val stdJpegs = formatSizeList(scMap?.getOutputSizes(ImageFormat.JPEG))
-                val hiResJpegs = formatSizeList(runCatching { scMap?.getHighResolutionOutputSizes(ImageFormat.JPEG) }.getOrNull())
-                val maxResJpegs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                fun queryMaxResSizesForFormat(format: Int): List<String> {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptyList()
                     val maxMap = runCatching {
                         chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
-                    }.getOrNull()
-                    val combined = ((maxMap?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()) +
-                        (runCatching { maxMap?.getHighResolutionOutputSizes(ImageFormat.JPEG) }.getOrNull() ?: emptyArray()))
+                    }.getOrNull() ?: return emptyList()
+                    val combined = ((runCatching { maxMap.getOutputSizes(format) }.getOrNull() ?: emptyArray()) +
+                        (runCatching { maxMap.getHighResolutionOutputSizes(format) }.getOrNull() ?: emptyArray()))
                         .distinctBy { it.width to it.height }
                         .toTypedArray()
-                    formatSizeList(combined)
-                } else emptyList()
+                    return formatSizeList(combined)
+                }
 
-                val videoStabModes = (chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: IntArray(0)).map { mode ->
+                val stdJpegs = formatSizeList(scMap?.getOutputSizes(ImageFormat.JPEG))
+                val hiResJpegs = formatSizeList(runCatching { scMap?.getHighResolutionOutputSizes(ImageFormat.JPEG) }.getOrNull())
+                val maxResJpegs = queryMaxResSizesForFormat(ImageFormat.JPEG)
+
+                val stdYuvs = formatSizeList(scMap?.getOutputSizes(ImageFormat.YUV_420_888))
+                val hiResYuvs = formatSizeList(runCatching { scMap?.getHighResolutionOutputSizes(ImageFormat.YUV_420_888) }.getOrNull())
+                val maxResYuvs = queryMaxResSizesForFormat(ImageFormat.YUV_420_888)
+
+                val stdRaws = formatSizeList(scMap?.getOutputSizes(ImageFormat.RAW_SENSOR))
+                val hiResRaws = formatSizeList(runCatching { scMap?.getHighResolutionOutputSizes(ImageFormat.RAW_SENSOR) }.getOrNull())
+                val maxResRaws = queryMaxResSizesForFormat(ImageFormat.RAW_SENSOR)
+
+                val rawVideoStabModes = (chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: IntArray(0)).toList()
+                val rawOisModes = (chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: IntArray(0)).toList()
+                val videoStabModes = rawVideoStabModes.map { mode ->
                     when (mode) {
                         CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF -> "OFF(0)"
                         CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON -> "ON(1)"
@@ -430,17 +951,52 @@ fun collectCameraHardwareDebugReport(context: Context): CameraHardwareDebugRepor
                         else -> "MODE($mode)"
                     }
                 }
-                val oisModes = (chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: IntArray(0)).map { mode ->
+                val oisModes = rawOisModes.map { mode ->
                     when (mode) {
                         CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF -> "OFF(0)"
                         CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON -> "ON(1)"
                         else -> "MODE($mode)"
                     }
                 }
-                val aeRanges = (chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray())
-                    .map { "[${it.lower}, ${it.upper}]" }
+                val rawAeRanges = (chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()).toList()
+                val aeFpsPairs = rawAeRanges.map { it.lower to it.upper }
+                val aeRanges = rawAeRanges.map { "[${it.lower}, ${it.upper}]" }
 
                 val ispCapsSummary = IspQualityCapabilities.fromCameraCharacteristics(chars).summaryLabel()
+                val isPrimaryForFacing = cid == firstBackId || cid == firstFrontId
+                val (extNames, extStatusLabel) = queryExtensionsForCameraId(
+                    context = context,
+                    cameraProvider = cameraProvider,
+                    cameraId = cid,
+                    lensFacing = lensFacing,
+                    isPrimaryForFacing = isPrimaryForFacing
+                )
+
+                val camcorderMaxByRes = queryCamcorderProfileMaxFpsByResolution(cid)
+                val staticProfile = buildVerifiedVideoCapabilityProfile(
+                    streamVideoSizes = streamVideoSizePairs,
+                    minFrameDurationNanosByResolution = minFrameDurationByRes,
+                    aeFpsRanges = aeFpsPairs,
+                    highSpeedSizeToMaxFps = highSpeedMap,
+                    cameraXSupportedResolutions = emptySet(),
+                    camcorderMaxFpsByResolution = camcorderMaxByRes,
+                    codecMaxFpsByResolution = encoderInfo.maxFpsByResolution,
+                    availableVideoStabilizationModes = rawVideoStabModes,
+                    availableOpticalStabilizationModes = rawOisModes
+                )
+                val cachedSessionEvals = VideoSessionConfigVerifier.getCachedEvaluations(cid)
+                val finalEvaluations = if (!cachedSessionEvals.isNullOrEmpty()) {
+                    cachedSessionEvals
+                } else {
+                    VideoSessionConfigVerifier.verifyAndCacheVideoCombinationsWithDiagnostics(
+                        context = context,
+                        cameraId = cid,
+                        candidates = staticProfile.supportedVideoQualities,
+                        staticEvaluations = staticProfile.videoComboEvaluations,
+                        aeFpsRanges = aeFpsPairs,
+                        allowDeviceOpenProbe = false
+                    ).second
+                }
 
                 entries.add(
                     CameraIdDebugInfo(
@@ -461,7 +1017,18 @@ fun collectCameraHardwareDebugReport(context: Context): CameraHardwareDebugRepor
                         videoStabilizationModes = videoStabModes,
                         opticalStabilizationModes = oisModes,
                         aeFpsRanges = aeRanges,
-                        ispQualitySummary = ispCapsSummary
+                        ispQualitySummary = ispCapsSummary,
+                        supportedExtensions = extNames,
+                        extensionsStatusLabel = extStatusLabel,
+                        standardYuvSizes = stdYuvs,
+                        highResYuvSizes = hiResYuvs,
+                        maxResYuvSizes = maxResYuvs,
+                        standardRawSizes = stdRaws,
+                        highResRawSizes = hiResRaws,
+                        maxResRawSizes = maxResRaws,
+                        supportsUltraHighResSensorCapability = supportsUltraHighRes,
+                        encoderCapabilitiesSummary = encoderInfo.summaryLines,
+                        videoComboEvaluations = finalEvaluations
                     )
                 )
             }
@@ -561,20 +1128,25 @@ object Camera2MaxResolutionStillCapturer {
             }
             cameraDevice = openRef.get() ?: return null
 
-            // 2. Create single-surface JPEG ImageReader at exact maximum resolution (maxImages = 2)
-            imageReader = ImageReader.newInstance(source.width, source.height, ImageFormat.JPEG, 2)
+            // 2. Create single-surface ImageReader at exact maximum resolution (JPEG or YUV_420_888)
+            val isYuvSource = source.sourceTag.startsWith("YUV", ignoreCase = true)
+            val readerFormat = if (isYuvSource) ImageFormat.YUV_420_888 else ImageFormat.JPEG
+            imageReader = ImageReader.newInstance(source.width, source.height, readerFormat, 2)
             val imageBytesRef = AtomicReference<ByteArray?>(null)
             val imageLatch = CountDownLatch(1)
             imageReader.setOnImageAvailableListener({ reader ->
                 val image = runCatching { reader.acquireLatestImage() }.getOrNull()
                 if (image != null) {
                     try {
-                        val buffer = image.planes[0].buffer
-                        val bytes = ByteArray(buffer.remaining())
-                        buffer.get(bytes)
+                        val bytes = if (isYuvSource) {
+                            encodeYuv420888ToJpeg(image, CameraCaptureQualityPolicy.SAVED_JPEG_QUALITY)
+                        } else {
+                            val buffer = image.planes[0].buffer
+                            ByteArray(buffer.remaining()).also { buffer.get(it) }
+                        }
                         imageBytesRef.set(bytes)
                     } catch (e: Throwable) {
-                        Log.e(HW_TAG, "Error reading max-res JPEG plane", e)
+                        Log.e(HW_TAG, "Error reading max-res ${source.sourceTag} image", e)
                     } finally {
                         runCatching { image.close() }
                         imageLatch.countDown()
@@ -683,7 +1255,7 @@ object Camera2MaxResolutionStillCapturer {
                 jpegBytes = bytes,
                 width = actualW,
                 height = actualH,
-                rotationDegrees = 0 // JPEG_ORIENTATION already baked in EXIF; AspectCropUtils preserves/handles EXIF
+                rotationDegrees = if (isYuvSource) jpegOrientation else 0 // JPEG_ORIENTATION already baked in EXIF for JPEG
             )
         } catch (t: Throwable) {
             Log.e(HW_TAG, "Camera2 max-resolution capture failed: ${t.localizedMessage}", t)
@@ -695,6 +1267,54 @@ object Camera2MaxResolutionStillCapturer {
             callbackExecutor.shutdown()
             thread.quitSafely()
         }
+    }
+
+    private fun encodeYuv420888ToJpeg(image: Image, jpegQuality: Int): ByteArray? {
+        val width = image.width
+        val height = image.height
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        val nv21 = ByteArray(width * height * 3 / 2)
+        val yBuf = yPlane.buffer
+        val yRowStride = yPlane.rowStride
+        val yPixelStride = yPlane.pixelStride
+        var outPos = 0
+        for (row in 0 until height) {
+            val rowStart = row * yRowStride
+            if (yPixelStride == 1) {
+                yBuf.position(rowStart)
+                yBuf.get(nv21, outPos, width)
+                outPos += width
+            } else {
+                for (col in 0 until width) {
+                    nv21[outPos++] = yBuf.get(rowStart + col * yPixelStride)
+                }
+            }
+        }
+
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
+        val chromaHeight = height / 2
+        val chromaWidth = width / 2
+        val uRowStride = uPlane.rowStride
+        val vRowStride = vPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vPixelStride = vPlane.pixelStride
+        for (row in 0 until chromaHeight) {
+            val uRowStart = row * uRowStride
+            val vRowStart = row * vRowStride
+            for (col in 0 until chromaWidth) {
+                nv21[outPos++] = vBuf.get(vRowStart + col * vPixelStride)
+                nv21[outPos++] = uBuf.get(uRowStart + col * uPixelStride)
+            }
+        }
+
+        val baos = ByteArrayOutputStream(width * height / 4)
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val ok = yuvImage.compressToJpeg(Rect(0, 0, width, height), jpegQuality.coerceIn(90, 100), baos)
+        return if (ok) baos.toByteArray() else null
     }
 }
 
@@ -791,11 +1411,16 @@ class Camera2DirectVideoRecorder(private val context: Context) {
                 (sensorOrientation - deviceRotDeg + 360) % 360
             }
 
-            // Pick a compatible preview surface size matching video aspect ratio
+            // Pick a compatible preview surface size matching video aspect ratio (prefer matching size <= 1080p)
             val scMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             val previewSizes = scMap?.getOutputSizes(SurfaceTexture::class.java) ?: arrayOf(Size(1280, 720))
             val targetRatio = resolution.width.toFloat() / resolution.height.toFloat()
-            val previewSize = previewSizes
+            val exactPreviewMatch = if (resolution.width <= 1920 && resolution.height <= 1080) {
+                previewSizes.firstOrNull { sz ->
+                    maxOf(sz.width, sz.height) == resolution.width && minOf(sz.width, sz.height) == resolution.height
+                }
+            } else null
+            val previewSize = exactPreviewMatch ?: previewSizes
                 .filter { maxOf(it.width, it.height) <= 1920 && minOf(it.width, it.height) <= 1080 }
                 .minByOrNull { sz ->
                     val r = maxOf(sz.width, sz.height).toFloat() / minOf(sz.width, sz.height).coerceAtLeast(1).toFloat()
@@ -827,7 +1452,6 @@ class Camera2DirectVideoRecorder(private val context: Context) {
             recorder.setOutputFile(outputFile.absolutePath)
             recorder.setVideoEncodingBitRate(targetBitrate)
             recorder.setVideoFrameRate(frameRate.fps)
-            recorder.setCaptureRate(frameRate.fps.toDouble())
             recorder.setVideoSize(resolution.width, resolution.height)
             recorder.setVideoEncoder(chosenVideoEncoder)
             if (audioGranted) {
@@ -875,31 +1499,10 @@ class Camera2DirectVideoRecorder(private val context: Context) {
             }
             cameraDevice = device
 
-            val sessionLatch = CountDownLatch(1)
-            val sessionRef = AtomicReference<CameraCaptureSession?>(null)
             val sessionExecutor = Executors.newSingleThreadExecutor()
             val outputs = listOf(
                 OutputConfiguration(pSurface),
                 OutputConfiguration(recorderSurface)
-            )
-            val sessionConfig = SessionConfiguration(
-                SessionConfiguration.SESSION_REGULAR,
-                outputs,
-                sessionExecutor,
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        sessionRef.set(session)
-                        sessionLatch.countDown()
-                    }
-
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        Log.e(
-                            HW_TAG,
-                            "Camera2 video session configuration failed for ${resolution.width}x${resolution.height} @ ${frameRate.fps}fps"
-                        )
-                        sessionLatch.countDown()
-                    }
-                }
             )
 
             val recordBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
@@ -926,20 +1529,43 @@ class Camera2DirectVideoRecorder(private val context: Context) {
                 }
                 applyStabilizationToRequest(this, stabilizationMode, lensCaps)
             }
-            sessionConfig.sessionParameters = recordBuilder.build()
-            device.createCaptureSession(sessionConfig)
 
-            if (!sessionLatch.await(3000L, TimeUnit.MILLISECONDS)) {
-                sessionExecutor.shutdown()
-                releaseInternal()
-                onError("Timed out configuring video capture session.")
-                return false
+            fun openSession(includeSessionParams: Boolean): CameraCaptureSession? {
+                val latch = CountDownLatch(1)
+                val ref = AtomicReference<CameraCaptureSession?>(null)
+                val cfg = SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR,
+                    outputs,
+                    sessionExecutor,
+                    object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(session: CameraCaptureSession) {
+                            ref.set(session)
+                            latch.countDown()
+                        }
+
+                        override fun onConfigureFailed(session: CameraCaptureSession) {
+                            Log.w(
+                                HW_TAG,
+                                "Camera2 video session configuration failed (sessionParams=$includeSessionParams) " +
+                                    "for ${resolution.width}x${resolution.height} @ ${frameRate.fps}fps"
+                            )
+                            latch.countDown()
+                        }
+                    }
+                )
+                if (includeSessionParams) {
+                    cfg.sessionParameters = recordBuilder.build()
+                }
+                device.createCaptureSession(cfg)
+                if (!latch.await(3000L, TimeUnit.MILLISECONDS)) return null
+                return ref.get()
             }
+
+            val session = openSession(includeSessionParams = true)
+                ?: openSession(includeSessionParams = false)
             sessionExecutor.shutdown()
 
-            val session = sessionRef.get()
             if (session == null) {
-                VideoSessionConfigVerifier.markComboFailed(cameraId, resolution, frameRate)
                 releaseInternal()
                 onError("Capture session failed for ${resolution.displayName} @ ${frameRate.displayName}.")
                 return false

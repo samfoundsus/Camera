@@ -30,6 +30,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import com.example.core.preferences.SlowMoSpeed
+import com.example.core.preferences.TimeLapseDurationLimit
 import com.example.core.preferences.TimeLapseSpeed
 import com.example.core.preferences.PanoramaDirection
 import androidx.camera.core.Preview
@@ -77,19 +78,30 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.core.camera.CameraLens
 import com.example.core.camera.LensCapabilities
 import com.example.core.camera.LensFacing
 import com.example.core.camera.ManualSensorCapabilities
 import com.example.core.camera.PhotoOutputSize
+import com.example.core.camera.ShutterProgressMode
+import com.example.core.camera.ShutterProgressPhase
+import com.example.core.camera.ShutterProgressState
+import com.example.core.camera.TimeLapseRecordingService
 import com.example.core.camera.VideoFrameRate
 import com.example.core.camera.VideoResolution
+import com.example.core.camera.formatAstroCaptureCaption
+import com.example.core.camera.formatShutterElapsedTime
+import com.example.core.camera.formatTimeLapseCaptureCaption
+import com.example.core.camera.toShutterProgressState
 import com.example.core.preferences.FlashMode
 import com.example.core.preferences.HdOutputOption
 import com.example.core.preferences.AstroDuration
 import com.example.core.preferences.AstroFocusMode
 import com.example.core.preferences.AstroStrategy
+import com.example.core.processing.AstroStreamingAccumulator
 import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -249,6 +261,80 @@ private data class BoundPipelineConfig(
     val preferHighQualityIsp: Boolean = false
 )
 
+/**
+ * LifecycleOwner wrapper for CameraX binding that mirrors [delegate] normally, except when
+ * [keepAlive] is enabled during an active foreground-service-backed Time Lapse recording:
+ * if the screen turns off or the app goes to the background briefly (`ON_PAUSE`/`ON_STOP`),
+ * it holds the CameraX lifecycle at [Lifecycle.State.STARTED] so the recording is not torn down.
+ * When [keepAlive] becomes false or the host Activity is destroyed, it immediately syncs back.
+ */
+private class KeepAliveCameraLifecycleOwner(
+    private val delegate: LifecycleOwner
+) : LifecycleOwner {
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val registry = LifecycleRegistry(this)
+
+    override val lifecycle: Lifecycle
+        get() = registry
+
+    @Volatile
+    var keepAlive: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            syncStateOnMainThread()
+        }
+
+    private val observer = LifecycleEventObserver { _, _ ->
+        syncStateOnMainThread()
+    }
+
+    init {
+        syncStateOnMainThread()
+        delegate.lifecycle.addObserver(observer)
+    }
+
+    private fun syncStateOnMainThread() {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            syncStateInternal()
+        } else {
+            mainHandler.post { syncStateInternal() }
+        }
+    }
+
+    private fun syncStateInternal() {
+        val delegateState = delegate.lifecycle.currentState
+        val targetState = if (keepAlive &&
+            delegateState != Lifecycle.State.DESTROYED &&
+            delegateState != Lifecycle.State.INITIALIZED &&
+            !delegateState.isAtLeast(Lifecycle.State.STARTED)
+        ) {
+            Lifecycle.State.STARTED
+        } else {
+            delegateState
+        }
+        if (registry.currentState != targetState) {
+            runCatching { registry.currentState = targetState }
+        }
+    }
+
+    fun release() {
+        keepAlive = false
+        delegate.lifecycle.removeObserver(observer)
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            if (registry.currentState != Lifecycle.State.DESTROYED) {
+                runCatching { registry.currentState = Lifecycle.State.DESTROYED }
+            }
+        } else {
+            mainHandler.post {
+                if (registry.currentState != Lifecycle.State.DESTROYED) {
+                    runCatching { registry.currentState = Lifecycle.State.DESTROYED }
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalCamera2Interop::class)
 @Composable
 fun CameraXViewfinder(
@@ -285,6 +371,7 @@ fun CameraXViewfinder(
     astroStrategy: AstroStrategy = AstroStrategy.AUTO,
     slowMoSpeed: SlowMoSpeed = SlowMoSpeed.SPEED_1_4X,
     timeLapseSpeed: TimeLapseSpeed = TimeLapseSpeed.SPEED_30X,
+    timeLapseDurationLimit: TimeLapseDurationLimit = TimeLapseDurationLimit.UNLIMITED,
     panoramaDirection: PanoramaDirection = PanoramaDirection.LEFT_TO_RIGHT,
     isPanoramaCapturingRequested: Boolean = false,
     panoramaFinishTrigger: Int = 0,
@@ -302,6 +389,7 @@ fun CameraXViewfinder(
     onFocusStatusChanged: ((Long, FocusIndicatorStatus) -> Unit)? = null,
     onExposureIndexApplied: ((Int) -> Unit)? = null,
     onCaptureSuccess: ((Uri) -> Unit)? = null,
+    onInstantPreviewThumbnail: ((android.graphics.Bitmap?) -> Unit)? = null,
     onCaptureError: ((String) -> Unit)? = null,
     onRecordingStateChanged: ((Boolean) -> Unit)? = null,
     onRecordingDurationChanged: ((Long) -> Unit)? = null,
@@ -311,12 +399,21 @@ fun CameraXViewfinder(
     onFocusPeakingUpdated: ((FocusPeakingFrame?) -> Unit)? = null,
     nightSightCancelTrigger: Int = 0,
     onNightSightProgressChanged: ((NightSightProgressState) -> Unit)? = null,
+    astroStopAndSaveTrigger: Int = 0,
+    astroDiscardTrigger: Int = 0,
+    onShutterProgressChanged: ((ShutterProgressState) -> Unit)? = null,
     onCameraError: ((String) -> Unit)? = null,
     onCountdownStateChanged: ((Boolean, Int) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val cameraLifecycleOwner = remember(lifecycleOwner) { KeepAliveCameraLifecycleOwner(lifecycleOwner) }
+    DisposableEffect(cameraLifecycleOwner) {
+        onDispose {
+            cameraLifecycleOwner.release()
+        }
+    }
     var activeCamera by remember { mutableStateOf<Camera?>(null) }
     var boundImageCapture by remember { mutableStateOf<ImageCapture?>(null) }
     var boundVideoCapture by remember { mutableStateOf<VideoCapture<Recorder>?>(null) }
@@ -331,6 +428,8 @@ fun CameraXViewfinder(
     var isCapturing by remember { mutableStateOf(false) }
     val isCaptureInFlight = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     val nightSightCancelFlag = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val astroStopAndSaveFlag = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val astroDiscardFlag = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     var isCountingDown by remember { mutableStateOf(false) }
     var countdownRemainingSeconds by remember { mutableIntStateOf(0) }
 
@@ -346,6 +445,18 @@ fun CameraXViewfinder(
     LaunchedEffect(nightSightCancelTrigger) {
         if (nightSightCancelTrigger > 0) {
             nightSightCancelFlag.set(true)
+        }
+    }
+
+    LaunchedEffect(astroStopAndSaveTrigger) {
+        if (astroStopAndSaveTrigger > 0) {
+            astroStopAndSaveFlag.set(true)
+        }
+    }
+
+    LaunchedEffect(astroDiscardTrigger) {
+        if (astroDiscardTrigger > 0) {
+            astroDiscardFlag.set(true)
         }
     }
 
@@ -372,19 +483,36 @@ fun CameraXViewfinder(
     val latestFlashMode by rememberUpdatedState(flashMode)
     val latestSlowMoSpeed by rememberUpdatedState(slowMoSpeed)
     val latestTimeLapseSpeed by rememberUpdatedState(timeLapseSpeed)
+    val latestTimeLapseDurationLimit by rememberUpdatedState(timeLapseDurationLimit)
     val latestPanoramaDirection by rememberUpdatedState(panoramaDirection)
     val latestIsPanoramaCapturingRequested by rememberUpdatedState(isPanoramaCapturingRequested)
     val latestOnPanoramaStateChanged by rememberUpdatedState(onPanoramaStateChanged)
     val latestOnNightSightProgressChanged by rememberUpdatedState(onNightSightProgressChanged)
+    val latestOnShutterProgressChanged by rememberUpdatedState(onShutterProgressChanged)
+    val latestOnInstantPreviewThumbnail by rememberUpdatedState(onInstantPreviewThumbnail)
     val latestSelectedFilter by rememberUpdatedState(selectedFilter)
+
+    val emitNightSightProgress: (NightSightProgressState) -> Unit = { nsState ->
+        latestOnNightSightProgressChanged?.invoke(nsState)
+        latestOnShutterProgressChanged?.invoke(nsState.toShutterProgressState())
+    }
 
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     val photoCaptureExecutor = remember { Executors.newSingleThreadExecutor() }
     val companionCaptureExecutor = remember { Executors.newSingleThreadExecutor() }
     val photoSaveQueue = remember { com.example.core.camera.BoundedPhotoSaveQueue(com.example.core.camera.BoundedPhotoSaveQueue.DEFAULT_MAX_IN_FLIGHT) }
+    val portraitJobsInFlight = remember { java.util.concurrent.atomic.AtomicInteger(0) }
     val panoramaKeyframes = remember { java.util.Collections.synchronizedList(mutableListOf<android.graphics.Bitmap>()) }
     val isPanoramaProcessingInFlight = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     var autoFinishSweepCounter by remember { mutableIntStateOf(0) }
+
+    // Preload and warm up the Portrait segmentation model as soon as the user opens Portrait mode
+    // so the very first Portrait shutter press does not incur cold model loading latency.
+    LaunchedEffect(activeMode) {
+        if (activeMode == CameraMode.PORTRAIT) {
+            PortraitProcessor.warmUpSegmentationModelAsync()
+        }
+    }
 
     fun clearPanoramaKeyframes() {
         synchronized(panoramaKeyframes) {
@@ -444,6 +572,7 @@ fun CameraXViewfinder(
 
     DisposableEffect(Unit) {
         onDispose {
+            TimeLapseRecordingService.stop(context)
             panoramaAnalyzer.stopSession()
             clearPanoramaKeyframes()
             analysisExecutor.shutdown()
@@ -493,7 +622,7 @@ fun CameraXViewfinder(
 
     val previewView = remember {
         PreviewView(context).apply {
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
             scaleType = PreviewView.ScaleType.FILL_CENTER
             isClickable = false
             isFocusable = false
@@ -511,8 +640,19 @@ fun CameraXViewfinder(
 
     LaunchedEffect(effectivePreviewFilter) {
         val colorFilter = com.example.core.processing.CameraFilterProcessor.createColorMatrixColorFilter(effectivePreviewFilter)
+        val desiredImplMode = if (colorFilter != null) {
+            PreviewView.ImplementationMode.COMPATIBLE
+        } else {
+            PreviewView.ImplementationMode.PERFORMANCE
+        }
+        val implModeChanged = previewView.implementationMode != desiredImplMode
+        if (implModeChanged) {
+            previewView.implementationMode = desiredImplMode
+        }
         if (colorFilter == null) {
-            previewView.setLayerType(android.view.View.LAYER_TYPE_NONE, null)
+            if (previewView.layerType != android.view.View.LAYER_TYPE_NONE) {
+                previewView.setLayerType(android.view.View.LAYER_TYPE_NONE, null)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 previewView.setRenderEffect(null)
             }
@@ -526,18 +666,26 @@ fun CameraXViewfinder(
                     android.graphics.RenderEffect.createColorFilterEffect(colorFilter)
                 )
             }
+            previewView.invalidate()
         }
-        previewView.invalidate()
+        if (implModeChanged && activeCamera != null) {
+            rebindTrigger++
+        }
     }
 
-    // Observe lifecycle events to ensure countdown/panorama cancels and torch turns off on pause/stop
+    // Observe lifecycle events to ensure countdown/panorama cancels and torch turns off on pause/stop,
+    // while keeping active Time Lapse recording and in-flight Astro/Night Sight processing stable
     DisposableEffect(lifecycleOwner, activeCamera) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
                 isCountingDown = false
                 countdownRemainingSeconds = 0
-                isCapturing = false
-                isCaptureInFlight.set(false)
+                val isMultiFrameOrTimeLapseActive = cameraLifecycleOwner.keepAlive ||
+                    (isCaptureInFlight.get() && (latestActiveMode == CameraMode.ASTRO || latestActiveMode == CameraMode.NIGHT_SIGHT))
+                if (!isMultiFrameOrTimeLapseActive) {
+                    isCapturing = false
+                    isCaptureInFlight.set(false)
+                }
                 if (panoramaAnalyzer.isCapturing) {
                     panoramaAnalyzer.stopSession()
                     clearPanoramaKeyframes()
@@ -557,17 +705,21 @@ fun CameraXViewfinder(
                         )
                     )
                 }
-                try {
-                    activeCamera?.cameraControl?.enableTorch(false)
-                } catch (_: Exception) {}
+                if (!cameraLifecycleOwner.keepAlive) {
+                    try {
+                        activeCamera?.cameraControl?.enableTorch(false)
+                    } catch (_: Exception) {}
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            try {
-                activeCamera?.cameraControl?.enableTorch(false)
-            } catch (_: Exception) {}
+            if (!cameraLifecycleOwner.keepAlive) {
+                try {
+                    activeCamera?.cameraControl?.enableTorch(false)
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -904,7 +1056,7 @@ fun CameraXViewfinder(
                         // In Video mode, prioritize Preview + VideoCapture so 4K UHD, 2K QHD, 60 FPS, and
                         // Stabilization are never throttled by an unused 3rd JPEG stream.
                         boundCam = cameraProvider.bindToLifecycle(
-                            lifecycleOwner,
+                            cameraLifecycleOwner,
                             cameraSelector,
                             preview,
                             configuredVideoCapture
@@ -919,7 +1071,7 @@ fun CameraXViewfinder(
                         try {
                             val fallbackQualityCapture = buildConfiguredVideoCapture(useCustomQhdResolution = false)
                             boundCam = cameraProvider.bindToLifecycle(
-                                lifecycleOwner,
+                                cameraLifecycleOwner,
                                 cameraSelector,
                                 preview,
                                 fallbackQualityCapture
@@ -937,7 +1089,7 @@ fun CameraXViewfinder(
                                     .setVideoStabilizationEnabled(false)
                                     .build()
                                 boundCam = cameraProvider.bindToLifecycle(
-                                    lifecycleOwner,
+                                    cameraLifecycleOwner,
                                     cameraSelector,
                                     preview,
                                     fallbackVideoCapture
@@ -1130,7 +1282,7 @@ fun CameraXViewfinder(
                             imageAnalysis.setAnalyzer(analysisExecutor, proAnalyzer)
 
                             boundCam = cameraProvider.bindToLifecycle(
-                                lifecycleOwner,
+                                cameraLifecycleOwner,
                                 cameraSelector,
                                 preview,
                                 imageCapture,
@@ -1148,7 +1300,7 @@ fun CameraXViewfinder(
                             imageAnalysis.setAnalyzer(analysisExecutor, panoramaAnalyzer)
 
                             boundCam = cameraProvider.bindToLifecycle(
-                                lifecycleOwner,
+                                cameraLifecycleOwner,
                                 cameraSelector,
                                 preview,
                                 imageCapture,
@@ -1159,7 +1311,7 @@ fun CameraXViewfinder(
                             Log.d(TAG, "Successfully bound Preview + ImageCapture + ImageAnalysis for Panorama Mode")
                         } else {
                             boundCam = cameraProvider.bindToLifecycle(
-                                lifecycleOwner,
+                                cameraLifecycleOwner,
                                 resolvedSelector,
                                 preview,
                                 imageCapture
@@ -1185,7 +1337,7 @@ fun CameraXViewfinder(
                                 applyHighQualityIsp = preferHighQualityIsp
                             )
                             boundCam = cameraProvider.bindToLifecycle(
-                                lifecycleOwner,
+                                cameraLifecycleOwner,
                                 cameraSelector,
                                 preview,
                                 fallbackImageCapture
@@ -2004,6 +2156,7 @@ fun CameraXViewfinder(
             hdMaxSource != null &&
             (hdMaxSource.requiresMaxResPixelMode ||
                 hdMaxSource.isPhysicalSubCamera ||
+                hdMaxSource.sourceTag.startsWith("YUV", ignoreCase = true) ||
                 (boundCapPixels > 0L && hdMaxSource.totalPixels > (boundCapPixels * 105L) / 100L))
 
         if (shouldUseDedicatedHdMaxResCapture && hdMaxSource != null) {
@@ -2171,17 +2324,36 @@ fun CameraXViewfinder(
             }
         }
 
-        if (captureMode != CameraMode.NIGHT_SIGHT) {
+        if (captureMode != CameraMode.NIGHT_SIGHT && captureMode != CameraMode.ASTRO) {
             showShutterFlashOverlay = true
-        } else {
+        } else if (captureMode == CameraMode.NIGHT_SIGHT) {
             nightSightCancelFlag.set(false)
-            latestOnNightSightProgressChanged?.invoke(
+            emitNightSightProgress(
                 NightSightProgressState(
                     phase = NightSightCapturePhase.CAPTURING,
                     currentFrame = 0,
                     totalFrames = 1,
                     progress = 0.05f,
                     statusLabel = "Starting…"
+                )
+            )
+        } else if (captureMode == CameraMode.ASTRO) {
+            astroStopAndSaveFlag.set(false)
+            astroDiscardFlag.set(false)
+            val plannedFrames = captureAstroDuration.targetFrames.coerceAtLeast(1)
+            val estimatedTotalSec = captureAstroDuration.targetSeconds.toLong().coerceAtLeast(plannedFrames.toLong())
+            latestOnShutterProgressChanged?.invoke(
+                ShutterProgressState(
+                    mode = ShutterProgressMode.ASTRO,
+                    phase = ShutterProgressPhase.CAPTURING,
+                    currentFrame = 0,
+                    totalFrames = plannedFrames,
+                    progress = 0.03f,
+                    elapsedSeconds = 0L,
+                    remainingSeconds = estimatedTotalSec,
+                    statusLabel = "0/$plannedFrames",
+                    detailLabel = formatAstroCaptureCaption(0, plannedFrames, 0L, estimatedTotalSec),
+                    canStopAndSave = false
                 )
             )
         }
@@ -2203,7 +2375,9 @@ fun CameraXViewfinder(
                         mainExecutor.execute {
                             isCapturing = false
                             if (captureMode == CameraMode.NIGHT_SIGHT) {
-                                latestOnNightSightProgressChanged?.invoke(NightSightProgressState())
+                                emitNightSightProgress(NightSightProgressState())
+                            } else if (captureMode == CameraMode.ASTRO) {
+                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                             }
                             onCaptureError?.invoke("Failed to read captured image buffer: ${e.localizedMessage}")
                         }
@@ -2233,7 +2407,24 @@ fun CameraXViewfinder(
                         }
                     }
 
+                    // Show an immediate preview thumbnail right after Portrait capture so the gallery button
+                    // updates instantly before background bokeh processing finishes and replaces it.
+                    if (captureMode == CameraMode.PORTRAIT) {
+                        val instantThumb = PortraitProcessor.decodeFastPreviewThumbnail(
+                            sourceBytes = bytes,
+                            rotationDegrees = rotationDegrees,
+                            aspectRatioMode = captureAspectRatio,
+                            mirrorHorizontally = captureSelfieMirror
+                        )
+                        if (instantThumb != null) {
+                            mainExecutor.execute {
+                                latestOnInstantPreviewThumbnail?.invoke(instantThumb)
+                            }
+                        }
+                    }
+
                     val runProcessingAndSave: () -> Unit = saveTask@{
+                    var portraitCompletedSuccessfully = false
                     try {
                         if (captureSoundsEnabled) {
                             runCatching {
@@ -2261,9 +2452,11 @@ fun CameraXViewfinder(
                         } else null
 
                         var portraitFallbackReason: String? = null
+                        var portraitStageTimings: com.example.core.camera.PortraitStageTimings? = null
                         var capturePathLabel = "DirectJPEG"
                         val processedPayload = if (captureMode == CameraMode.PORTRAIT) {
                             capturePathLabel = "Portrait"
+                            val captureElapsedMs = (frameCapturedAtMs - shutterPressedAtMs).coerceAtLeast(0L)
                             val normFocusX = if (captureFocusReq != null && captureFocusReq.previewWidth > 0f) {
                                 (captureFocusReq.tapX / captureFocusReq.previewWidth).coerceIn(0.1f, 0.9f)
                             } else {
@@ -2287,10 +2480,33 @@ fun CameraXViewfinder(
                                     focusNormY = normFocusY,
                                     depthSupportPath = cachedCapabilities[captureLens]?.portraitDepthSupportPath
                                         ?: com.example.core.camera.PortraitDepthSupportPath.ON_DEVICE_SEGMENTATION_ONLY,
-                                    jpegQuality = com.example.core.camera.CameraCaptureQualityPolicy.SAVED_JPEG_QUALITY
+                                    jpegQuality = com.example.core.camera.CameraCaptureQualityPolicy.SAVED_JPEG_QUALITY,
+                                    captureElapsedMs = captureElapsedMs,
+                                    onStageProgress = { stageProgress, stageLabel ->
+                                        val queuedNow = portraitJobsInFlight.get().coerceAtLeast(1)
+                                        val caption = if (queuedNow > 1) {
+                                            "$stageLabel ($queuedNow queued)"
+                                        } else {
+                                            "Portrait: $stageLabel"
+                                        }
+                                        val canTakeNext = !photoSaveQueue.isFull
+                                        mainExecutor.execute {
+                                            latestOnShutterProgressChanged?.invoke(
+                                                ShutterProgressState(
+                                                    mode = ShutterProgressMode.PORTRAIT,
+                                                    phase = ShutterProgressPhase.PROCESSING,
+                                                    progress = stageProgress.coerceIn(0.05f, 0.96f),
+                                                    statusLabel = stageLabel,
+                                                    detailLabel = caption,
+                                                    allowConcurrentCapture = canTakeNext
+                                                )
+                                            )
+                                        }
+                                    }
                                 )
                             ) {
                                 is PortraitProcessingOutcome.ProcessedPortrait -> {
+                                    portraitStageTimings = outcome.stageTimings
                                     com.example.core.processing.ProcessedPhotoPayload(
                                         jpegBytes = outcome.jpegBytes,
                                         width = outcome.width,
@@ -2301,6 +2517,7 @@ fun CameraXViewfinder(
                                 }
                                 is PortraitProcessingOutcome.FallbackOriginal -> {
                                     portraitFallbackReason = outcome.reason
+                                    portraitStageTimings = outcome.stageTimings
                                     com.example.core.processing.ProcessedPhotoPayload(
                                         jpegBytes = outcome.jpegBytes,
                                         width = outcome.width,
@@ -2341,7 +2558,7 @@ fun CameraXViewfinder(
                                     accumulator = NightSightStreamingAccumulator(firstBitmap.width, firstBitmap.height)
                                     accumulator.addFrame(firstBitmap, recycleBitmap = true)
                                     mainExecutor.execute {
-                                        latestOnNightSightProgressChanged?.invoke(
+                                        emitNightSightProgress(
                                             NightSightProgressState(
                                                 phase = NightSightCapturePhase.CAPTURING,
                                                 currentFrame = accumulator.framesMerged,
@@ -2428,7 +2645,7 @@ fun CameraXViewfinder(
 
                                                 val curCount = accumulator.framesMerged
                                                 mainExecutor.execute {
-                                                    latestOnNightSightProgressChanged?.invoke(
+                                                    emitNightSightProgress(
                                                         NightSightProgressState(
                                                             phase = NightSightCapturePhase.CAPTURING,
                                                             currentFrame = curCount,
@@ -2451,7 +2668,7 @@ fun CameraXViewfinder(
                                     isCaptureInFlight.set(false)
                                     mainExecutor.execute {
                                         isCapturing = false
-                                        latestOnNightSightProgressChanged?.invoke(NightSightProgressState())
+                                        emitNightSightProgress(NightSightProgressState())
                                     }
                                     return@saveTask
                                 }
@@ -2464,7 +2681,7 @@ fun CameraXViewfinder(
                                     )
 
                                 mainExecutor.execute {
-                                    latestOnNightSightProgressChanged?.invoke(
+                                    emitNightSightProgress(
                                         NightSightProgressState(
                                             phase = NightSightCapturePhase.PROCESSING,
                                             currentFrame = mergedFramesCount,
@@ -2487,7 +2704,7 @@ fun CameraXViewfinder(
                                         startTimeMs = nightStartMs,
                                         onProcessingProgress = { p ->
                                             mainExecutor.execute {
-                                                latestOnNightSightProgressChanged?.invoke(
+                                                emitNightSightProgress(
                                                     NightSightProgressState(
                                                         phase = NightSightCapturePhase.PROCESSING,
                                                         currentFrame = mergedFramesCount,
@@ -2556,105 +2773,288 @@ fun CameraXViewfinder(
                                 desiredFrames = kotlin.math.round(requestedSeconds / singleFrameExpSec).toInt().coerceIn(1, 24)
                             } else {
                                 perFrameExposureMs = 0L
-                                desiredFrames = captureAstroDuration.targetFrames
+                                desiredFrames = captureAstroDuration.targetFrames.coerceAtLeast(1)
                             }
 
                             Log.d(
                                 TAG,
-                                "Astro Capture Initiated: Requested=${captureAstroDuration.displayName} (${requestedSeconds}s), " +
+                                "Astro Streaming Capture Initiated: Requested=${captureAstroDuration.displayName} (${requestedSeconds}s), " +
                                 "Lens=${captureLens.displayName}, ManualShutter=$isManualShutterSupported, " +
                                 "MaxSensorExposureMs=${maxExposureNanos / 1_000_000L}ms, TargetFrames=$desiredFrames, " +
                                 "PerFrameExpMs=${perFrameExposureMs}ms"
                             )
 
-                            val companionFrames = mutableListOf<ByteArray>()
-                            if (desiredFrames > 1) {
-                                for (frameIndex in 1 until desiredFrames) {
-                                    if (activeLens != captureLens || activeMode != captureMode) {
-                                        Log.d(TAG, "Astro companion frame capture cancelled")
-                                        break
-                                    }
-                                    val latch = java.util.concurrent.CountDownLatch(1)
-                                    val timedOut = java.util.concurrent.atomic.AtomicBoolean(false)
-                                    var companionBytes: ByteArray? = null
-                                    var companionFailed = false
-                                    try {
-                                        imageCapture.takePicture(
-                                            companionCaptureExecutor,
-                                            object : ImageCapture.OnImageCapturedCallback() {
-                                                override fun onCaptureSuccess(companionProxy: ImageProxy) {
-                                                    try {
-                                                        if (!timedOut.get()) {
-                                                            val buf = companionProxy.planes[0].buffer
-                                                            val arr = ByteArray(buf.remaining())
-                                                            buf.get(arr)
-                                                            companionBytes = arr
-                                                        }
-                                                    } catch (e: Exception) {
-                                                        companionFailed = true
-                                                    } finally {
-                                                        try { companionProxy.close() } catch (_: Exception) {}
-                                                        latch.countDown()
-                                                    }
-                                                }
-                                                override fun onError(exception: ImageCaptureException) {
-                                                    companionFailed = true
-                                                    latch.countDown()
-                                                }
-                                            }
+                            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
+                            val frameW = if (boundsOpts.outWidth > 0) boundsOpts.outWidth else 4000
+                            val frameH = if (boundsOpts.outHeight > 0) boundsOpts.outHeight else 3000
+                            val safeSampleSize = com.example.core.processing.AstroProcessor.computeSafeDecodeSampleSize(
+                                context = context,
+                                frameWidth = frameW,
+                                frameHeight = frameH
+                            )
+                            val decodeOpts = BitmapFactory.Options().apply {
+                                inPreferredConfig = Bitmap.Config.ARGB_8888
+                                inSampleSize = safeSampleSize
+                            }
+
+                            var accumulator: AstroStreamingAccumulator? = null
+                            val capturedFramesAtomic = java.util.concurrent.atomic.AtomicInteger(0)
+                            val isStillAcquiringAstro = java.util.concurrent.atomic.AtomicBoolean(true)
+                            var astroTicker: java.util.concurrent.ScheduledExecutorService? = null
+
+                            fun emitAstroCaptureState(curFrames: Int) {
+                                val elapsedSec = ((System.currentTimeMillis() - astroStartAcquisitionMs) / 1000L).coerceAtLeast(0L)
+                                val remainingSec = if (curFrames > 0 && curFrames < desiredFrames) {
+                                    val avgMsPerFrame = maxOf(
+                                        perFrameExposureMs.coerceAtLeast(600L),
+                                        (System.currentTimeMillis() - astroStartAcquisitionMs) / curFrames.toLong()
+                                    )
+                                    (((desiredFrames - curFrames) * avgMsPerFrame) / 1000L).coerceAtLeast(1L)
+                                } else if (curFrames == 0) {
+                                    requestedSeconds.toLong().coerceAtLeast(1L)
+                                } else {
+                                    0L
+                                }
+                                val progressFraction = (curFrames.toFloat() / desiredFrames.toFloat()).coerceIn(0.03f, 1f)
+                                mainExecutor.execute {
+                                    if (isStillAcquiringAstro.get()) {
+                                        latestOnShutterProgressChanged?.invoke(
+                                            ShutterProgressState(
+                                                mode = ShutterProgressMode.ASTRO,
+                                                phase = ShutterProgressPhase.CAPTURING,
+                                                currentFrame = curFrames,
+                                                totalFrames = desiredFrames,
+                                                progress = progressFraction,
+                                                elapsedSeconds = elapsedSec,
+                                                remainingSeconds = remainingSec,
+                                                statusLabel = "$curFrames/$desiredFrames",
+                                                detailLabel = formatAstroCaptureCaption(curFrames, desiredFrames, elapsedSec, remainingSec),
+                                                canStopAndSave = curFrames >= 1
+                                            )
                                         )
-                                        val completedInTime = latch.await(2500L, TimeUnit.MILLISECONDS)
-                                        if (!completedInTime) {
-                                            timedOut.set(true)
-                                            break
-                                        }
-                                        val capturedArr = companionBytes
-                                        if (companionFailed || capturedArr == null || capturedArr.isEmpty()) {
-                                            break
-                                        }
-                                        companionFrames.add(capturedArr)
-                                    } catch (e: Throwable) {
-                                        Log.w(TAG, "Astro companion frame $frameIndex skipped: ${e.localizedMessage}")
-                                        break
                                     }
                                 }
                             }
 
-                            val astroTotalAcquisitionMs = maxOf(1L, System.currentTimeMillis() - astroStartAcquisitionMs)
+                            try {
+                                val firstBitmap = try {
+                                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
+                                } catch (oom: OutOfMemoryError) {
+                                    Log.w(TAG, "OOM decoding first Astro frame; falling back safely", oom)
+                                    null
+                                }
 
-                            when (
-                                val outcome = com.example.core.processing.AstroProcessor.processAstroJpegBytes(
+                                if (firstBitmap != null) {
+                                    accumulator = AstroStreamingAccumulator(firstBitmap.width, firstBitmap.height)
+                                    accumulator.addFrame(firstBitmap, recycleBitmap = true)
+                                    capturedFramesAtomic.set(accumulator.framesMerged)
+                                    emitAstroCaptureState(accumulator.framesMerged)
+
+                                    if (desiredFrames > 1) {
+                                        // 1-second live elapsed / remaining time ticker while frames stream in
+                                        astroTicker = Executors.newSingleThreadScheduledExecutor()
+                                        astroTicker.scheduleAtFixedRate({
+                                            if (isStillAcquiringAstro.get()) {
+                                                emitAstroCaptureState(capturedFramesAtomic.get())
+                                            }
+                                        }, 1000L, 1000L, TimeUnit.MILLISECONDS)
+
+                                        for (frameIndex in 1 until desiredFrames) {
+                                            if (astroDiscardFlag.get()) {
+                                                Log.d(TAG, "Astrophotography capture discarded by user at frame $frameIndex/$desiredFrames")
+                                                break
+                                            }
+                                            if (astroStopAndSaveFlag.get() || activeLens != captureLens || activeMode != captureMode) {
+                                                Log.d(TAG, "Astrophotography stop-and-save requested at ${accumulator.framesMerged}/$desiredFrames frames")
+                                                break
+                                            }
+                                            if (accumulator.encounteredLowMemory) {
+                                                Log.w(TAG, "Astrophotography stopping early at ${accumulator.framesMerged} frames due to low memory")
+                                                break
+                                            }
+
+                                            val latch = java.util.concurrent.CountDownLatch(1)
+                                            val timedOut = java.util.concurrent.atomic.AtomicBoolean(false)
+                                            var companionBytes: ByteArray? = null
+                                            var companionFailed = false
+                                            try {
+                                                imageCapture.takePicture(
+                                                    companionCaptureExecutor,
+                                                    object : ImageCapture.OnImageCapturedCallback() {
+                                                        override fun onCaptureSuccess(companionProxy: ImageProxy) {
+                                                            try {
+                                                                if (!timedOut.get() && !astroDiscardFlag.get()) {
+                                                                    val buf = companionProxy.planes[0].buffer
+                                                                    val arr = ByteArray(buf.remaining())
+                                                                    buf.get(arr)
+                                                                    companionBytes = arr
+                                                                }
+                                                            } catch (e: Throwable) {
+                                                                companionFailed = true
+                                                            } finally {
+                                                                try { companionProxy.close() } catch (_: Exception) {}
+                                                                latch.countDown()
+                                                            }
+                                                        }
+                                                        override fun onError(exception: ImageCaptureException) {
+                                                            companionFailed = true
+                                                            latch.countDown()
+                                                        }
+                                                    }
+                                                )
+                                                val timeoutMs = maxOf(2500L, perFrameExposureMs + 1500L)
+                                                val completedInTime = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+                                                if (!completedInTime) {
+                                                    timedOut.set(true)
+                                                    break
+                                                }
+                                                if (astroDiscardFlag.get()) {
+                                                    break
+                                                }
+                                                val capturedArr = companionBytes
+                                                if (companionFailed || capturedArr == null || capturedArr.isEmpty()) {
+                                                    break
+                                                }
+
+                                                // Decode, star-align, merge into running accumulator, and recycle immediately!
+                                                val nextBmp = try {
+                                                    BitmapFactory.decodeByteArray(capturedArr, 0, capturedArr.size, decodeOpts)
+                                                } catch (oom: OutOfMemoryError) {
+                                                    Log.w(TAG, "OOM decoding Astro frame ${frameIndex + 1}; stacking ${accumulator.framesMerged} frames so far", oom)
+                                                    null
+                                                }
+                                                if (nextBmp != null) {
+                                                    val mergedOk = accumulator.addFrame(nextBmp, recycleBitmap = true)
+                                                    if (!mergedOk && accumulator.encounteredLowMemory) {
+                                                        break
+                                                    }
+                                                } else {
+                                                    break
+                                                }
+
+                                                capturedFramesAtomic.set(accumulator.framesMerged)
+                                                emitAstroCaptureState(accumulator.framesMerged)
+
+                                                if (astroStopAndSaveFlag.get()) {
+                                                    break
+                                                }
+                                            } catch (e: Throwable) {
+                                                Log.w(TAG, "Astro streaming frame $frameIndex skipped: ${e.localizedMessage}")
+                                                break
+                                            }
+                                        }
+                                    }
+                                }
+
+                                isStillAcquiringAstro.set(false)
+                                runCatching { astroTicker?.shutdownNow() }
+                                astroTicker = null
+
+                                if (astroDiscardFlag.get()) {
+                                    accumulator?.close()
+                                    isCaptureInFlight.set(false)
+                                    mainExecutor.execute {
+                                        isCapturing = false
+                                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                    }
+                                    return@saveTask
+                                }
+
+                                val mergedFramesCount = accumulator?.framesMerged ?: 0
+                                val astroTotalAcquisitionMs = maxOf(1L, System.currentTimeMillis() - astroStartAcquisitionMs)
+                                val elapsedSecFinal = (astroTotalAcquisitionMs / 1000L).coerceAtLeast(0L)
+
+                                // Switch shared shutter ring to distinct PROCESSING (aligning & stacking) state
+                                mainExecutor.execute {
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.ASTRO,
+                                            phase = ShutterProgressPhase.PROCESSING,
+                                            currentFrame = mergedFramesCount,
+                                            totalFrames = desiredFrames,
+                                            progress = 0.05f,
+                                            elapsedSeconds = elapsedSecFinal,
+                                            statusLabel = "5%",
+                                            detailLabel = "Aligning & stacking… 5%",
+                                            canStopAndSave = false
+                                        )
+                                    )
+                                }
+
+                                if (accumulator != null && mergedFramesCount > 0) {
+                                    val outcome = com.example.core.processing.AstroProcessor.finalizeStreamingAccumulator(
+                                        accumulator = accumulator,
+                                        rotationDegrees = rotationDegrees,
+                                        aspectRatioMode = captureAspectRatio,
+                                        mirrorHorizontally = captureSelfieMirror,
+                                        duration = captureAstroDuration,
+                                        perFrameExposureMs = if (perFrameExposureMs > 0) perFrameExposureMs else (astroTotalAcquisitionMs / maxOf(1, mergedFramesCount)),
+                                        totalAcquisitionMs = astroTotalAcquisitionMs,
+                                        jpegQuality = com.example.core.camera.CameraCaptureQualityPolicy.SAVED_JPEG_QUALITY,
+                                        onProcessingProgress = { p ->
+                                            val pct = (p * 100f).toInt().coerceIn(1, 99)
+                                            mainExecutor.execute {
+                                                latestOnShutterProgressChanged?.invoke(
+                                                    ShutterProgressState(
+                                                        mode = ShutterProgressMode.ASTRO,
+                                                        phase = ShutterProgressPhase.PROCESSING,
+                                                        currentFrame = mergedFramesCount,
+                                                        totalFrames = desiredFrames,
+                                                        progress = p,
+                                                        elapsedSeconds = elapsedSecFinal,
+                                                        statusLabel = "$pct%",
+                                                        detailLabel = "Aligning & stacking… $pct%",
+                                                        canStopAndSave = false
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    )
+                                    capturePathLabel = "Astro(${outcome.framesStacked}f)"
+                                    if (astroStopAndSaveFlag.get() && outcome.framesStacked < desiredFrames) {
+                                        portraitFallbackReason = "Stopped early — saved Astrophotography stack (${outcome.framesStacked} frames)."
+                                    } else if (outcome.wasPartialLowMemoryMerge) {
+                                        portraitFallbackReason = "Low memory — saved Astrophotography stack (${outcome.framesStacked} frames)."
+                                    }
+                                    com.example.core.processing.ProcessedPhotoPayload(
+                                        jpegBytes = outcome.jpegBytes,
+                                        width = outcome.width,
+                                        height = outcome.height,
+                                        exifOrientation = outcome.exifOrientation,
+                                        wasRecompressed = true
+                                    )
+                                } else {
+                                    capturePathLabel = "Astro-1f"
+                                    portraitFallbackReason = "Saved captured Astrophotography frame."
+                                    AspectCropUtils.processCapturedJpegBytes(
+                                        sourceBytes = bytes,
+                                        rotationDegrees = rotationDegrees,
+                                        aspectRatioMode = captureAspectRatio,
+                                        mirrorHorizontally = captureSelfieMirror,
+                                        jpegQuality = com.example.core.camera.CameraCaptureQualityPolicy.SAVED_JPEG_QUALITY,
+                                        allowExifOrientationBypass = true
+                                    )
+                                }
+                            } catch (t: Throwable) {
+                                Log.e(TAG, "Astrophotography stacking failed — saving captured frame fallback", t)
+                                isStillAcquiringAstro.set(false)
+                                runCatching { astroTicker?.shutdownNow() }
+                                runCatching { accumulator?.close() }
+                                capturePathLabel = "Astro-Fallback"
+                                portraitFallbackReason = "Astrophotography stacking failed — saved captured photo so nothing was lost."
+                                AspectCropUtils.processCapturedJpegBytes(
                                     sourceBytes = bytes,
-                                    additionalFramesBytes = companionFrames,
                                     rotationDegrees = rotationDegrees,
                                     aspectRatioMode = captureAspectRatio,
                                     mirrorHorizontally = captureSelfieMirror,
-                                    duration = captureAstroDuration,
-                                    perFrameExposureMs = if (perFrameExposureMs > 0) perFrameExposureMs else (astroTotalAcquisitionMs / maxOf(1, companionFrames.size + 1)),
-                                    totalAcquisitionMs = astroTotalAcquisitionMs,
-                                    jpegQuality = com.example.core.camera.CameraCaptureQualityPolicy.SAVED_JPEG_QUALITY
+                                    jpegQuality = com.example.core.camera.CameraCaptureQualityPolicy.SAVED_JPEG_QUALITY,
+                                    allowExifOrientationBypass = true
                                 )
-                            ) {
-                                is com.example.core.processing.AstroProcessingOutcome.ProcessedAstro -> {
-                                    capturePathLabel = "Astro(${companionFrames.size + 1}f)"
-                                    com.example.core.processing.ProcessedPhotoPayload(
-                                        jpegBytes = outcome.jpegBytes,
-                                        width = outcome.width,
-                                        height = outcome.height,
-                                        exifOrientation = outcome.exifOrientation,
-                                        wasRecompressed = true
-                                    )
-                                }
-                                is com.example.core.processing.AstroProcessingOutcome.FallbackNightSight -> {
-                                    capturePathLabel = "Astro-Fallback"
-                                    com.example.core.processing.ProcessedPhotoPayload(
-                                        jpegBytes = outcome.jpegBytes,
-                                        width = outcome.width,
-                                        height = outcome.height,
-                                        exifOrientation = outcome.exifOrientation,
-                                        wasRecompressed = true
-                                    )
-                                }
+                            } finally {
+                                isStillAcquiringAstro.set(false)
+                                runCatching { astroTicker?.shutdownNow() }
+                                runCatching { accumulator?.close() }
                             }
                         } else if (captureMode == CameraMode.PHOTO) {
                             val hasOemExtension = captureActiveExtMode != androidx.camera.extensions.ExtensionMode.NONE
@@ -2930,6 +3330,23 @@ fun CameraXViewfinder(
                             processedPayload
                         }
 
+                        val saveStartMs = System.currentTimeMillis()
+                        if (captureMode == CameraMode.PORTRAIT) {
+                            val queuedNow = portraitJobsInFlight.get().coerceAtLeast(1)
+                            val canTakeNext = !photoSaveQueue.isFull
+                            mainExecutor.execute {
+                                latestOnShutterProgressChanged?.invoke(
+                                    ShutterProgressState(
+                                        mode = ShutterProgressMode.PORTRAIT,
+                                        phase = ShutterProgressPhase.PROCESSING,
+                                        progress = 0.94f,
+                                        statusLabel = "Saving…",
+                                        detailLabel = if (queuedNow > 1) "Saving… ($queuedNow queued)" else "Portrait: Saving…",
+                                        allowConcurrentCapture = canTakeNext
+                                    )
+                                )
+                            }
+                        }
                         val contentResolver = context.contentResolver
                         val savedUri: Uri? = if (isDngOnly) {
                             var pendingUri: Uri? = null
@@ -2985,6 +3402,23 @@ fun CameraXViewfinder(
 
                         if (savedUri != null) {
                             val savedAtMs = System.currentTimeMillis()
+                            val saveMs = (savedAtMs - saveStartMs).coerceAtLeast(0L)
+                            if (captureMode == CameraMode.PORTRAIT) {
+                                portraitCompletedSuccessfully = true
+                                val baseTimings = portraitStageTimings ?: com.example.core.camera.PortraitStageTimings(
+                                    captureMs = (frameCapturedAtMs - shutterPressedAtMs).coerceAtLeast(0L),
+                                    width = finalPhotoPayload.width,
+                                    height = finalPhotoPayload.height
+                                )
+                                com.example.core.camera.PortraitStageTimingTracker.record(
+                                    baseTimings.copy(
+                                        saveMs = saveMs,
+                                        totalMs = (savedAtMs - shutterPressedAtMs).coerceAtLeast(1L),
+                                        width = finalPhotoPayload.width,
+                                        height = finalPhotoPayload.height
+                                    )
+                                )
+                            }
                             com.example.core.camera.CaptureLatencyTracker.record(
                                 modeName = captureMode.displayName,
                                 speedModeLabel = captureSpeedMode.displayName,
@@ -3044,7 +3478,7 @@ fun CameraXViewfinder(
                                 }
                                 onCaptureSuccess?.invoke(savedUri)
                                 if (captureMode == CameraMode.NIGHT_SIGHT) {
-                                    latestOnNightSightProgressChanged?.invoke(
+                                    emitNightSightProgress(
                                         NightSightProgressState(
                                             phase = NightSightCapturePhase.COMPLETED,
                                             progress = 1f,
@@ -3052,8 +3486,21 @@ fun CameraXViewfinder(
                                         )
                                     )
                                     android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                        latestOnNightSightProgressChanged?.invoke(NightSightProgressState())
+                                        emitNightSightProgress(NightSightProgressState())
                                     }, 750L)
+                                } else if (captureMode == CameraMode.ASTRO) {
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.ASTRO,
+                                            phase = ShutterProgressPhase.COMPLETED,
+                                            progress = 1f,
+                                            statusLabel = "Saved",
+                                            detailLabel = "Saved"
+                                        )
+                                    )
+                                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                    }, 850L)
                                 }
                                 portraitFallbackReason?.let { reason ->
                                     val userMsg = if (reason.startsWith("No subject found", ignoreCase = true)) {
@@ -3073,7 +3520,9 @@ fun CameraXViewfinder(
                                     isCapturing = false
                                 }
                                 if (captureMode == CameraMode.NIGHT_SIGHT) {
-                                    latestOnNightSightProgressChanged?.invoke(NightSightProgressState())
+                                    emitNightSightProgress(NightSightProgressState())
+                                } else if (captureMode == CameraMode.ASTRO) {
+                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                 }
                                 onCaptureError?.invoke("Failed to create MediaStore entry.")
                             }
@@ -3088,9 +3537,53 @@ fun CameraXViewfinder(
                                 isCapturing = false
                             }
                             if (captureMode == CameraMode.NIGHT_SIGHT) {
-                                latestOnNightSightProgressChanged?.invoke(NightSightProgressState())
+                                emitNightSightProgress(NightSightProgressState())
+                            } else if (captureMode == CameraMode.ASTRO) {
+                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                             }
                             onCaptureError?.invoke("Photo processing failed: ${e.localizedMessage}")
+                        }
+                    } finally {
+                        if (captureMode == CameraMode.PORTRAIT) {
+                            val remaining = portraitJobsInFlight.decrementAndGet().coerceAtLeast(0)
+                            if (remaining == 0) {
+                                mainExecutor.execute {
+                                    if (portraitCompletedSuccessfully) {
+                                        latestOnShutterProgressChanged?.invoke(
+                                            ShutterProgressState(
+                                                mode = ShutterProgressMode.PORTRAIT,
+                                                phase = ShutterProgressPhase.COMPLETED,
+                                                progress = 1f,
+                                                statusLabel = "Saved",
+                                                detailLabel = "Saved",
+                                                allowConcurrentCapture = true
+                                            )
+                                        )
+                                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                            if (portraitJobsInFlight.get() == 0) {
+                                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                            }
+                                        }, 750L)
+                                    } else {
+                                        latestOnInstantPreviewThumbnail?.invoke(null)
+                                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                    }
+                                }
+                            } else {
+                                val canTakeNext = !photoSaveQueue.isFull
+                                mainExecutor.execute {
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.PORTRAIT,
+                                            phase = ShutterProgressPhase.PROCESSING,
+                                            progress = 0.25f,
+                                            statusLabel = "Processing…",
+                                            detailLabel = if (remaining == 1) "Portrait: Processing…" else "Portrait: Processing ($remaining queued)",
+                                            allowConcurrentCapture = canTakeNext
+                                        )
+                                    )
+                                }
+                            }
                         }
                     }
                     }
@@ -3098,10 +3591,39 @@ fun CameraXViewfinder(
                     // For single-frame captures, hand off saving/processing to the bounded background queue
                     // so photoCaptureExecutor stays free and consecutive shots fire without waiting for I/O!
                     if (isSingleFrameFastHandoff) {
-                        val queued = photoSaveQueue.tryEnqueue(runProcessingAndSave)
-                        if (!queued) {
-                            mainExecutor.execute {
-                                onCaptureError?.invoke("Save queue full — wait a moment before next shot.")
+                        if (captureMode == CameraMode.PORTRAIT) {
+                            val queuedCount = portraitJobsInFlight.incrementAndGet()
+                            val queued = photoSaveQueue.tryEnqueue(runProcessingAndSave)
+                            if (!queued) {
+                                val rem = portraitJobsInFlight.decrementAndGet().coerceAtLeast(0)
+                                mainExecutor.execute {
+                                    if (rem == 0) {
+                                        latestOnInstantPreviewThumbnail?.invoke(null)
+                                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                    }
+                                    onCaptureError?.invoke("Save queue full — wait a moment before next shot.")
+                                }
+                            } else {
+                                val canTakeNext = !photoSaveQueue.isFull
+                                mainExecutor.execute {
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.PORTRAIT,
+                                            phase = ShutterProgressPhase.PROCESSING,
+                                            progress = 0.08f,
+                                            statusLabel = "Processing…",
+                                            detailLabel = if (queuedCount > 1) "Portrait: Processing ($queuedCount queued)" else "Portrait: Processing…",
+                                            allowConcurrentCapture = canTakeNext
+                                        )
+                                    )
+                                }
+                            }
+                        } else {
+                            val queued = photoSaveQueue.tryEnqueue(runProcessingAndSave)
+                            if (!queued) {
+                                mainExecutor.execute {
+                                    onCaptureError?.invoke("Save queue full — wait a moment before next shot.")
+                                }
                             }
                         }
                     } else {
@@ -3115,7 +3637,9 @@ fun CameraXViewfinder(
                     mainExecutor.execute {
                         isCapturing = false
                         if (captureMode == CameraMode.NIGHT_SIGHT) {
-                            latestOnNightSightProgressChanged?.invoke(NightSightProgressState())
+                            emitNightSightProgress(NightSightProgressState())
+                        } else if (captureMode == CameraMode.ASTRO) {
+                            latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                         }
                         onCaptureError?.invoke("Photo capture failed: ${exception.localizedMessage}")
                     }
@@ -3722,6 +4246,17 @@ fun CameraXViewfinder(
             try {
                 val recordingSlowMoSpeed = latestSlowMoSpeed
                 val recordingTimeLapseSpeed = latestTimeLapseSpeed
+                val recordingTimeLapseDurationLimit = latestTimeLapseDurationLimit
+                val isTimeLapseSession = recordingMode == CameraMode.TIME_LAPSE
+                val timeLapseTargetDurationSec = if (isTimeLapseSession) recordingTimeLapseDurationLimit.targetDurationSeconds else null
+                val timeLapseIntervalMs = recordingTimeLapseSpeed.captureIntervalMs.coerceAtLeast(100L)
+                val timeLapseTargetFrames = timeLapseTargetDurationSec?.let { durSec ->
+                    ((durSec * 1000L) / timeLapseIntervalMs).toInt().coerceAtLeast(1)
+                }
+                val timeLapseFramesCaptured = java.util.concurrent.atomic.AtomicInteger(0)
+                val timeLapsePulseCount = java.util.concurrent.atomic.AtomicInteger(0)
+                val timeLapseAutoStopTriggered = java.util.concurrent.atomic.AtomicBoolean(false)
+
                 val recordingRequestedRes = latestVideoResolution
                 val recordingRequestedFps = if (recordingMode == CameraMode.SLOW_MOTION) {
                     recordingSlowMoSpeed.expectedFps
@@ -3761,20 +4296,114 @@ fun CameraXViewfinder(
                     when (recordEvent) {
                         is VideoRecordEvent.Start -> {
                             onRecordingStateChanged?.invoke(true)
+                            if (isTimeLapseSession) {
+                                cameraLifecycleOwner.keepAlive = true
+                                TimeLapseRecordingService.start(
+                                    context = context,
+                                    statusText = "Recording ${recordingTimeLapseSpeed.shortLabel} Time Lapse"
+                                )
+                                latestOnShutterProgressChanged?.invoke(
+                                    ShutterProgressState(
+                                        mode = ShutterProgressMode.TIME_LAPSE,
+                                        phase = ShutterProgressPhase.CAPTURING,
+                                        currentFrame = 0,
+                                        totalFrames = timeLapseTargetFrames ?: 0,
+                                        progress = 0f,
+                                        isIndeterminateCapture = (timeLapseTargetDurationSec == null),
+                                        framePulseCount = 0,
+                                        elapsedSeconds = 0L,
+                                        remainingSeconds = timeLapseTargetDurationSec,
+                                        statusLabel = "00:00",
+                                        detailLabel = formatTimeLapseCaptureCaption(
+                                            elapsedSeconds = 0L,
+                                            framesCaptured = 0,
+                                            targetDurationSeconds = timeLapseTargetDurationSec,
+                                            targetFrames = timeLapseTargetFrames
+                                        )
+                                    )
+                                )
+                            }
                         }
                         is VideoRecordEvent.Status -> {
                             val nanos = recordEvent.recordingStats.recordedDurationNanos
                             val seconds = nanos / 1_000_000_000L
                             onRecordingDurationChanged?.invoke(seconds)
+                            if (isTimeLapseSession) {
+                                val elapsedMs = (nanos / 1_000_000L).coerceAtLeast(0L)
+                                val frames = ((elapsedMs / timeLapseIntervalMs).toInt() + 1).coerceAtLeast(1)
+                                val prevFrames = timeLapseFramesCaptured.get()
+                                if (frames > prevFrames) {
+                                    timeLapseFramesCaptured.set(frames)
+                                    timeLapsePulseCount.incrementAndGet()
+                                }
+                                val progressFraction = if (timeLapseTargetDurationSec != null && timeLapseTargetDurationSec > 0L) {
+                                    (seconds.toFloat() / timeLapseTargetDurationSec.toFloat()).coerceIn(0f, 1f)
+                                } else {
+                                    0f
+                                }
+                                val remainingSec = timeLapseTargetDurationSec?.let { (it - seconds).coerceAtLeast(0L) }
+                                latestOnShutterProgressChanged?.invoke(
+                                    ShutterProgressState(
+                                        mode = ShutterProgressMode.TIME_LAPSE,
+                                        phase = ShutterProgressPhase.CAPTURING,
+                                        currentFrame = frames,
+                                        totalFrames = timeLapseTargetFrames ?: 0,
+                                        progress = progressFraction,
+                                        isIndeterminateCapture = (timeLapseTargetDurationSec == null),
+                                        framePulseCount = timeLapsePulseCount.get(),
+                                        elapsedSeconds = seconds,
+                                        remainingSeconds = remainingSec,
+                                        statusLabel = formatShutterElapsedTime(seconds),
+                                        detailLabel = formatTimeLapseCaptureCaption(
+                                            elapsedSeconds = seconds,
+                                            framesCaptured = frames,
+                                            targetDurationSeconds = timeLapseTargetDurationSec,
+                                            targetFrames = timeLapseTargetFrames
+                                        )
+                                    )
+                                )
+                                if (timeLapseTargetDurationSec != null &&
+                                    seconds >= timeLapseTargetDurationSec &&
+                                    timeLapseAutoStopTriggered.compareAndSet(false, true)
+                                ) {
+                                    try {
+                                        activeRecording?.stop()
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "Error auto-stopping time-lapse at duration limit", e)
+                                    }
+                                }
+                            }
                         }
                         is VideoRecordEvent.Finalize -> {
+                            if (isTimeLapseSession) {
+                                cameraLifecycleOwner.keepAlive = false
+                            }
                             onRecordingStateChanged?.invoke(false)
                             activeRecording = null
 
                             val hasValidTempFile = tempRecordFile.exists() && tempRecordFile.length() > 0L
-                            if (!recordEvent.hasError() && hasValidTempFile) {
+                            if ((!recordEvent.hasError() || (isTimeLapseSession && hasValidTempFile)) && hasValidTempFile) {
+                                val capturedFrameSnapshot = timeLapseFramesCaptured.get().coerceAtLeast(1)
+                                if (isTimeLapseSession) {
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.TIME_LAPSE,
+                                            phase = ShutterProgressPhase.PROCESSING,
+                                            currentFrame = capturedFrameSnapshot,
+                                            totalFrames = timeLapseTargetFrames ?: 0,
+                                            progress = 0.05f,
+                                            statusLabel = "5%",
+                                            detailLabel = "Building time-lapse… 5%"
+                                        )
+                                    )
+                                }
                                 companionCaptureExecutor.execute {
                                     var finalVideoFile: java.io.File? = null
+                                    var timeLapseFallbackNotice: String? = if (isTimeLapseSession && recordEvent.hasError()) {
+                                        "Recording interrupted — saved captured time-lapse footage."
+                                    } else {
+                                        null
+                                    }
                                     try {
                                         val modeProcessedFile = when (recordingMode) {
                                             CameraMode.SLOW_MOTION -> {
@@ -3787,13 +4416,40 @@ fun CameraXViewfinder(
                                                 processedFile
                                             }
                                             CameraMode.TIME_LAPSE -> {
-                                                val processedFile = processTimeLapseVideoFile(
-                                                    context = context,
-                                                    inputFile = tempRecordFile,
-                                                    speed = recordingTimeLapseSpeed
-                                                )
-                                                runCatching { tempRecordFile.delete() }
-                                                processedFile
+                                                val processedFile = try {
+                                                    processTimeLapseVideoFile(
+                                                        context = context,
+                                                        inputFile = tempRecordFile,
+                                                        speed = recordingTimeLapseSpeed,
+                                                        onProgress = { p ->
+                                                            val pct = (p * 100f).toInt().coerceIn(5, 99)
+                                                            mainExecutor.execute {
+                                                                latestOnShutterProgressChanged?.invoke(
+                                                                    ShutterProgressState(
+                                                                        mode = ShutterProgressMode.TIME_LAPSE,
+                                                                        phase = ShutterProgressPhase.PROCESSING,
+                                                                        currentFrame = capturedFrameSnapshot,
+                                                                        totalFrames = timeLapseTargetFrames ?: 0,
+                                                                        progress = p,
+                                                                        statusLabel = "$pct%",
+                                                                        detailLabel = "Building time-lapse… $pct%"
+                                                                    )
+                                                                )
+                                                            }
+                                                        }
+                                                    )
+                                                } catch (t: Throwable) {
+                                                    Log.e(TAG, "Time-lapse processing threw; falling back to raw recording", t)
+                                                    null
+                                                }
+                                                if (processedFile != null && processedFile.exists() && processedFile.length() > 0L) {
+                                                    runCatching { tempRecordFile.delete() }
+                                                    processedFile
+                                                } else {
+                                                    // Keep raw recording instead of losing the session!
+                                                    timeLapseFallbackNotice = "Time-lapse processing failed — saved raw recording so nothing was lost."
+                                                    tempRecordFile
+                                                }
                                             }
                                             else -> tempRecordFile
                                         }
@@ -3815,7 +4471,13 @@ fun CameraXViewfinder(
                                         }
 
                                         if (finalVideoFile == null || !finalVideoFile.exists() || finalVideoFile.length() == 0L) {
+                                            if (isTimeLapseSession) {
+                                                TimeLapseRecordingService.stop(context)
+                                            }
                                             mainExecutor.execute {
+                                                if (isTimeLapseSession) {
+                                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                                }
                                                 val modeLabel = if (recordingMode == CameraMode.TIME_LAPSE) "time-lapse" else "slow-motion"
                                                 onRecordingError?.invoke("Failed to finalize $modeLabel video output.")
                                             }
@@ -3838,24 +4500,96 @@ fun CameraXViewfinder(
                                             durationMs = durationMs
                                         )
                                         runCatching { finalVideoFile.delete() }
+                                        if (isTimeLapseSession) {
+                                            TimeLapseRecordingService.stop(context)
+                                        }
 
                                         mainExecutor.execute {
                                             if (savedMediaStoreUri != null && savedMediaStoreUri != Uri.EMPTY) {
                                                 onRecordingSuccess?.invoke(savedMediaStoreUri)
+                                                if (isTimeLapseSession) {
+                                                    latestOnShutterProgressChanged?.invoke(
+                                                        ShutterProgressState(
+                                                            mode = ShutterProgressMode.TIME_LAPSE,
+                                                            phase = ShutterProgressPhase.COMPLETED,
+                                                            currentFrame = capturedFrameSnapshot,
+                                                            totalFrames = timeLapseTargetFrames ?: 0,
+                                                            progress = 1f,
+                                                            statusLabel = "Saved",
+                                                            detailLabel = "Saved"
+                                                        )
+                                                    )
+                                                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                                    }, 850L)
+                                                }
+                                                timeLapseFallbackNotice?.let { notice ->
+                                                    onRecordingError?.invoke(notice)
+                                                }
                                             } else {
+                                                if (isTimeLapseSession) {
+                                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                                }
                                                 onRecordingError?.invoke("Failed to save recorded video to MediaStore.")
                                             }
                                         }
                                     } catch (e: Exception) {
                                         Log.e(TAG, "Error finalizing and saving video", e)
+                                        // Last-chance fallback for Time Lapse: if tempRecordFile still exists, save it raw
+                                        var rescuedUri: Uri? = null
+                                        if (isTimeLapseSession && tempRecordFile.exists() && tempRecordFile.length() > 0L) {
+                                            rescuedUri = runCatching {
+                                                val (rw, rh, rDur) = inspectAndLogSavedVideoMetadata(
+                                                    videoFile = tempRecordFile,
+                                                    requestedResolution = recordingRequestedRes,
+                                                    requestedFps = recordingRequestedFps,
+                                                    modeLabel = "TIME_LAPSE_RAW_FALLBACK"
+                                                )
+                                                saveVideoFileToMediaStore(
+                                                    context = context,
+                                                    videoFile = tempRecordFile,
+                                                    displayName = displayName,
+                                                    width = rw,
+                                                    height = rh,
+                                                    durationMs = rDur
+                                                )
+                                            }.getOrNull()
+                                        }
                                         runCatching { tempRecordFile.delete() }
                                         runCatching { finalVideoFile?.delete() }
+                                        if (isTimeLapseSession) {
+                                            TimeLapseRecordingService.stop(context)
+                                        }
                                         mainExecutor.execute {
-                                            onRecordingError?.invoke("Failed to save recorded video: ${e.localizedMessage}")
+                                            if (rescuedUri != null && rescuedUri != Uri.EMPTY) {
+                                                onRecordingSuccess?.invoke(rescuedUri)
+                                                latestOnShutterProgressChanged?.invoke(
+                                                    ShutterProgressState(
+                                                        mode = ShutterProgressMode.TIME_LAPSE,
+                                                        phase = ShutterProgressPhase.COMPLETED,
+                                                        progress = 1f,
+                                                        statusLabel = "Saved",
+                                                        detailLabel = "Saved"
+                                                    )
+                                                )
+                                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                                }, 850L)
+                                                onRecordingError?.invoke("Time-lapse processing failed — saved raw recording so nothing was lost.")
+                                            } else {
+                                                if (isTimeLapseSession) {
+                                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                                }
+                                                onRecordingError?.invoke("Failed to save recorded video: ${e.localizedMessage}")
+                                            }
                                         }
                                     }
                                 }
                             } else {
+                                if (isTimeLapseSession) {
+                                    TimeLapseRecordingService.stop(context)
+                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                }
                                 runCatching { tempRecordFile.delete() }
                                 Log.e(TAG, "Video recording finalize error code ${recordEvent.error}")
                                 onRecordingError?.invoke("Video recording completed with error code ${recordEvent.error}")
@@ -3866,6 +4600,11 @@ fun CameraXViewfinder(
                 activeRecording = recording
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start video recording", e)
+                if (recordingMode == CameraMode.TIME_LAPSE) {
+                    cameraLifecycleOwner.keepAlive = false
+                    TimeLapseRecordingService.stop(context)
+                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                }
                 onRecordingError?.invoke("Failed to start video recording: ${e.localizedMessage}")
                 onRecordingStateChanged?.invoke(false)
                 activeRecording = null
@@ -4004,14 +4743,17 @@ fun CameraXViewfinder(
                 .testTag("camerax_preview_view")
         )
 
-        // Dedicated TextureView surface for direct Camera2 + MediaRecorder video recording (exact resolution/FPS)
-        AndroidView(
-            factory = { camera2PreviewTextureView },
-            modifier = Modifier
-                .fillMaxSize()
-                .alpha(if (isDirectCamera2RecordingActive) 1f else 0f)
-                .testTag("camera2_video_texture_view")
-        )
+        // Dedicated TextureView surface for direct Camera2 + MediaRecorder video recording (exact resolution/FPS).
+        // Mounted only in Video mode to avoid allocating an unused TextureView Gralloc buffer in photo modes.
+        if (activeMode == CameraMode.VIDEO || isDirectCamera2RecordingActive) {
+            AndroidView(
+                factory = { camera2PreviewTextureView },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .alpha(if (isDirectCamera2RecordingActive) 1f else 0f)
+                    .testTag("camera2_video_texture_view")
+            )
+        }
 
         // Real Focus Peaking edge overlay directly over the viewfinder surface
         if (activeMode == CameraMode.PRO && proFocusPeakingEnabled && currentPeakingFrame != null) {
@@ -4280,45 +5022,7 @@ fun discoverVideoQualitiesFromHardware(
  * supported frame rate at each candidate [VideoResolution].
  */
 internal fun queryHardwareEncoderMaxFpsByResolution(): Map<VideoResolution, Double> {
-    val result = mutableMapOf<VideoResolution, Double>()
-    try {
-        val codecList = android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
-        val videoMimeTypes = setOf(
-            android.media.MediaFormat.MIMETYPE_VIDEO_AVC,
-            android.media.MediaFormat.MIMETYPE_VIDEO_HEVC
-        )
-        for (info in codecList.codecInfos) {
-            if (!info.isEncoder) continue
-            for (type in info.supportedTypes) {
-                val matchedMime = videoMimeTypes.firstOrNull { it.equals(type, ignoreCase = true) } ?: continue
-                val caps = runCatching { info.getCapabilitiesForType(matchedMime)?.videoCapabilities }.getOrNull() ?: continue
-                for (res in VideoResolution.VIDEO_MODE_OPTIONS) {
-                    val w = res.width
-                    val h = res.height
-                    val sizeSupported = runCatching {
-                        caps.isSizeSupported(w, h) || caps.isSizeSupported(h, w)
-                    }.getOrDefault(false)
-                    if (!sizeSupported) continue
-                    val supportedUpper = runCatching {
-                        val r1 = if (caps.isSizeSupported(w, h)) caps.getSupportedFrameRatesFor(w, h)?.upper ?: 0.0 else 0.0
-                        val r2 = if (caps.isSizeSupported(h, w)) caps.getSupportedFrameRatesFor(h, w)?.upper ?: 0.0 else 0.0
-                        maxOf(r1, r2)
-                    }.getOrDefault(30.0)
-                    val rate60Supported = runCatching {
-                        caps.areSizeAndRateSupported(w, h, 60.0) || caps.areSizeAndRateSupported(h, w, 60.0)
-                    }.getOrDefault(false)
-                    val effectiveMax = if (rate60Supported) maxOf(supportedUpper, 60.0) else supportedUpper
-                    val current = result[res] ?: 0.0
-                    if (effectiveMax > current) {
-                        result[res] = effectiveMax
-                    }
-                }
-            }
-        }
-    } catch (e: Exception) {
-        Log.w(TAG, "Unable to query MediaCodecList video encoder limits", e)
-    }
-    return result
+    return com.example.core.camera.queryHardwareEncoderVideoCapabilities().maxFpsByResolution
 }
 
 /**
@@ -4364,42 +5068,87 @@ fun queryDeviceCameraCapabilities(
             // Keep primary lens entry per facing (first discovered main back / front camera)
             if (capabilitiesMap.containsKey(lens)) continue
 
-            // Physical sub-cameras belonging to this logical camera (inspected for full-res HD still streams)
+            // Physical sub-cameras belonging to this logical camera PLUS every other same-facing camera ID
+            // in cameraIdList (some OEMs expose a dedicated full-res still camera ID alongside ID 0).
             val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 runCatching { characteristics.physicalCameraIds.toList() }.getOrDefault(emptyList())
             } else {
                 emptyList()
             }
-            val stillInspectionIds = (listOf(id) + physicalIds).distinct()
-            val stillInspectionChars = stillInspectionIds.mapNotNull { cid ->
+            val sameFacingCameraIds = buildList {
+                add(id)
+                addAll(physicalIds)
+                for (otherId in cameraIdList) {
+                    if (otherId == id || otherId in physicalIds) continue
+                    runCatching {
+                        val otherChars = cameraManager.getCameraCharacteristics(otherId)
+                        if (otherChars.get(CameraCharacteristics.LENS_FACING) == facing) {
+                            add(otherId)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                runCatching { otherChars.physicalCameraIds.toList() }
+                                    .getOrDefault(emptyList())
+                                    .forEach { add(it) }
+                            }
+                        }
+                    }
+                }
+            }.distinct()
+            val stillInspectionChars = sameFacingCameraIds.mapNotNull { cid ->
                 runCatching { cid to cameraManager.getCameraCharacteristics(cid) }.getOrNull()
             }
 
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val pixelArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.let {
+            var pixelArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.let {
                 PhotoOutputSize(width = it.width, height = it.height, isSensorMaxResolution = true)
             }
-            val activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.let {
+            var activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.let {
                 PhotoOutputSize(width = it.width(), height = it.height(), isSensorMaxResolution = true)
+            }
+            for ((cid, chars) in stillInspectionChars) {
+                if (cid == id) continue
+                chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.let { sz ->
+                    val candidate = PhotoOutputSize(width = sz.width, height = sz.height, isSensorMaxResolution = true)
+                    if (candidate.totalPixels > (pixelArraySize?.totalPixels ?: 0L)) {
+                        pixelArraySize = candidate
+                    }
+                }
+                chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.let { rect ->
+                    val candidate = PhotoOutputSize(width = rect.width(), height = rect.height(), isSensorMaxResolution = true)
+                    if (candidate.totalPixels > (activeArraySize?.totalPixels ?: 0L)) {
+                        activeArraySize = candidate
+                    }
+                }
             }
 
             // 1. HD MAX RESOLUTION DISCOVERY:
-            // Inspect standard JPEG & YUV_420_888, getHighResolutionOutputSizes, API 31+
-            // SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION, and all physical sub-camera IDs.
-            // Pick the single largest available capture source honestly.
+            // Inspect standard JPEG, YUV_420_888, and RAW_SENSOR, getHighResolutionOutputSizes, API 31+
+            // SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION, and all same-facing & physical camera IDs.
+            // Pick the single largest available JPEG/YUV capture source honestly (only adopting a size from a
+            // secondary camera ID if it is strictly larger than the primary camera ID's largest exposed size).
             val rawPhotoSet = LinkedHashSet<Pair<Int, Int>>()
             var bestHdSource: HdMaxPhotoCaptureSource? = null
+            var primaryMaxExposedPixels = 0L
 
             fun considerHdCandidate(
                 candidateCamId: String,
                 w: Int,
                 h: Int,
                 requiresMaxResMode: Boolean,
-                sourceTag: String
+                sourceTag: String,
+                isSecondaryCameraId: Boolean
             ) {
                 if (w <= 0 || h <= 0) return
-                rawPhotoSet.add(w to h)
                 val pixels = w.toLong() * h.toLong()
+                if (!isSecondaryCameraId) {
+                    rawPhotoSet.add(w to h)
+                    if (pixels > primaryMaxExposedPixels) {
+                        primaryMaxExposedPixels = pixels
+                    }
+                } else {
+                    // Only adopt a size from a separate camera ID if it genuinely beats primary camera `id`
+                    if (pixels <= primaryMaxExposedPixels) return
+                    rawPhotoSet.add(w to h)
+                }
                 val curBest = bestHdSource
                 val isBetter = curBest == null ||
                     pixels > curBest.totalPixels ||
@@ -4417,23 +5166,26 @@ fun queryDeviceCameraCapabilities(
                 }
             }
 
-            for ((cid, chars) in stillInspectionChars) {
+            // Inspect primary camera `id` first so `primaryMaxExposedPixels` is established before checking secondary IDs
+            val orderedInspectionChars = stillInspectionChars.sortedBy { if (it.first == id) 0 else 1 }
+            for ((cid, chars) in orderedInspectionChars) {
+                val isSecondary = cid != id
                 val scMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                 if (scMap != null) {
                     scMap.getOutputSizes(android.graphics.ImageFormat.JPEG)?.forEach { sz ->
-                        considerHdCandidate(cid, sz.width, sz.height, false, "JPEG_STD")
+                        considerHdCandidate(cid, sz.width, sz.height, false, "JPEG_STD", isSecondary)
                     }
                     scMap.getOutputSizes(android.graphics.ImageFormat.YUV_420_888)?.forEach { sz ->
-                        considerHdCandidate(cid, sz.width, sz.height, false, "YUV_STD")
+                        considerHdCandidate(cid, sz.width, sz.height, false, "YUV_STD", isSecondary)
                     }
                     runCatching {
                         scMap.getHighResolutionOutputSizes(android.graphics.ImageFormat.JPEG)?.forEach { sz ->
-                            considerHdCandidate(cid, sz.width, sz.height, false, "JPEG_HIRES")
+                            considerHdCandidate(cid, sz.width, sz.height, false, "JPEG_HIRES", isSecondary)
                         }
                     }
                     runCatching {
                         scMap.getHighResolutionOutputSizes(android.graphics.ImageFormat.YUV_420_888)?.forEach { sz ->
-                            considerHdCandidate(cid, sz.width, sz.height, false, "YUV_HIRES")
+                            considerHdCandidate(cid, sz.width, sz.height, false, "YUV_HIRES", isSecondary)
                         }
                     }
                 }
@@ -4441,16 +5193,16 @@ fun queryDeviceCameraCapabilities(
                     runCatching {
                         chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)?.let { maxResMap ->
                             maxResMap.getOutputSizes(android.graphics.ImageFormat.JPEG)?.forEach { sz ->
-                                considerHdCandidate(cid, sz.width, sz.height, true, "JPEG_MAXRES_API31")
+                                considerHdCandidate(cid, sz.width, sz.height, true, "JPEG_MAXRES_API31", isSecondary)
                             }
                             maxResMap.getHighResolutionOutputSizes(android.graphics.ImageFormat.JPEG)?.forEach { sz ->
-                                considerHdCandidate(cid, sz.width, sz.height, true, "JPEG_MAXRES_HIRES_API31")
+                                considerHdCandidate(cid, sz.width, sz.height, true, "JPEG_MAXRES_HIRES_API31", isSecondary)
                             }
                             maxResMap.getOutputSizes(android.graphics.ImageFormat.YUV_420_888)?.forEach { sz ->
-                                considerHdCandidate(cid, sz.width, sz.height, true, "YUV_MAXRES_API31")
+                                considerHdCandidate(cid, sz.width, sz.height, true, "YUV_MAXRES_API31", isSecondary)
                             }
                             maxResMap.getHighResolutionOutputSizes(android.graphics.ImageFormat.YUV_420_888)?.forEach { sz ->
-                                considerHdCandidate(cid, sz.width, sz.height, true, "YUV_MAXRES_HIRES_API31")
+                                considerHdCandidate(cid, sz.width, sz.height, true, "YUV_MAXRES_HIRES_API31", isSecondary)
                             }
                         }
                     }
@@ -4494,7 +5246,13 @@ fun queryDeviceCameraCapabilities(
                     val matchingSize = combinedVideoSizes.firstOrNull { sz ->
                         (sz.width == res.width && sz.height == res.height) ||
                             (sz.width == res.height && sz.height == res.width)
-                    } ?: continue
+                    } ?: if (res == VideoResolution.FHD_1080P) {
+                        combinedVideoSizes.firstOrNull { sz ->
+                            (sz.width == 1920 && sz.height == 1088) ||
+                                (sz.width == 1088 && sz.height == 1920)
+                        }
+                    } else null
+                    if (matchingSize == null) continue
 
                     val recDur = runCatching { map.getOutputMinFrameDuration(android.media.MediaRecorder::class.java, matchingSize) }.getOrDefault(0L)
                     val codecDur = runCatching { map.getOutputMinFrameDuration(android.media.MediaCodec::class.java, matchingSize) }.getOrDefault(0L)
@@ -4520,37 +5278,8 @@ fun queryDeviceCameraCapabilities(
                 }
             }
 
-            // 4. STANDARD CamcorderProfile / EncoderProfiles AS SECOND SOURCE (STRICTLY FOR CAMERA `id`, NO HIGH_SPEED PROFILES)
-            val camcorderMaxFpsByRes = mutableMapOf<VideoResolution, Int>()
-            val camIdInt = id.toIntOrNull()
-            val standardQualityPairs = listOf(
-                android.media.CamcorderProfile.QUALITY_720P to VideoResolution.HD_720P,
-                android.media.CamcorderProfile.QUALITY_1080P to VideoResolution.FHD_1080P,
-                10 to VideoResolution.QHD_2K, // CamcorderProfile.QUALITY_2K
-                11 to VideoResolution.QHD_2K, // CamcorderProfile.QUALITY_QHD
-                android.media.CamcorderProfile.QUALITY_2160P to VideoResolution.UHD_4K
-            )
-            for ((qCode, videoRes) in standardQualityPairs) {
-                try {
-                    val hasProf = camIdInt != null && android.media.CamcorderProfile.hasProfile(camIdInt, qCode)
-                    if (hasProf && camIdInt != null) {
-                        var profFps = 0
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            val encProfiles = runCatching { android.media.CamcorderProfile.getAll(id, qCode) }.getOrNull()
-                            profFps = encProfiles?.videoProfiles?.maxOfOrNull { it.frameRate } ?: 0
-                        }
-                        if (profFps <= 0) {
-                            val legacyProf = runCatching {
-                                @Suppress("DEPRECATION")
-                                android.media.CamcorderProfile.get(camIdInt, qCode)
-                            }.getOrNull()
-                            profFps = legacyProf?.videoFrameRate ?: 30
-                        }
-                        val prev = camcorderMaxFpsByRes[videoRes] ?: 0
-                        if (profFps > prev) camcorderMaxFpsByRes[videoRes] = profFps
-                    }
-                } catch (_: Exception) {}
-            }
+            // 4. STANDARD CamcorderProfile / EncoderProfiles AS SECOND SOURCE (MATCHED BY ACTUAL FRAME DIMENSIONS)
+            val camcorderMaxFpsByRes = com.example.core.camera.queryCamcorderProfileMaxFpsByResolution(id)
 
             // 5. Query CameraX Recorder.getVideoCapabilities, PreviewCapabilities, ZSL, and Extensions
             val cameraXSupportedResolutions = mutableSetOf<VideoResolution>()
@@ -4573,25 +5302,64 @@ fun queryDeviceCameraCapabilities(
                     val matchingCameraInfo = selector.filter(cameraProvider.availableCameraInfos).firstOrNull()
                     if (matchingCameraInfo != null) {
                         isCameraXZslSupported = isCameraInfoZslSupported(matchingCameraInfo)
-                        val codecVideoCaps = Recorder.getVideoCapabilities(
-                            matchingCameraInfo,
-                            Recorder.VIDEO_CAPABILITIES_SOURCE_CODEC_CAPABILITIES
-                        )
-                        val profileVideoCaps = Recorder.getVideoCapabilities(
-                            matchingCameraInfo,
-                            Recorder.VIDEO_CAPABILITIES_SOURCE_CAMCORDER_PROFILE
-                        )
-                        isCameraXVideoStabSupported = codecVideoCaps.isStabilizationSupported || profileVideoCaps.isStabilizationSupported
                         isCameraXPreviewStabSupported = runCatching {
                             Preview.getPreviewCapabilities(matchingCameraInfo).isStabilizationSupported
                         }.getOrDefault(false)
 
-                        val qualities = (
-                            codecVideoCaps.getSupportedQualities(DynamicRange.SDR) +
-                                profileVideoCaps.getSupportedQualities(DynamicRange.SDR)
-                            ).distinct()
-                        for (q in qualities) {
-                            q.toVideoResolution()?.let { cameraXSupportedResolutions.add(it) }
+                        // Verify the camera actually exposes at least one valid standard EncoderProfile before
+                        // invoking Recorder.getVideoCapabilities (which logs E/CapabilitiesByQuality: No supported
+                        // EncoderProfiles on devices/emulators that expose zero usable EncoderProfiles).
+                        val camIdIntForProfile = id.toIntOrNull()
+                        val hasAnyCamcorderProfile = camcorderMaxFpsByRes.isNotEmpty() || (
+                            camIdIntForProfile != null && listOf(
+                                android.media.CamcorderProfile.QUALITY_480P,
+                                android.media.CamcorderProfile.QUALITY_720P,
+                                android.media.CamcorderProfile.QUALITY_1080P,
+                                android.media.CamcorderProfile.QUALITY_2160P
+                            ).any { q ->
+                                runCatching {
+                                    if (!android.media.CamcorderProfile.hasProfile(camIdIntForProfile, q)) {
+                                        false
+                                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                        val ep = android.media.CamcorderProfile.getAll(id, q)
+                                        ep != null && ep.videoProfiles.any { vp -> vp.width >= 640 && vp.height >= 480 }
+                                    } else {
+                                        true
+                                    }
+                                }.getOrDefault(false)
+                            }
+                        )
+
+                        if (hasAnyCamcorderProfile) {
+                            val codecVideoCaps = Recorder.getVideoCapabilities(
+                                matchingCameraInfo,
+                                Recorder.VIDEO_CAPABILITIES_SOURCE_CODEC_CAPABILITIES
+                            )
+                            val profileVideoCaps = Recorder.getVideoCapabilities(
+                                matchingCameraInfo,
+                                Recorder.VIDEO_CAPABILITIES_SOURCE_CAMCORDER_PROFILE
+                            )
+                            isCameraXVideoStabSupported = codecVideoCaps.isStabilizationSupported || profileVideoCaps.isStabilizationSupported
+
+                            val qualities = (
+                                codecVideoCaps.getSupportedQualities(DynamicRange.SDR) +
+                                    profileVideoCaps.getSupportedQualities(DynamicRange.SDR)
+                                ).distinct()
+                            for (q in qualities) {
+                                q.toVideoResolution()?.let { cameraXSupportedResolutions.add(it) }
+                            }
+                        } else {
+                            // No CamcorderProfile/EncoderProfiles on this camera: derive supported resolutions
+                            // directly from the verified Camera2 stream map + MediaCodec VideoCapabilities.
+                            for (res in VideoResolution.entries) {
+                                val inStreamMap = streamVideoSizes.any { (w, h) ->
+                                    maxOf(w, h) == res.width && (minOf(w, h) == res.height || (res == VideoResolution.FHD_1080P && minOf(w, h) == 1088))
+                                }
+                                val codecCapable = (codecMaxFpsByRes[res] ?: 0.0) >= 23.0
+                                if (inStreamMap && codecCapable) {
+                                    cameraXSupportedResolutions.add(res)
+                                }
+                            }
                         }
                         val has2kStream = streamVideoSizes.any { (w, h) ->
                             maxOf(w, h) == VideoResolution.QHD_2K.width && minOf(w, h) == VideoResolution.QHD_2K.height
@@ -4633,12 +5401,15 @@ fun queryDeviceCameraCapabilities(
             )
 
             // Verify candidate video (resolution, FPS) session configs and cache per camera ID
-            val sessionVerifiedQualities = VideoSessionConfigVerifier.verifyAndCacheVideoCombinations(
+            // Note: keep allowDeviceOpenProbe = false here to avoid racing CameraX startup camera open on API 29-34;
+            // API 35+ still verifies CameraCharacteristics.isSessionConfigurationSupported without opening the device.
+            val (sessionVerifiedQualities, _) = VideoSessionConfigVerifier.verifyAndCacheVideoCombinationsWithDiagnostics(
                 context = context,
                 cameraId = id,
                 candidates = rawVerifiedVideoProfile.supportedVideoQualities,
+                staticEvaluations = rawVerifiedVideoProfile.videoComboEvaluations,
                 aeFpsRanges = aeFpsPairs,
-                allowDeviceOpenProbe = cameraProvider == null
+                allowDeviceOpenProbe = false
             )
 
             val hasFlashUnit = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
@@ -5060,7 +5831,8 @@ internal fun processTimeLapseVideoFile(
     context: Context,
     inputFile: java.io.File,
     speed: TimeLapseSpeed,
-    targetOutputFps: Int = TimeLapseSpeed.TARGET_OUTPUT_FPS
+    targetOutputFps: Int = TimeLapseSpeed.TARGET_OUTPUT_FPS,
+    onProgress: ((Float) -> Unit)? = null
 ): java.io.File? {
     if (!inputFile.exists() || inputFile.length() == 0L) return null
     val multiplier = speed.multiplier.coerceAtLeast(1)
@@ -5069,6 +5841,7 @@ internal fun processTimeLapseVideoFile(
     var muxerStarted = false
     val outputFile = java.io.File.createTempFile("timelapse_out_${multiplier}x_", ".mp4", context.cacheDir)
     try {
+        onProgress?.invoke(0.06f)
         var rotationDegrees = 0
         val retriever = android.media.MediaMetadataRetriever()
         try {
@@ -5117,8 +5890,12 @@ internal fun processTimeLapseVideoFile(
             val isSync = (flags and android.media.MediaExtractor.SAMPLE_FLAG_SYNC) != 0
             sampleMetas.add(VideoSampleMeta(index = metaIdx, ptsUs = ptsUs, isSync = isSync))
             metaIdx++
+            if (metaIdx % 120 == 0) {
+                onProgress?.invoke((0.10f + minOf(0.28f, metaIdx / 4000f)).coerceIn(0.10f, 0.38f))
+            }
             if (!extractor.advance()) break
         }
+        onProgress?.invoke(0.40f)
 
         val schedule = computeTimeLapseSampleSchedule(
             samples = sampleMetas,
@@ -5130,6 +5907,7 @@ internal fun processTimeLapseVideoFile(
             return null
         }
         val scheduleBySourceIndex = schedule.associateBy { it.sourceIndex }
+        val totalSourceSamples = sampleMetas.size.coerceAtLeast(1)
 
         // Pass 2: Remux selected samples with compressed time-lapse presentation timestamps
         extractor.seekTo(0L, android.media.MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
@@ -5157,6 +5935,7 @@ internal fun processTimeLapseVideoFile(
 
         var currentIndex = 0
         var writtenCount = 0
+        var lastReportedPct = 40
 
         while (true) {
             buffer.clear()
@@ -5180,6 +5959,11 @@ internal fun processTimeLapseVideoFile(
             }
 
             currentIndex++
+            val nextPct = 40 + ((currentIndex * 54) / totalSourceSamples).coerceIn(0, 54)
+            if (nextPct >= lastReportedPct + 3) {
+                lastReportedPct = nextPct
+                onProgress?.invoke(nextPct / 100f)
+            }
             if (!extractor.advance()) break
         }
 
@@ -5190,12 +5974,14 @@ internal fun processTimeLapseVideoFile(
             return null
         }
 
+        onProgress?.invoke(0.96f)
         muxer.stop()
         muxerStarted = false
         muxer.release()
         muxer = null
         extractor.release()
         extractor = null
+        onProgress?.invoke(0.99f)
 
         return if (outputFile.exists() && outputFile.length() > 0L) outputFile else null
     } catch (e: Exception) {

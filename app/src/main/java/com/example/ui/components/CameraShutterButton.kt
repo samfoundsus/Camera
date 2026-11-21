@@ -1,5 +1,6 @@
 package com.example.ui.components
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -9,6 +10,8 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -18,15 +21,19 @@ import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
@@ -48,19 +55,271 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.core.camera.NightSightCapturePhase
 import com.example.core.camera.NightSightProgressState
+import com.example.core.camera.ShutterProgressMode
+import com.example.core.camera.ShutterProgressPhase
+import com.example.core.camera.ShutterProgressState
+import com.example.core.camera.toShutterProgressState
 import com.example.ui.theme.CameraMotionTokens
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 /**
+ * Shared circular progress ring overlay used identically by Night Sight, Astrophotography,
+ * and Time Lapse modes:
+ * - [ShutterProgressPhase.CAPTURING] (determinate): fills 0° -> 360° smoothly as frames or duration advance.
+ * - [ShutterProgressPhase.CAPTURING] (indeterminate, e.g. unlimited Time Lapse): crisp active ring that
+ *   subtly pulses each time [ShutterProgressState.framePulseCount] increments.
+ * - [ShutterProgressPhase.PROCESSING]: distinct spinning dual-arc indicator so processing never looks frozen.
+ * - [ShutterProgressPhase.COMPLETED]: full 360° completion ring.
+ */
+@Composable
+fun ShutterProgressRing(
+    progressState: ShutterProgressState,
+    processingSpinAngle: Float,
+    framePulseAlpha: Float,
+    modifier: Modifier = Modifier
+) {
+    val phase = progressState.phase
+    if (phase == ShutterProgressPhase.IDLE) return
+
+    val animatedCaptureSweep by animateFloatAsState(
+        targetValue = when {
+            phase == ShutterProgressPhase.CAPTURING && !progressState.isIndeterminateCapture ->
+                (progressState.progress.coerceIn(0.05f, 1f) * 360f)
+            phase == ShutterProgressPhase.COMPLETED -> 360f
+            else -> 0f
+        },
+        animationSpec = tween(durationMillis = 220),
+        label = "shared_shutter_capture_sweep"
+    )
+
+    val captureRingColor = when (progressState.mode) {
+        ShutterProgressMode.TIME_LAPSE -> MaterialTheme.colorScheme.error
+        ShutterProgressMode.NIGHT_SIGHT,
+        ShutterProgressMode.ASTRO,
+        ShutterProgressMode.PORTRAIT -> MaterialTheme.colorScheme.primary
+    }
+    val processingRingColor = MaterialTheme.colorScheme.tertiary
+    val completedRingColor = MaterialTheme.colorScheme.tertiary
+    val trackRingColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.20f)
+
+    val ringTag = when (progressState.mode) {
+        ShutterProgressMode.NIGHT_SIGHT -> when (phase) {
+            ShutterProgressPhase.CAPTURING -> "night_sight_shutter_capture_progress"
+            ShutterProgressPhase.PROCESSING -> "night_sight_shutter_processing_ring"
+            ShutterProgressPhase.COMPLETED -> "night_sight_shutter_completed"
+            ShutterProgressPhase.IDLE -> "night_sight_shutter_idle"
+        }
+        ShutterProgressMode.ASTRO -> when (phase) {
+            ShutterProgressPhase.CAPTURING -> "astro_shutter_capture_progress"
+            ShutterProgressPhase.PROCESSING -> "astro_shutter_processing_ring"
+            ShutterProgressPhase.COMPLETED -> "astro_shutter_completed"
+            ShutterProgressPhase.IDLE -> "astro_shutter_idle"
+        }
+        ShutterProgressMode.TIME_LAPSE -> when (phase) {
+            ShutterProgressPhase.CAPTURING -> "timelapse_shutter_capture_progress"
+            ShutterProgressPhase.PROCESSING -> "timelapse_shutter_processing_ring"
+            ShutterProgressPhase.COMPLETED -> "timelapse_shutter_completed"
+            ShutterProgressPhase.IDLE -> "timelapse_shutter_idle"
+        }
+        ShutterProgressMode.PORTRAIT -> when (phase) {
+            ShutterProgressPhase.CAPTURING -> "portrait_shutter_capture_progress"
+            ShutterProgressPhase.PROCESSING -> "portrait_shutter_processing_ring"
+            ShutterProgressPhase.COMPLETED -> "portrait_shutter_completed"
+            ShutterProgressPhase.IDLE -> "portrait_shutter_idle"
+        }
+    }
+
+    Canvas(
+        modifier = modifier
+            .fillMaxSize()
+            .testTag(ringTag)
+    ) {
+        val strokePx = 5.dp.toPx()
+        val inset = strokePx / 2f + 1.dp.toPx()
+        val arcSize = Size(size.width - inset * 2f, size.height - inset * 2f)
+        val topLeft = Offset(inset, inset)
+
+        // Background track
+        drawArc(
+            color = trackRingColor,
+            startAngle = 0f,
+            sweepAngle = 360f,
+            useCenter = false,
+            topLeft = topLeft,
+            size = arcSize,
+            style = Stroke(width = strokePx, cap = StrokeCap.Round)
+        )
+
+        when (phase) {
+            ShutterProgressPhase.CAPTURING -> {
+                if (progressState.isIndeterminateCapture) {
+                    // Unlimited Time Lapse: steady active ring + visible pulse glow on each captured frame
+                    drawArc(
+                        color = captureRingColor.copy(alpha = 0.45f + 0.55f * framePulseAlpha),
+                        startAngle = -90f,
+                        sweepAngle = 360f,
+                        useCenter = false,
+                        topLeft = topLeft,
+                        size = arcSize,
+                        style = Stroke(
+                            width = strokePx + (2.dp.toPx() * framePulseAlpha),
+                            cap = StrokeCap.Round
+                        )
+                    )
+                    // Accent sweep indicator showing active cadence
+                    drawArc(
+                        color = captureRingColor,
+                        startAngle = processingSpinAngle,
+                        sweepAngle = 64f,
+                        useCenter = false,
+                        topLeft = topLeft,
+                        size = arcSize,
+                        style = Stroke(width = strokePx, cap = StrokeCap.Round)
+                    )
+                } else {
+                    drawArc(
+                        color = captureRingColor,
+                        startAngle = -90f,
+                        sweepAngle = animatedCaptureSweep,
+                        useCenter = false,
+                        topLeft = topLeft,
+                        size = arcSize,
+                        style = Stroke(width = strokePx, cap = StrokeCap.Round)
+                    )
+                }
+            }
+            ShutterProgressPhase.PROCESSING -> {
+                // Clearly distinct spinning double-arc indicator so processing never looks frozen
+                drawArc(
+                    color = processingRingColor,
+                    startAngle = processingSpinAngle,
+                    sweepAngle = 115f,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = Stroke(width = strokePx, cap = StrokeCap.Round)
+                )
+                drawArc(
+                    color = captureRingColor.copy(alpha = 0.65f),
+                    startAngle = processingSpinAngle + 180f,
+                    sweepAngle = 70f,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = Stroke(width = strokePx, cap = StrokeCap.Round)
+                )
+            }
+            ShutterProgressPhase.COMPLETED -> {
+                drawArc(
+                    color = completedRingColor,
+                    startAngle = -90f,
+                    sweepAngle = 360f,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = Stroke(width = strokePx, cap = StrokeCap.Round)
+                )
+            }
+            ShutterProgressPhase.IDLE -> Unit
+        }
+    }
+}
+
+/**
+ * Shared Material 3 status banner rendered immediately above the shutter bar for
+ * Night Sight, Astrophotography, and Time Lapse modes.
+ *
+ * Shows frame count, elapsed/remaining time, processing progress, "Saved" completion,
+ * and during Astrophotography capture offers a clear "Stop & save" action so long sessions are never lost.
+ */
+@Composable
+fun ShutterProgressStatusBanner(
+    progressState: ShutterProgressState,
+    onStopAndSaveClick: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    val visible = progressState.phase != ShutterProgressPhase.IDLE &&
+        (progressState.detailLabel.isNotBlank() || progressState.statusLabel.isNotBlank())
+
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(animationSpec = tween(180)),
+        exit = fadeOut(animationSpec = tween(180)),
+        modifier = modifier
+    ) {
+        val containerColor = when (progressState.phase) {
+            ShutterProgressPhase.COMPLETED -> MaterialTheme.colorScheme.tertiaryContainer
+            ShutterProgressPhase.PROCESSING -> MaterialTheme.colorScheme.secondaryContainer
+            ShutterProgressPhase.CAPTURING -> MaterialTheme.colorScheme.surfaceContainerHigh
+            ShutterProgressPhase.IDLE -> MaterialTheme.colorScheme.surfaceContainerHigh
+        }
+        val contentColor = when (progressState.phase) {
+            ShutterProgressPhase.COMPLETED -> MaterialTheme.colorScheme.onTertiaryContainer
+            ShutterProgressPhase.PROCESSING -> MaterialTheme.colorScheme.onSecondaryContainer
+            ShutterProgressPhase.CAPTURING -> MaterialTheme.colorScheme.onSurface
+            ShutterProgressPhase.IDLE -> MaterialTheme.colorScheme.onSurface
+        }
+        val caption = progressState.detailLabel.ifBlank { progressState.statusLabel }
+        val showStopAndSaveChip = progressState.mode == ShutterProgressMode.ASTRO &&
+            progressState.phase == ShutterProgressPhase.CAPTURING &&
+            progressState.canStopAndSave
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier
+                .padding(horizontal = 16.dp, vertical = 4.dp)
+                .testTag("shutter_progress_banner")
+        ) {
+            Surface(
+                color = containerColor.copy(alpha = 0.94f),
+                shape = RoundedCornerShape(16.dp),
+                tonalElevation = 2.dp
+            ) {
+                Text(
+                    text = caption,
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = contentColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .testTag("shutter_progress_caption")
+                )
+            }
+
+            if (showStopAndSaveChip) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    shape = RoundedCornerShape(16.dp),
+                    tonalElevation = 2.dp,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .clickable(onClick = onStopAndSaveClick)
+                        .testTag("astro_stop_and_save_button")
+                ) {
+                    Text(
+                        text = "Stop & save",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
  * Reusable Google Pixel-inspired prominent double-ring shutter button with touch feedback,
- * smooth video-recording shape morphing, capture confirmation pulse, and Night Sight
- * multi-phase circular progress ring (Capture fill + Cancel -> Processing spinner -> Done).
+ * smooth video-recording shape morphing, capture confirmation pulse, and one shared multi-phase
+ * circular progress component used by Night Sight, Astrophotography, and Time Lapse.
  */
 @Composable
 fun CameraShutterButton(
@@ -70,6 +329,8 @@ fun CameraShutterButton(
     isCountingDown: Boolean = false,
     countdownSeconds: Int = 0,
     captureConfirmationTrigger: Int = 0,
+    shutterProgress: ShutterProgressState = ShutterProgressState(),
+    onActiveProgressShutterClick: () -> Unit = {},
     nightSightProgress: NightSightProgressState = NightSightProgressState(),
     onCancelNightSightCapture: () -> Unit = {},
     modifier: Modifier = Modifier,
@@ -79,11 +340,22 @@ fun CameraShutterButton(
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
 
-    val nightPhase = nightSightProgress.phase
-    val isNightCapturing = nightPhase == NightSightCapturePhase.CAPTURING
-    val isNightProcessing = nightPhase == NightSightCapturePhase.PROCESSING
-    val isNightCompleted = nightPhase == NightSightCapturePhase.COMPLETED
-    val isNightActive = nightSightProgress.isActive
+    val effectiveProgress = remember(shutterProgress, nightSightProgress) {
+        if (shutterProgress.phase != ShutterProgressPhase.IDLE) {
+            shutterProgress
+        } else {
+            nightSightProgress.toShutterProgressState()
+        }
+    }
+
+    val phase = effectiveProgress.phase
+    val isProgressCapturing = phase == ShutterProgressPhase.CAPTURING
+    val isProgressProcessing = phase == ShutterProgressPhase.PROCESSING
+    val isProgressCompleted = phase == ShutterProgressPhase.COMPLETED
+    val isProgressActive = effectiveProgress.isActive
+    val isTimeLapseCapturing = isProgressCapturing && effectiveProgress.mode == ShutterProgressMode.TIME_LAPSE
+    val isAstroCapturing = isProgressCapturing && effectiveProgress.mode == ShutterProgressMode.ASTRO
+    val isNightCapturing = isProgressCapturing && effectiveProgress.mode == ShutterProgressMode.NIGHT_SIGHT
 
     var isCapturePulsing by remember { mutableStateOf(false) }
     LaunchedEffect(captureConfirmationTrigger) {
@@ -94,17 +366,22 @@ fun CameraShutterButton(
         }
     }
 
-    val animatedCaptureSweep by animateFloatAsState(
-        targetValue = when (nightPhase) {
-            NightSightCapturePhase.CAPTURING -> (nightSightProgress.progress.coerceIn(0.05f, 1f) * 360f)
-            NightSightCapturePhase.COMPLETED -> 360f
-            else -> 0f
-        },
+    // Subtle pulse whenever an unlimited Time Lapse frame is captured
+    var isFramePulseActive by remember { mutableStateOf(false) }
+    LaunchedEffect(effectiveProgress.framePulseCount) {
+        if (effectiveProgress.framePulseCount > 0 && isTimeLapseCapturing && effectiveProgress.isIndeterminateCapture) {
+            isFramePulseActive = true
+            delay(240L)
+            isFramePulseActive = false
+        }
+    }
+    val framePulseAlpha by animateFloatAsState(
+        targetValue = if (isFramePulseActive) 1f else 0f,
         animationSpec = tween(durationMillis = 220),
-        label = "night_sight_capture_sweep"
+        label = "timelapse_frame_pulse_alpha"
     )
 
-    val processingTransition = rememberInfiniteTransition(label = "night_sight_processing_anim")
+    val processingTransition = rememberInfiniteTransition(label = "shutter_progress_processing_anim")
     val processingSpinAngle by processingTransition.animateFloat(
         initialValue = 0f,
         targetValue = 360f,
@@ -112,7 +389,7 @@ fun CameraShutterButton(
             animation = tween(durationMillis = 1050, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "night_sight_processing_spin"
+        label = "shutter_progress_spin"
     )
     val processingPulseScale by processingTransition.animateFloat(
         initialValue = 0.94f,
@@ -121,14 +398,15 @@ fun CameraShutterButton(
             animation = tween(durationMillis = 700),
             repeatMode = RepeatMode.Reverse
         ),
-        label = "night_sight_processing_pulse"
+        label = "shutter_progress_pulse"
     )
 
     val pressScale by animateFloatAsState(
         targetValue = when {
-            isNightProcessing -> processingPulseScale
+            isProgressProcessing -> processingPulseScale
+            isFramePulseActive -> 1.04f
             isPressed -> 0.92f
-            isCapturePulsing || isNightCompleted -> 1.05f
+            isCapturePulsing || isProgressCompleted -> 1.05f
             else -> 1.0f
         },
         animationSpec = CameraMotionTokens.touchSpring(),
@@ -136,8 +414,8 @@ fun CameraShutterButton(
     )
 
     val targetBorderColor = when {
-        isNightCapturing || isNightProcessing -> MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
-        isNightCompleted -> MaterialTheme.colorScheme.tertiary
+        isProgressCapturing || isProgressProcessing -> MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+        isProgressCompleted -> MaterialTheme.colorScheme.tertiary
         isRecording -> MaterialTheme.colorScheme.error
         isCountingDown -> MaterialTheme.colorScheme.primary
         isCapturePulsing -> MaterialTheme.colorScheme.primary
@@ -150,9 +428,10 @@ fun CameraShutterButton(
     )
 
     val targetInnerSize = when {
+        isTimeLapseCapturing -> 32.dp
         isRecording -> 32.dp
-        isNightCapturing -> 56.dp
-        isNightProcessing -> 54.dp
+        isProgressCapturing -> 56.dp
+        isProgressProcessing -> 54.dp
         else -> innerSize
     }
     val animatedInnerSize by animateDpAsState(
@@ -162,7 +441,7 @@ fun CameraShutterButton(
     )
 
     val targetCornerRadius = when {
-        isRecording -> 8.dp
+        isTimeLapseCapturing || isRecording -> 8.dp
         else -> (innerSize / 2)
     }
     val animatedCornerRadius by animateDpAsState(
@@ -172,9 +451,10 @@ fun CameraShutterButton(
     )
 
     val targetInnerColor = when {
-        isNightCapturing -> MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.92f)
-        isNightProcessing -> MaterialTheme.colorScheme.tertiaryContainer
-        isNightCompleted -> MaterialTheme.colorScheme.tertiary
+        isTimeLapseCapturing -> MaterialTheme.colorScheme.error
+        isProgressCapturing -> MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.92f)
+        isProgressProcessing -> MaterialTheme.colorScheme.tertiaryContainer
+        isProgressCompleted -> MaterialTheme.colorScheme.tertiary
         isRecording -> MaterialTheme.colorScheme.error
         isCountingDown -> MaterialTheme.colorScheme.primaryContainer
         isVideoMode -> MaterialTheme.colorScheme.error
@@ -186,32 +466,51 @@ fun CameraShutterButton(
         label = "shutter_inner_color"
     )
 
-    val captureRingColor = MaterialTheme.colorScheme.primary
-    val processingRingColor = MaterialTheme.colorScheme.tertiary
-    val completedRingColor = MaterialTheme.colorScheme.tertiary
-    val trackRingColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f)
-
-    // While capturing Night Sight, tapping the shutter cancels capture cleanly.
-    // While processing or completed, shutter clicks are disabled so duplicate captures cannot start.
-    val isClickable = when (nightPhase) {
-        NightSightCapturePhase.IDLE -> true
-        NightSightCapturePhase.CAPTURING -> true
-        NightSightCapturePhase.PROCESSING, NightSightCapturePhase.COMPLETED -> false
+    // Shutter is strictly disabled during PROCESSING and COMPLETED for multi-frame / video build modes.
+    // For Portrait mode with bounded queue capacity (allowConcurrentCapture == true), allow taking the next
+    // photo while the previous portrait finishes processing in the background.
+    // During CAPTURING:
+    //  - Night Sight: tap cancels capture
+    //  - Astrophotography: tap offers "Stop and save what I have"
+    //  - Time Lapse: tap stops recording and begins building video
+    val isClickable = when (phase) {
+        ShutterProgressPhase.IDLE -> true
+        ShutterProgressPhase.CAPTURING -> true
+        ShutterProgressPhase.PROCESSING -> effectiveProgress.allowConcurrentCapture
+        ShutterProgressPhase.COMPLETED -> effectiveProgress.mode == ShutterProgressMode.PORTRAIT
     }
     val effectiveOnClick: () -> Unit = {
-        if (isNightCapturing) {
-            onCancelNightSightCapture()
-        } else if (!isNightActive) {
-            onClick()
+        when {
+            isNightCapturing && shutterProgress.phase == ShutterProgressPhase.IDLE -> onCancelNightSightCapture()
+            isProgressCapturing -> onActiveProgressShutterClick()
+            isProgressProcessing && effectiveProgress.allowConcurrentCapture -> onClick()
+            isProgressCompleted && effectiveProgress.mode == ShutterProgressMode.PORTRAIT -> onClick()
+            !isProgressActive -> onClick()
         }
     }
-    val accessibilityLabel = when (nightPhase) {
-        NightSightCapturePhase.CAPTURING ->
-            "Capturing Night Sight frame ${nightSightProgress.currentFrame} of ${nightSightProgress.totalFrames}. Tap to cancel."
-        NightSightCapturePhase.PROCESSING ->
-            "Processing Night Sight photo ${(nightSightProgress.progress * 100f).roundToInt()} percent"
-        NightSightCapturePhase.COMPLETED -> "Night Sight photo saved"
-        NightSightCapturePhase.IDLE -> if (isVideoMode) {
+    val accessibilityLabel = when (phase) {
+        ShutterProgressPhase.CAPTURING -> when (effectiveProgress.mode) {
+            ShutterProgressMode.NIGHT_SIGHT ->
+                "Capturing Night Sight frame ${effectiveProgress.currentFrame} of ${effectiveProgress.totalFrames}. Tap to cancel."
+            ShutterProgressMode.ASTRO ->
+                "Capturing Astrophotography frame ${effectiveProgress.currentFrame} of ${effectiveProgress.totalFrames}. Tap to stop and save what you have."
+            ShutterProgressMode.TIME_LAPSE ->
+                "Recording Time Lapse, ${effectiveProgress.currentFrame} frames captured. Tap to stop recording."
+            ShutterProgressMode.PORTRAIT ->
+                "Capturing Portrait photo"
+        }
+        ShutterProgressPhase.PROCESSING -> {
+            val modeName = when (effectiveProgress.mode) {
+                ShutterProgressMode.NIGHT_SIGHT -> "Night Sight photo"
+                ShutterProgressMode.ASTRO -> "Astrophotography photo"
+                ShutterProgressMode.TIME_LAPSE -> "Time Lapse video"
+                ShutterProgressMode.PORTRAIT -> "Portrait photo"
+            }
+            val nextHint = if (effectiveProgress.allowConcurrentCapture) ". Tap to capture next photo." else ""
+            "Processing $modeName ${(effectiveProgress.progress * 100f).roundToInt()} percent$nextHint"
+        }
+        ShutterProgressPhase.COMPLETED -> "Capture saved"
+        ShutterProgressPhase.IDLE -> if (isVideoMode) {
             if (isRecording) "Stop recording" else "Start recording"
         } else {
             "Capture photo"
@@ -238,86 +537,57 @@ fun CameraShutterButton(
             .testTag("shutter_button"),
         contentAlignment = Alignment.Center
     ) {
-        // Outer circular progress ring for Night Sight phases
-        if (nightPhase != NightSightCapturePhase.IDLE) {
-            Canvas(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .testTag(
-                        when (nightPhase) {
-                            NightSightCapturePhase.CAPTURING -> "night_sight_shutter_capture_progress"
-                            NightSightCapturePhase.PROCESSING -> "night_sight_shutter_processing_ring"
-                            NightSightCapturePhase.COMPLETED -> "night_sight_shutter_completed"
-                            NightSightCapturePhase.IDLE -> "night_sight_shutter_idle"
-                        }
-                    )
-            ) {
-                val strokePx = 5.dp.toPx()
-                val inset = strokePx / 2f + 1.dp.toPx()
-                val arcSize = Size(size.width - inset * 2f, size.height - inset * 2f)
-                val topLeft = Offset(inset, inset)
-
-                // Background track
-                drawArc(
-                    color = trackRingColor,
-                    startAngle = 0f,
-                    sweepAngle = 360f,
-                    useCenter = false,
-                    topLeft = topLeft,
-                    size = arcSize,
-                    style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                )
-
-                when (nightPhase) {
-                    NightSightCapturePhase.CAPTURING -> {
-                        drawArc(
-                            color = captureRingColor,
-                            startAngle = -90f,
-                            sweepAngle = animatedCaptureSweep,
-                            useCenter = false,
-                            topLeft = topLeft,
-                            size = arcSize,
-                            style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                        )
-                    }
-                    NightSightCapturePhase.PROCESSING -> {
-                        // Clearly distinct spinning double-arc indicator so processing never looks frozen
-                        drawArc(
-                            color = processingRingColor,
-                            startAngle = processingSpinAngle,
-                            sweepAngle = 115f,
-                            useCenter = false,
-                            topLeft = topLeft,
-                            size = arcSize,
-                            style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                        )
-                        drawArc(
-                            color = captureRingColor.copy(alpha = 0.65f),
-                            startAngle = processingSpinAngle + 180f,
-                            sweepAngle = 70f,
-                            useCenter = false,
-                            topLeft = topLeft,
-                            size = arcSize,
-                            style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                        )
-                    }
-                    NightSightCapturePhase.COMPLETED -> {
-                        drawArc(
-                            color = completedRingColor,
-                            startAngle = -90f,
-                            sweepAngle = 360f,
-                            useCenter = false,
-                            topLeft = topLeft,
-                            size = arcSize,
-                            style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                        )
-                    }
-                    NightSightCapturePhase.IDLE -> Unit
-                }
-            }
-        }
+        // Shared outer circular progress ring across Night Sight, Astrophotography, and Time Lapse
+        ShutterProgressRing(
+            progressState = effectiveProgress,
+            processingSpinAngle = processingSpinAngle,
+            framePulseAlpha = framePulseAlpha
+        )
 
         when {
+            isTimeLapseCapturing -> {
+                // Time Lapse recording: unmistakable red Stop square inside the shared progress/pulse ring
+                Box(
+                    modifier = Modifier
+                        .size(animatedInnerSize)
+                        .clip(RoundedCornerShape(animatedCornerRadius))
+                        .background(animatedInnerColor)
+                        .testTag("timelapse_stop_button")
+                )
+            }
+            isAstroCapturing -> {
+                Box(
+                    modifier = Modifier
+                        .size(animatedInnerSize)
+                        .clip(CircleShape)
+                        .background(animatedInnerColor)
+                        .testTag("astro_capture_stop_button"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Stop,
+                            contentDescription = "Stop and save Astrophotography capture",
+                            tint = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        if (effectiveProgress.totalFrames > 0) {
+                            Text(
+                                text = "${effectiveProgress.currentFrame}/${effectiveProgress.totalFrames}",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                ),
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.testTag("astro_frame_progress_text")
+                            )
+                        }
+                    }
+                }
+            }
             isNightCapturing -> {
                 Box(
                     modifier = Modifier
@@ -337,9 +607,9 @@ fun CameraShutterButton(
                             tint = MaterialTheme.colorScheme.onSurface,
                             modifier = Modifier.size(20.dp)
                         )
-                        if (nightSightProgress.totalFrames > 0) {
+                        if (effectiveProgress.totalFrames > 0) {
                             Text(
-                                text = "${nightSightProgress.currentFrame}/${nightSightProgress.totalFrames}",
+                                text = "${effectiveProgress.currentFrame}/${effectiveProgress.totalFrames}",
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 10.sp
@@ -351,7 +621,7 @@ fun CameraShutterButton(
                     }
                 }
             }
-            isNightProcessing -> {
+            isProgressProcessing -> {
                 Box(
                     modifier = Modifier
                         .size(animatedInnerSize)
@@ -359,18 +629,24 @@ fun CameraShutterButton(
                         .background(animatedInnerColor),
                     contentAlignment = Alignment.Center
                 ) {
-                    val pct = (nightSightProgress.progress * 100f).roundToInt().coerceIn(0, 99)
+                    val pct = (effectiveProgress.progress * 100f).roundToInt().coerceIn(0, 99)
                     Text(
                         text = if (pct > 0) "$pct%" else "...",
                         style = MaterialTheme.typography.labelMedium.copy(
                             fontWeight = FontWeight.ExtraBold
                         ),
                         color = MaterialTheme.colorScheme.onTertiaryContainer,
-                        modifier = Modifier.testTag("night_sight_processing_pct_text")
+                        modifier = Modifier.testTag(
+                            if (effectiveProgress.mode == ShutterProgressMode.NIGHT_SIGHT) {
+                                "night_sight_processing_pct_text"
+                            } else {
+                                "shutter_processing_pct_text"
+                            }
+                        )
                     )
                 }
             }
-            isNightCompleted -> {
+            isProgressCompleted -> {
                 Box(
                     modifier = Modifier
                         .size(animatedInnerSize)
@@ -380,7 +656,7 @@ fun CameraShutterButton(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Check,
-                        contentDescription = "Night Sight complete",
+                        contentDescription = "Saved",
                         tint = MaterialTheme.colorScheme.onTertiary,
                         modifier = Modifier.size(30.dp)
                     )

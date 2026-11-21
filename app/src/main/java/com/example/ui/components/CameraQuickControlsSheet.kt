@@ -78,6 +78,7 @@ import com.example.core.preferences.PortraitRetouch
 import com.example.core.preferences.ProFocusMode
 import com.example.core.preferences.ProRawFormat
 import com.example.core.preferences.SlowMoSpeed
+import com.example.core.preferences.TimeLapseDurationLimit
 import com.example.core.preferences.TimeLapseSpeed
 import com.example.core.preferences.PanoramaDirection
 import com.example.core.preferences.TimerMode
@@ -106,6 +107,7 @@ fun CameraQuickControlsSheet(
     onPortraitBlurLevelChanged: (PortraitBlurLevel) -> Unit = {},
     onNightSightExposureChanged: (NightSightExposure) -> Unit = {},
     onTimeLapseSpeedChanged: (TimeLapseSpeed) -> Unit = {},
+    onTimeLapseDurationLimitChanged: (TimeLapseDurationLimit) -> Unit = {},
     onSlowMoSpeedChanged: (SlowMoSpeed) -> Unit = {},
     onPanoramaDirectionChanged: (PanoramaDirection) -> Unit = {},
     onProIsoChanged: (String) -> Unit = {},
@@ -444,13 +446,6 @@ fun CameraQuickControlsSheet(
                         aspectRatioMode = preferences.aspectRatioMode,
                         hdOutputOption = preferences.hdOutputOption
                     )
-                    val hdMaxCaptureSize = CaptureResolutionResolver.resolveActualCaptureSize(
-                        lensCaps = verifiedLensCaps,
-                        activeMode = CameraMode.HD,
-                        aspectRatioMode = preferences.aspectRatioMode,
-                        hdOutputOption = HdOutputOption.MAX_NATIVE
-                    )
-                    val hdMaxFormattedWithDims = CaptureResolutionResolver.formatMegapixelsWithDimensions(hdMaxCaptureSize)
 
                     // HD Output Option
                     QuickControlPillSection(
@@ -459,13 +454,7 @@ fun CameraQuickControlsSheet(
                         options = HdOutputOption.entries,
                         selectedOption = preferences.hdOutputOption,
                         optionLabel = { it.displayName },
-                        supportingNote = if (verifiedLensCaps?.isSensorFullResolutionRestricted == true) {
-                            if (hdMaxFormattedWithDims != null) {
-                                "This device doesn't expose full sensor resolution to apps. Max available: $hdMaxFormattedWithDims."
-                            } else {
-                                "This device doesn't expose full sensor resolution to apps."
-                            }
-                        } else null,
+                        supportingNote = verifiedLensCaps?.hdRestrictedResolutionNote,
                         onOptionSelected = onHdOptionChanged
                     )
 
@@ -498,13 +487,13 @@ fun CameraQuickControlsSheet(
                                     is CameraCapabilitiesState.Verified -> {
                                         val caps = capabilitiesState.currentLensCapabilities
                                         val formattedOutput = CaptureResolutionResolver.formatMegapixelsWithDimensions(hdActiveCaptureSize)
-                                        val sensorArrayMp = CaptureResolutionResolver.formatMegapixels(caps?.sensorPixelArraySize)
+                                        val restrictionNote = caps?.hdRestrictedResolutionNote
                                         if (formattedOutput != null) {
                                             when {
                                                 preferences.hdOutputOption == HdOutputOption.STANDARD_BINNED ->
                                                     "Target output: $formattedOutput standard binned capture."
-                                                caps?.isSensorFullResolutionRestricted == true && sensorArrayMp != null ->
-                                                    "Target output: $formattedOutput. This device doesn't expose full sensor resolution to apps ($sensorArrayMp sensor)."
+                                                restrictionNote != null ->
+                                                    "Target output: $formattedOutput. $restrictionNote"
                                                 else ->
                                                     "Target output: $formattedOutput native sensor capture."
                                             }
@@ -1024,6 +1013,21 @@ fun CameraQuickControlsSheet(
                         optionTestTag = { "time_lapse_quick_speed_${it.multiplier}x" },
                         supportingNote = timeLapseNote,
                         onOptionSelected = onTimeLapseSpeedChanged
+                    )
+
+                    // Optional Duration Limit (shows determinate ring progress when chosen)
+                    QuickControlPillSection(
+                        label = "Duration Limit",
+                        icon = Icons.Outlined.Timer,
+                        options = TimeLapseDurationLimit.entries,
+                        selectedOption = preferences.timeLapseDurationLimit,
+                        optionLabel = { it.displayName },
+                        optionTestTag = { "time_lapse_duration_${it.name.lowercase()}" },
+                        supportingNote = preferences.timeLapseDurationLimit.targetDurationSeconds?.let { targetSec ->
+                            val estOutSec = (targetSec / activeSpeed.multiplier.toLong().coerceAtLeast(1L)).coerceAtLeast(1L)
+                            "Auto-stops after ${preferences.timeLapseDurationLimit.displayName} (~${estOutSec}s output video)"
+                        } ?: "Records until you tap Stop, pulsing on each captured frame",
+                        onOptionSelected = onTimeLapseDurationLimitChanged
                     )
 
                     // Grid

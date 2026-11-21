@@ -31,7 +31,14 @@ import androidx.compose.ui.unit.dp
 import com.example.core.camera.CameraCapabilitiesRepository
 import com.example.core.camera.CameraLens
 import com.example.core.camera.DefaultCameraCapabilitiesRepository
+import com.example.core.camera.NightSightCapturePhase
 import com.example.core.camera.NightSightProgressState
+import com.example.core.camera.RecordingReadinessChecker
+import com.example.core.camera.RecordingReadinessWarning
+import com.example.core.camera.ShutterProgressMode
+import com.example.core.camera.ShutterProgressPhase
+import com.example.core.camera.ShutterProgressState
+import com.example.core.camera.toShutterProgressState
 import com.example.core.model.CameraMode
 import com.example.core.model.SystemDeviceInfo
 import com.example.core.preferences.CameraPreferences
@@ -52,9 +59,11 @@ import com.example.ui.components.CameraQuickControlsSheet
 import kotlinx.coroutines.launch
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -84,6 +93,7 @@ fun CameraFoundationScreen(
     var recordingDurationSeconds by remember { mutableLongStateOf(0L) }
     var photoCaptureTrigger by remember { mutableIntStateOf(0) }
     var lastCapturedPhotoUri by remember { mutableStateOf<Uri?>(null) }
+    var instantPreviewThumbnail by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var captureConfirmationTrigger by remember { mutableIntStateOf(0) }
     var showSavedBadge by remember { mutableStateOf(false) }
     var inAppViewerUri by remember { mutableStateOf<Uri?>(null) }
@@ -99,6 +109,11 @@ fun CameraFoundationScreen(
     var countdownRemainingSeconds by remember { mutableIntStateOf(0) }
     var nightSightProgress by remember { mutableStateOf(NightSightProgressState()) }
     var nightSightCancelTrigger by remember { mutableIntStateOf(0) }
+    var shutterProgress by remember { mutableStateOf(ShutterProgressState()) }
+    var astroStopAndSaveTrigger by remember { mutableIntStateOf(0) }
+    var astroDiscardTrigger by remember { mutableIntStateOf(0) }
+    var showAstroStopSaveDialog by remember { mutableStateOf(false) }
+    var pendingTimeLapseWarning by remember { mutableStateOf<RecordingReadinessWarning?>(null) }
     var panoramaLiveState by remember {
         mutableStateOf(PanoramaLiveState(direction = preferences.panoramaDirection))
     }
@@ -117,6 +132,29 @@ fun CameraFoundationScreen(
 
     val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+
+    // Keep screen awake during active multi-frame captures (Night Sight / Astrophotography) or video/time-lapse recording
+    val keepScreenAwake = isRecordingState || shutterProgress.isActive || nightSightProgress.isActive
+    androidx.compose.runtime.DisposableEffect(context, keepScreenAwake) {
+        val window = (context as? Activity)?.window
+        if (keepScreenAwake) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    // Dismiss Astro stop-and-save dialog automatically if capture naturally transitions to processing/idle
+    LaunchedEffect(shutterProgress.phase, shutterProgress.mode) {
+        if (showAstroStopSaveDialog &&
+            (shutterProgress.mode != ShutterProgressMode.ASTRO || shutterProgress.phase != ShutterProgressPhase.CAPTURING)
+        ) {
+            showAstroStopSaveDialog = false
+        }
+    }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
@@ -271,6 +309,22 @@ fun CameraFoundationScreen(
     LaunchedEffect(hardwareShutterTrigger) {
         if (hardwareShutterTrigger > 0) {
             when {
+                (shutterProgress.phase == ShutterProgressPhase.PROCESSING && !shutterProgress.allowConcurrentCapture) ||
+                    (shutterProgress.phase == ShutterProgressPhase.COMPLETED && shutterProgress.mode != ShutterProgressMode.PORTRAIT) -> {
+                    // Shutter disabled while multi-frame/video processing or full-queue saving
+                }
+                selectedMode == CameraMode.TIME_LAPSE -> {
+                    if (!isRecordingState) {
+                        val readiness = RecordingReadinessChecker.checkReadiness(context)
+                        if (readiness.hasWarning) {
+                            pendingTimeLapseWarning = readiness
+                        } else {
+                            isRecordingState = true
+                        }
+                    } else {
+                        isRecordingState = false
+                    }
+                }
                 selectedMode.isVideo -> {
                     isRecordingState = !isRecordingState
                     if (!isRecordingState) {
@@ -285,7 +339,9 @@ fun CameraFoundationScreen(
                     }
                 }
                 else -> {
-                    if (!nightSightProgress.isActive) {
+                    val allowPortraitNextShot = shutterProgress.mode == ShutterProgressMode.PORTRAIT &&
+                        (shutterProgress.allowConcurrentCapture || shutterProgress.phase == ShutterProgressPhase.COMPLETED)
+                    if (!nightSightProgress.isActive && (!shutterProgress.isActive || allowPortraitNextShot)) {
                         photoCaptureTrigger++
                     }
                 }
@@ -549,6 +605,7 @@ fun CameraFoundationScreen(
                 videoStabilization = preferences.videoStabilization,
                 slowMoSpeed = preferences.slowMoSpeed,
                 timeLapseSpeed = preferences.timeLapseSpeed,
+                timeLapseDurationLimit = preferences.timeLapseDurationLimit,
                 onTimeLapseSpeedChanged = { preferencesRepository.setTimeLapseSpeed(it) },
                 panoramaDirection = panoramaLiveState.direction,
                 onPanoramaDirectionChanged = { dir ->
@@ -639,7 +696,11 @@ fun CameraFoundationScreen(
                 },
                 onCaptureSuccess = { uri ->
                     lastCapturedPhotoUri = uri
+                    instantPreviewThumbnail = null
                     captureConfirmationTrigger++
+                },
+                onInstantPreviewThumbnail = { previewBmp ->
+                    instantPreviewThumbnail = previewBmp
                 },
                 onCaptureError = { errorMsg ->
                     coroutineScope.launch {
@@ -657,6 +718,7 @@ fun CameraFoundationScreen(
                 },
                 onRecordingSuccess = { uri ->
                     lastCapturedPhotoUri = uri
+                    captureConfirmationTrigger++
                 },
                 onRecordingError = { errorMsg ->
                     coroutineScope.launch {
@@ -671,6 +733,11 @@ fun CameraFoundationScreen(
                 nightSightCancelTrigger = nightSightCancelTrigger,
                 onNightSightProgressChanged = { updatedProgress ->
                     nightSightProgress = updatedProgress
+                },
+                astroStopAndSaveTrigger = astroStopAndSaveTrigger,
+                astroDiscardTrigger = astroDiscardTrigger,
+                onShutterProgressChanged = { updatedShutterProgress ->
+                    shutterProgress = updatedShutterProgress
                 },
                 onCountdownStateChanged = { counting, remaining ->
                     isCountingDown = counting
@@ -765,6 +832,15 @@ fun CameraFoundationScreen(
                         if (selectedMode == CameraMode.NIGHT_SIGHT && mode != CameraMode.NIGHT_SIGHT && nightSightProgress.isActive) {
                             nightSightCancelTrigger++
                         }
+                        if (selectedMode == CameraMode.ASTRO && mode != CameraMode.ASTRO &&
+                            shutterProgress.mode == ShutterProgressMode.ASTRO &&
+                            shutterProgress.phase == ShutterProgressPhase.CAPTURING
+                        ) {
+                            astroStopAndSaveTrigger++
+                        }
+                        if (selectedMode == CameraMode.TIME_LAPSE && mode != CameraMode.TIME_LAPSE && isRecordingState) {
+                            isRecordingState = false
+                        }
                         selectedMode = mode
                     },
                     onMoreClick = {
@@ -773,6 +849,19 @@ fun CameraFoundationScreen(
                 )
 
                 Spacer(modifier = Modifier.height(4.dp))
+
+                val activeShutterProgress = when {
+                    shutterProgress.phase != ShutterProgressPhase.IDLE &&
+                        ((shutterProgress.mode == ShutterProgressMode.NIGHT_SIGHT && selectedMode == CameraMode.NIGHT_SIGHT) ||
+                            (shutterProgress.mode == ShutterProgressMode.ASTRO && selectedMode == CameraMode.ASTRO) ||
+                            (shutterProgress.mode == ShutterProgressMode.TIME_LAPSE && selectedMode == CameraMode.TIME_LAPSE) ||
+                            (shutterProgress.mode == ShutterProgressMode.PORTRAIT && selectedMode == CameraMode.PORTRAIT) ||
+                            shutterProgress.phase == ShutterProgressPhase.PROCESSING ||
+                            shutterProgress.phase == ShutterProgressPhase.COMPLETED) -> shutterProgress
+                    selectedMode == CameraMode.NIGHT_SIGHT && nightSightProgress.phase != NightSightCapturePhase.IDLE ->
+                        nightSightProgress.toShutterProgressState()
+                    else -> ShutterProgressState()
+                }
 
                 CameraShutterBar(
                     activeMode = selectedMode,
@@ -783,14 +872,67 @@ fun CameraFoundationScreen(
                     },
                     isCountingDown = isCountingDown,
                     countdownSeconds = countdownRemainingSeconds,
+                    shutterProgress = activeShutterProgress,
+                    onActiveProgressShutterClick = {
+                        when (activeShutterProgress.mode) {
+                            ShutterProgressMode.NIGHT_SIGHT -> {
+                                if (activeShutterProgress.phase == ShutterProgressPhase.CAPTURING) {
+                                    nightSightCancelTrigger++
+                                }
+                            }
+                            ShutterProgressMode.ASTRO -> {
+                                if (activeShutterProgress.phase == ShutterProgressPhase.CAPTURING) {
+                                    if (activeShutterProgress.canStopAndSave) {
+                                        showAstroStopSaveDialog = true
+                                    } else {
+                                        astroDiscardTrigger++
+                                    }
+                                }
+                            }
+                            ShutterProgressMode.TIME_LAPSE -> {
+                                if (activeShutterProgress.phase == ShutterProgressPhase.CAPTURING && isRecordingState) {
+                                    isRecordingState = false
+                                }
+                            }
+                            ShutterProgressMode.PORTRAIT -> {
+                                // Portrait single-shot concurrent capture routes through onShutterClick
+                            }
+                        }
+                    },
+                    onStopAndSaveCapture = {
+                        if (activeShutterProgress.mode == ShutterProgressMode.ASTRO &&
+                            activeShutterProgress.phase == ShutterProgressPhase.CAPTURING &&
+                            activeShutterProgress.canStopAndSave
+                        ) {
+                            showAstroStopSaveDialog = true
+                        }
+                    },
                     nightSightProgress = if (selectedMode == CameraMode.NIGHT_SIGHT) nightSightProgress else NightSightProgressState(),
                     onCancelNightSightCapture = {
                         nightSightCancelTrigger++
                     },
                     lastCapturedPhotoUri = lastCapturedPhotoUri,
+                    instantPreviewBitmap = instantPreviewThumbnail,
                     captureConfirmationTrigger = captureConfirmationTrigger,
                     onShutterClick = {
+                        val canCaptureNextPortrait = activeShutterProgress.mode == ShutterProgressMode.PORTRAIT &&
+                            (activeShutterProgress.allowConcurrentCapture || activeShutterProgress.phase == ShutterProgressPhase.COMPLETED)
                         when {
+                            (activeShutterProgress.isActive || activeShutterProgress.phase == ShutterProgressPhase.COMPLETED) && !canCaptureNextPortrait -> {
+                                // Shutter is disabled while capturing/processing/saving; active-phase taps route through onActiveProgressShutterClick
+                            }
+                            selectedMode == CameraMode.TIME_LAPSE -> {
+                                if (!isRecordingState) {
+                                    val readiness = RecordingReadinessChecker.checkReadiness(context)
+                                    if (readiness.hasWarning) {
+                                        pendingTimeLapseWarning = readiness
+                                    } else {
+                                        isRecordingState = true
+                                    }
+                                } else {
+                                    isRecordingState = false
+                                }
+                            }
                             selectedMode.isVideo -> {
                                 if (!isRecordingState && !hasAudioPermission) {
                                     audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
@@ -805,9 +947,6 @@ fun CameraFoundationScreen(
                                         // Ignore duplicate taps while panorama stitching is in flight
                                     }
                                 }
-                            }
-                            selectedMode == CameraMode.NIGHT_SIGHT && nightSightProgress.isActive -> {
-                                // Shutter is disabled while capturing/processing; cancellation uses onCancelNightSightCapture
                             }
                             else -> {
                                 // Photo, Portrait, Night Sight, HD, Pro, Astro modes execute real image capture
@@ -892,6 +1031,7 @@ fun CameraFoundationScreen(
             onPortraitBlurLevelChanged = { preferencesRepository.setPortraitBlurLevel(it) },
             onNightSightExposureChanged = { preferencesRepository.setNightSightExposure(it) },
             onTimeLapseSpeedChanged = { preferencesRepository.setTimeLapseSpeed(it) },
+            onTimeLapseDurationLimitChanged = { preferencesRepository.setTimeLapseDurationLimit(it) },
             onSlowMoSpeedChanged = { preferencesRepository.setSlowMoSpeed(it) },
             onPanoramaDirectionChanged = { dir ->
                 updatePanoramaDirectionWhileIdle(dir)
@@ -911,6 +1051,80 @@ fun CameraFoundationScreen(
             onOpenFullSettings = onNavigateToSettings,
             onDismissRequest = { showQuickControlsSheet = false },
             sheetState = sheetState
+        )
+    }
+
+    // Astrophotography "Stop and save what I have" confirmation dialog
+    if (showAstroStopSaveDialog &&
+        shutterProgress.mode == ShutterProgressMode.ASTRO &&
+        shutterProgress.phase == ShutterProgressPhase.CAPTURING
+    ) {
+        val capturedSoFar = shutterProgress.currentFrame.coerceAtLeast(1)
+        val frameWord = if (capturedSoFar == 1) "frame" else "frames"
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showAstroStopSaveDialog = false },
+            modifier = Modifier.testTag("astro_stop_save_dialog"),
+            title = {
+                androidx.compose.material3.Text(text = "Stop Astrophotography?")
+            },
+            text = {
+                androidx.compose.material3.Text(
+                    text = "Stop capturing now and stack the $capturedSoFar $frameWord captured so far, so this session isn't lost?"
+                )
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        showAstroStopSaveDialog = false
+                        astroStopAndSaveTrigger++
+                    },
+                    modifier = Modifier.testTag("astro_stop_and_save_confirm_button")
+                ) {
+                    androidx.compose.material3.Text("Stop and save what I have")
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { showAstroStopSaveDialog = false },
+                    modifier = Modifier.testTag("astro_keep_capturing_button")
+                ) {
+                    androidx.compose.material3.Text("Keep capturing")
+                }
+            }
+        )
+    }
+
+    // Time Lapse low storage / low battery readiness warning dialog
+    val readinessWarning = pendingTimeLapseWarning
+    if (readinessWarning != null) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { pendingTimeLapseWarning = null },
+            modifier = Modifier.testTag("timelapse_readiness_warning_dialog"),
+            title = {
+                androidx.compose.material3.Text(text = readinessWarning.buildWarningTitle())
+            },
+            text = {
+                androidx.compose.material3.Text(text = readinessWarning.buildWarningMessage())
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        pendingTimeLapseWarning = null
+                        isRecordingState = true
+                    },
+                    modifier = Modifier.testTag("timelapse_start_anyway_button")
+                ) {
+                    androidx.compose.material3.Text("Start anyway")
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { pendingTimeLapseWarning = null },
+                    modifier = Modifier.testTag("timelapse_warning_cancel_button")
+                ) {
+                    androidx.compose.material3.Text("Cancel")
+                }
+            }
         )
     }
 
