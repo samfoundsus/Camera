@@ -6,11 +6,17 @@ import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.Environment
 import android.os.StatFs
+import com.example.core.model.CameraMode
 import java.util.Locale
 
 /**
- * Unified lifecycle phases for the shared shutter progress component used by
- * Night Sight, Astrophotography, and Time Lapse modes.
+ * Threshold below which fast single-frame captures (such as standard Photo or Pro JPEG) do not
+ * flash the shutter progress ring, keeping instant actions crisp and distraction-free.
+ */
+const val SHUTTER_PROGRESS_SHOW_DELAY_MS: Long = 180L
+
+/**
+ * Unified lifecycle phases for the shared shutter progress component used across all camera modes.
  */
 enum class ShutterProgressPhase {
     IDLE,
@@ -20,18 +26,52 @@ enum class ShutterProgressPhase {
 }
 
 /**
- * Camera modes that drive the shared shutter progress ring and status banner.
+ * Every camera mode that can drive the unified shutter progress ring and status banner.
  */
 enum class ShutterProgressMode {
+    PHOTO,
+    HD,
+    PORTRAIT,
     NIGHT_SIGHT,
     ASTRO,
+    PRO,
+    PANORAMA,
     TIME_LAPSE,
-    PORTRAIT
+    VIDEO,
+    SLOW_MOTION;
+
+    /**
+     * Modes that record continuously with a red stop-square shutter affordance while active.
+     */
+    val isVideoLikeRecording: Boolean
+        get() = this == VIDEO || this == SLOW_MOTION || this == TIME_LAPSE
+
+    /**
+     * Still-photo modes that support background save queuing so the user can take the next shot
+     * while the previous one finishes processing/saving (up to the bounded queue capacity).
+     */
+    val supportsConcurrentPhotoQueue: Boolean
+        get() = this == PHOTO || this == HD || this == PORTRAIT || this == PRO
 }
 
 /**
- * Shared UI progress state consumed by the unified shutter progress component across
- * Night Sight, Astrophotography, Time Lapse, and Portrait modes.
+ * Maps a [CameraMode] to its corresponding [ShutterProgressMode].
+ */
+fun CameraMode.toShutterProgressMode(): ShutterProgressMode = when (this) {
+    CameraMode.PHOTO -> ShutterProgressMode.PHOTO
+    CameraMode.HD -> ShutterProgressMode.HD
+    CameraMode.PORTRAIT -> ShutterProgressMode.PORTRAIT
+    CameraMode.NIGHT_SIGHT -> ShutterProgressMode.NIGHT_SIGHT
+    CameraMode.ASTRO -> ShutterProgressMode.ASTRO
+    CameraMode.PRO -> ShutterProgressMode.PRO
+    CameraMode.PANORAMA -> ShutterProgressMode.PANORAMA
+    CameraMode.TIME_LAPSE -> ShutterProgressMode.TIME_LAPSE
+    CameraMode.VIDEO -> ShutterProgressMode.VIDEO
+    CameraMode.SLOW_MOTION -> ShutterProgressMode.SLOW_MOTION
+}
+
+/**
+ * Shared UI progress state consumed by the unified shutter progress component across all modes.
  */
 data class ShutterProgressState(
     val mode: ShutterProgressMode = ShutterProgressMode.NIGHT_SIGHT,
@@ -146,6 +186,39 @@ fun formatTimeLapseCaptureCaption(
         "$framesCaptured $framesWord"
     }
     return "$timePart • $framePart"
+}
+
+/**
+ * Builds the concise status caption displayed near the shutter during Video or Slow Motion recording.
+ */
+fun formatVideoRecordingCaption(
+    elapsedSeconds: Long,
+    isSlowMotion: Boolean = false,
+    fpsLabel: String? = null
+): String {
+    val prefix = if (isSlowMotion) "Slow-Mo" else "REC"
+    val timeText = formatShutterElapsedTime(elapsedSeconds)
+    return if (!fpsLabel.isNullOrBlank()) {
+        "$prefix • $timeText · $fpsLabel"
+    } else {
+        "$prefix • $timeText"
+    }
+}
+
+/**
+ * Builds the concise status caption displayed near the shutter during Panorama sweep capture.
+ */
+fun formatPanoramaProgressCaption(
+    progressFraction: Float,
+    framesCaptured: Int
+): String {
+    val pct = (progressFraction.coerceIn(0f, 1f) * 100f).toInt()
+    val framesWord = if (framesCaptured == 1) "frame" else "frames"
+    return if (framesCaptured > 0) {
+        "Panorama $pct% • $framesCaptured $framesWord"
+    } else {
+        "Sweep slowly • $pct%"
+    }
 }
 
 /**

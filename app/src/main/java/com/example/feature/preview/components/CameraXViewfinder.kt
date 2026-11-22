@@ -23,12 +23,14 @@ import android.graphics.BitmapFactory
 import androidx.camera.core.ImageProxy
 import com.example.core.processing.AspectCropUtils
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalZeroShutterLag
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.UseCaseGroup
 import com.example.core.preferences.SlowMoSpeed
 import com.example.core.preferences.TimeLapseDurationLimit
 import com.example.core.preferences.TimeLapseSpeed
@@ -39,6 +41,8 @@ import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.IntSize
 import com.example.core.processing.FocusPeakingFrame
+import com.example.core.processing.GlFilterSurfaceProcessor
+import com.example.core.processing.GpuCameraFilterEngine
 import com.example.core.processing.LiveHistogramData
 import com.example.core.processing.PanoramaCapturePhase
 import com.example.core.processing.PanoramaGuidanceStatus
@@ -67,6 +71,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -82,10 +87,12 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.core.camera.CameraLens
+import com.example.core.camera.FilterDebugTracker
 import com.example.core.camera.LensCapabilities
 import com.example.core.camera.LensFacing
 import com.example.core.camera.ManualSensorCapabilities
 import com.example.core.camera.PhotoOutputSize
+import com.example.core.camera.SHUTTER_PROGRESS_SHOW_DELAY_MS
 import com.example.core.camera.ShutterProgressMode
 import com.example.core.camera.ShutterProgressPhase
 import com.example.core.camera.ShutterProgressState
@@ -93,8 +100,11 @@ import com.example.core.camera.TimeLapseRecordingService
 import com.example.core.camera.VideoFrameRate
 import com.example.core.camera.VideoResolution
 import com.example.core.camera.formatAstroCaptureCaption
+import com.example.core.camera.formatPanoramaProgressCaption
 import com.example.core.camera.formatShutterElapsedTime
 import com.example.core.camera.formatTimeLapseCaptureCaption
+import com.example.core.camera.formatVideoRecordingCaption
+import com.example.core.camera.toShutterProgressMode
 import com.example.core.camera.toShutterProgressState
 import com.example.core.preferences.FlashMode
 import com.example.core.preferences.HdOutputOption
@@ -102,7 +112,12 @@ import com.example.core.preferences.AstroDuration
 import com.example.core.preferences.AstroFocusMode
 import com.example.core.preferences.AstroStrategy
 import com.example.core.processing.AstroStreamingAccumulator
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -258,7 +273,9 @@ private data class BoundPipelineConfig(
     val captureMode: Int = ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY,
     val aspectRatioMode: AspectRatioMode = AspectRatioMode.RATIO_4_3,
     val hdOutputOption: HdOutputOption = HdOutputOption.MAX_NATIVE,
-    val preferHighQualityIsp: Boolean = false
+    val preferHighQualityIsp: Boolean = false,
+    val glFilterEffectTargets: Int = 0,
+    val previewImplMode: PreviewView.ImplementationMode = PreviewView.ImplementationMode.PERFORMANCE
 )
 
 /**
@@ -502,15 +519,17 @@ fun CameraXViewfinder(
     val companionCaptureExecutor = remember { Executors.newSingleThreadExecutor() }
     val photoSaveQueue = remember { com.example.core.camera.BoundedPhotoSaveQueue(com.example.core.camera.BoundedPhotoSaveQueue.DEFAULT_MAX_IN_FLIGHT) }
     val portraitJobsInFlight = remember { java.util.concurrent.atomic.AtomicInteger(0) }
+    val stillJobsInFlight = remember { java.util.concurrent.atomic.AtomicInteger(0) }
     val panoramaKeyframes = remember { java.util.Collections.synchronizedList(mutableListOf<android.graphics.Bitmap>()) }
     val isPanoramaProcessingInFlight = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     var autoFinishSweepCounter by remember { mutableIntStateOf(0) }
 
-    // Preload and warm up the Portrait segmentation model as soon as the user opens Portrait mode
-    // so the very first Portrait shutter press does not incur cold model loading latency.
+    // Preload and warm up heavy mode resources on background threads so first capture/panel open is instant.
     LaunchedEffect(activeMode) {
-        if (activeMode == CameraMode.PORTRAIT) {
-            PortraitProcessor.warmUpSegmentationModelAsync()
+        when (activeMode) {
+            CameraMode.PORTRAIT -> PortraitProcessor.warmUpSegmentationModelAsync()
+            CameraMode.PHOTO, CameraMode.VIDEO -> GpuCameraFilterEngine.warmUpAsync()
+            else -> Unit
         }
     }
 
@@ -556,6 +575,18 @@ fun CameraXViewfinder(
                                 isCaptureLagging = lagging
                             )
                         )
+                        latestOnShutterProgressChanged?.invoke(
+                            ShutterProgressState(
+                                mode = ShutterProgressMode.PANORAMA,
+                                phase = ShutterProgressPhase.CAPTURING,
+                                currentFrame = effectiveCount,
+                                totalFrames = PanoramaProcessor.DEFAULT_TARGET_FRAMES,
+                                progress = progress.coerceIn(0f, 1f),
+                                statusLabel = "${(progress.coerceIn(0f, 1f) * 100f).toInt()}%",
+                                detailLabel = formatPanoramaProgressCaption(progress, effectiveCount),
+                                canStopAndSave = effectiveCount >= PanoramaProcessor.MIN_REQUIRED_FRAMES
+                            )
+                        )
                     }
                 }
             },
@@ -582,17 +613,16 @@ fun CameraXViewfinder(
         }
     }
 
-    var currentPeakingFrame by remember { mutableStateOf<FocusPeakingFrame?>(null) }
-    var currentHistogramData by remember { mutableStateOf<LiveHistogramData?>(null) }
+    // Isolated state holder so 30 fps Focus Peaking ticks recompose only FocusPeakingOverlay, never CameraXViewfinder.
+    val currentPeakingFrameState = remember { mutableStateOf<FocusPeakingFrame?>(null) }
 
     val proAnalyzer = remember {
         ProImageAnalyzer(
             onHistogramComputed = { hist ->
-                currentHistogramData = hist
                 onHistogramUpdated?.invoke(hist)
             },
             onFocusPeakingComputed = { peaking ->
-                currentPeakingFrame = peaking
+                currentPeakingFrameState.value = peaking
                 onFocusPeakingUpdated?.invoke(peaking)
             }
         )
@@ -611,11 +641,10 @@ fun CameraXViewfinder(
         proAnalyzer.isFrontCamera = activeLens.facing == LensFacing.FRONT
         proAnalyzer.isSelfieMirrorEnabled = isSelfieMirrorEnabled
         if (!isPro || !proFocusPeakingEnabled) {
-            currentPeakingFrame = null
+            currentPeakingFrameState.value = null
             onFocusPeakingUpdated?.invoke(null)
         }
         if (!isPro || !proHistogramEnabled) {
-            currentHistogramData = null
             onHistogramUpdated?.invoke(null)
         }
     }
@@ -636,11 +665,32 @@ fun CameraXViewfinder(
         }
     }
 
+    // Real-time GPU OpenGL ES 2.0 SurfaceProcessor shared across Photo preview and Video preview + recording.
+    val glFilterProcessor = remember { GlFilterSurfaceProcessor() }
+    var isGlPreviewEffectBound by remember { mutableStateOf(false) }
+    var isGlVideoEffectBound by remember { mutableStateOf(false) }
+
+    DisposableEffect(glFilterProcessor) {
+        onDispose {
+            glFilterProcessor.release()
+        }
+    }
+
     val effectivePreviewFilter = com.example.core.processing.CameraFilterProcessor.resolveEffectiveFilter(activeMode, selectedFilter)
 
-    LaunchedEffect(effectivePreviewFilter) {
-        val colorFilter = com.example.core.processing.CameraFilterProcessor.createColorMatrixColorFilter(effectivePreviewFilter)
-        val desiredImplMode = if (colorFilter != null) {
+    LaunchedEffect(
+        effectivePreviewFilter,
+        activeMode,
+        selectedFilter,
+        isGlPreviewEffectBound,
+        isDirectCamera2RecordingActive
+    ) {
+        // Instant 0 ms GPU shader uniform update (zero camera rebind when switching filters!)
+        glFilterProcessor.activePreset = effectivePreviewFilter
+
+        val glActiveOnPreview = isGlPreviewEffectBound && !isDirectCamera2RecordingActive
+        val needsTextureViewFallback = !glActiveOnPreview && !effectivePreviewFilter.isOriginal
+        val desiredImplMode = if (needsTextureViewFallback) {
             PreviewView.ImplementationMode.COMPATIBLE
         } else {
             PreviewView.ImplementationMode.PERFORMANCE
@@ -649,26 +699,22 @@ fun CameraXViewfinder(
         if (implModeChanged) {
             previewView.implementationMode = desiredImplMode
         }
-        if (colorFilter == null) {
-            if (previewView.layerType != android.view.View.LAYER_TYPE_NONE) {
-                previewView.setLayerType(android.view.View.LAYER_TYPE_NONE, null)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                previewView.setRenderEffect(null)
-            }
-        } else {
-            val layerPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                this.colorFilter = colorFilter
-            }
-            previewView.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, layerPaint)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                previewView.setRenderEffect(
-                    android.graphics.RenderEffect.createColorFilterEffect(colorFilter)
-                )
-            }
-            previewView.invalidate()
-        }
-        if (implModeChanged && activeCamera != null) {
+
+        val backendUsed = GpuCameraFilterEngine.applyFilterToPreviewViewFallback(
+            previewView = previewView,
+            camera2TextureView = camera2PreviewTextureView,
+            preset = effectivePreviewFilter,
+            glProcessorActiveOnPreview = glActiveOnPreview
+        )
+        FilterDebugTracker.recordPreviewFilter(
+            mode = activeMode,
+            selectedFilter = selectedFilter,
+            effectiveFilter = effectivePreviewFilter,
+            wasAppliedToPreview = !effectivePreviewFilter.isOriginal,
+            backend = backendUsed
+        )
+
+        if (implModeChanged && activeCamera != null && !isDirectCamera2RecordingActive && activeRecording == null) {
             rebindTrigger++
         }
     }
@@ -777,144 +823,186 @@ fun CameraXViewfinder(
             activeRecording = null
         }
 
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-        cameraProviderFuture.addListener({
-            try {
-                val cameraProvider = cameraProviderFuture.get()
-
-                val cameraSelector = if (activeLens.facing == LensFacing.FRONT) {
-                    CameraSelector.DEFAULT_FRONT_CAMERA
-                } else {
-                    CameraSelector.DEFAULT_BACK_CAMERA
-                }
-
-                if (!cameraProvider.hasCamera(cameraSelector)) {
-                    Log.w(TAG, "Selected camera facing not available on device: ${activeLens.facing}")
-                    onCameraError?.invoke("Camera lens ${activeLens.displayName} unavailable on this device.")
-                    return@addListener
-                }
-
-                // Discover real capabilities across both rear and front cameras using Camera2 + CameraX Codec VideoCapabilities + Extensions
-                val discoveredCapabilities = if (cachedCapabilities.isNotEmpty() && hasQueriedWithCameraProvider) {
-                    cachedCapabilities
-                } else {
-                    val queried = queryDeviceCameraCapabilities(context, cameraProvider)
-                    if (queried.isNotEmpty()) {
-                        cachedCapabilities = queried
-                        hasQueriedWithCameraProvider = true
-                        onCapabilitiesDiscovered?.invoke(queried)
-                    }
-                    queried.ifEmpty { cachedCapabilities }
-                }
-
-                val activeLensCaps = discoveredCapabilities[activeLens]
-                val reconciled = activeLensCaps?.reconcileVideoSettings(
-                    requestedResolution = videoResolution,
-                    requestedFrameRate = videoFrameRate,
-                    requestedStabilization = videoStabilization,
-                    requestedFlashMode = flashMode
-                ) ?: ReconciledVideoSettings(
-                    resolution = videoResolution,
-                    frameRate = videoFrameRate,
-                    stabilization = videoStabilization,
-                    flashMode = flashMode
+        try {
+            val cameraProvider = suspendCancellableCoroutine<ProcessCameraProvider> { cont ->
+                val future = ProcessCameraProvider.getInstance(context)
+                future.addListener(
+                    {
+                        try {
+                            if (cont.isActive) cont.resume(future.get())
+                        } catch (e: Exception) {
+                            if (cont.isActive) cont.resumeWithException(e)
+                        }
+                    },
+                    ContextCompat.getMainExecutor(context)
                 )
+            }
 
-                // Notify caller if any setting had to fall back to a valid supported option
-                if (reconciled.resolution != videoResolution ||
-                    reconciled.frameRate != videoFrameRate ||
-                    reconciled.stabilization != videoStabilization ||
-                    reconciled.flashMode != flashMode
-                ) {
-                    onVideoConfigApplied?.invoke(reconciled)
+            val cameraSelector = if (activeLens.facing == LensFacing.FRONT) {
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            } else {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            }
+
+            if (!cameraProvider.hasCamera(cameraSelector)) {
+                Log.w(TAG, "Selected camera facing not available on device: ${activeLens.facing}")
+                onCameraError?.invoke("Camera lens ${activeLens.displayName} unavailable on this device.")
+                return@LaunchedEffect
+            }
+
+            // Discover real capabilities off the main thread using Camera2 + CameraX Codec VideoCapabilities + Extensions
+            val discoveredCapabilities = if (cachedCapabilities.isNotEmpty() && hasQueriedWithCameraProvider) {
+                cachedCapabilities
+            } else {
+                val queried = withContext(Dispatchers.IO) {
+                    queryDeviceCameraCapabilities(context, cameraProvider)
                 }
-
-                val slowMoTargetFrameRate = VideoFrameRate.entries.firstOrNull {
-                    it.fps == slowMoSpeed.expectedFps
-                } ?: VideoFrameRate.FPS_120
-                val effectiveSlowMoResolution = activeLensCaps?.resolveSlowMoResolution(
-                    rate = slowMoTargetFrameRate,
-                    preferred = reconciled.resolution
-                ) ?: VideoResolution.FHD_1080P
-
-                val desiredExtensionMode = if (activeMode.isVideo) {
-                    androidx.camera.extensions.ExtensionMode.NONE
-                } else {
-                    com.example.core.camera.CameraExtensionsHelper.resolveDesiredExtensionMode(
-                        availability = activeLensCaps?.extensionAvailability ?: com.example.core.camera.CameraExtensionAvailability(),
-                        activeMode = activeMode,
-                        hdrMode = hdrMode,
-                        portraitRetouch = portraitRetouch,
-                        portraitBlurLevel = portraitBlurLevel,
-                        nightSightExposure = nightSightExposure,
-                        photoCaptureSpeedMode = photoCaptureSpeedMode
-                    )
+                if (queried.isNotEmpty()) {
+                    cachedCapabilities = queried
+                    hasQueriedWithCameraProvider = true
+                    onCapabilitiesDiscovered?.invoke(queried)
                 }
-                val resolvedStillCaptureMode = com.example.core.camera.CameraCaptureQualityPolicy.resolveCameraXCaptureMode(
+                queried.ifEmpty { cachedCapabilities }
+            }
+
+            val activeLensCaps = discoveredCapabilities[activeLens]
+            val reconciled = activeLensCaps?.reconcileVideoSettings(
+                requestedResolution = videoResolution,
+                requestedFrameRate = videoFrameRate,
+                requestedStabilization = videoStabilization,
+                requestedFlashMode = flashMode
+            ) ?: ReconciledVideoSettings(
+                resolution = videoResolution,
+                frameRate = videoFrameRate,
+                stabilization = videoStabilization,
+                flashMode = flashMode
+            )
+
+            // Notify caller if any setting had to fall back to a valid supported option
+            if (reconciled.resolution != videoResolution ||
+                reconciled.frameRate != videoFrameRate ||
+                reconciled.stabilization != videoStabilization ||
+                reconciled.flashMode != flashMode
+            ) {
+                onVideoConfigApplied?.invoke(reconciled)
+            }
+
+            val slowMoTargetFrameRate = VideoFrameRate.entries.firstOrNull {
+                it.fps == slowMoSpeed.expectedFps
+            } ?: VideoFrameRate.FPS_120
+            val effectiveSlowMoResolution = activeLensCaps?.resolveSlowMoResolution(
+                rate = slowMoTargetFrameRate,
+                preferred = reconciled.resolution
+            ) ?: VideoResolution.FHD_1080P
+
+            val desiredExtensionMode = if (activeMode.isVideo) {
+                androidx.camera.extensions.ExtensionMode.NONE
+            } else {
+                com.example.core.camera.CameraExtensionsHelper.resolveDesiredExtensionMode(
+                    availability = activeLensCaps?.extensionAvailability ?: com.example.core.camera.CameraExtensionAvailability(),
                     activeMode = activeMode,
-                    photoCaptureSpeedMode = photoCaptureSpeedMode,
-                    isZslSupported = activeLensCaps?.ispQualityCapabilities?.isZslSupported == true,
-                    activeExtensionMode = desiredExtensionMode,
-                    flashMode = flashMode
-                )
-                val preferHighQualityIsp = com.example.core.camera.CameraCaptureQualityPolicy.shouldUseHighQualityIspForStillCapture(
-                    activeMode = activeMode,
+                    hdrMode = hdrMode,
+                    portraitRetouch = portraitRetouch,
+                    portraitBlurLevel = portraitBlurLevel,
+                    nightSightExposure = nightSightExposure,
                     photoCaptureSpeedMode = photoCaptureSpeedMode
                 )
+            }
+            val resolvedStillCaptureMode = com.example.core.camera.CameraCaptureQualityPolicy.resolveCameraXCaptureMode(
+                activeMode = activeMode,
+                photoCaptureSpeedMode = photoCaptureSpeedMode,
+                isZslSupported = activeLensCaps?.ispQualityCapabilities?.isZslSupported == true,
+                activeExtensionMode = desiredExtensionMode,
+                flashMode = flashMode
+            )
+            val preferHighQualityIsp = com.example.core.camera.CameraCaptureQualityPolicy.shouldUseHighQualityIspForStillCapture(
+                activeMode = activeMode,
+                photoCaptureSpeedMode = photoCaptureSpeedMode
+            )
+            val desiredGlEffectTargets = when (activeMode) {
+                CameraMode.VIDEO -> CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE
+                CameraMode.PHOTO -> CameraEffect.PREVIEW
+                else -> 0
+            }
 
-                val desiredBindConfig = if (activeMode.isVideo) {
-                    val isSlowMo = activeMode == CameraMode.SLOW_MOTION
-                    val isTimeLapse = activeMode == CameraMode.TIME_LAPSE
-                    BoundPipelineConfig(
-                        lens = activeLens,
-                        isVideoMode = true,
-                        isSlowMotionMode = isSlowMo,
-                        slowMoSpeed = if (isSlowMo) slowMoSpeed else SlowMoSpeed.SPEED_1_4X,
-                        isTimeLapseMode = isTimeLapse,
-                        timeLapseSpeed = if (isTimeLapse) timeLapseSpeed else TimeLapseSpeed.SPEED_30X,
-                        isProMode = false,
-                        resolution = if (isSlowMo) effectiveSlowMoResolution else reconciled.resolution,
-                        frameRate = if (isSlowMo) slowMoTargetFrameRate else if (isTimeLapse) VideoFrameRate.FPS_30 else reconciled.frameRate,
-                        stabilization = if (isSlowMo) VideoStabilizationMode.OFF else reconciled.stabilization,
-                        activeExtensionMode = androidx.camera.extensions.ExtensionMode.NONE,
-                        captureMode = ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
-                    )
-                } else {
-                    BoundPipelineConfig(
-                        lens = activeLens,
-                        isVideoMode = false,
-                        isSlowMotionMode = false,
-                        isProMode = activeMode == CameraMode.PRO,
-                        isPanoramaMode = activeMode == CameraMode.PANORAMA,
-                        resolution = VideoResolution.FHD_1080P,
-                        frameRate = VideoFrameRate.FPS_30,
-                        stabilization = VideoStabilizationMode.OFF,
-                        activeExtensionMode = desiredExtensionMode,
-                        captureMode = resolvedStillCaptureMode,
-                        aspectRatioMode = aspectRatioMode,
-                        hdOutputOption = hdOutputOption,
-                        preferHighQualityIsp = preferHighQualityIsp
+            val desiredBindConfig = if (activeMode.isVideo) {
+                val isSlowMo = activeMode == CameraMode.SLOW_MOTION
+                val isTimeLapse = activeMode == CameraMode.TIME_LAPSE
+                BoundPipelineConfig(
+                    lens = activeLens,
+                    isVideoMode = true,
+                    isSlowMotionMode = isSlowMo,
+                    slowMoSpeed = if (isSlowMo) slowMoSpeed else SlowMoSpeed.SPEED_1_4X,
+                    isTimeLapseMode = isTimeLapse,
+                    timeLapseSpeed = if (isTimeLapse) timeLapseSpeed else TimeLapseSpeed.SPEED_30X,
+                    isProMode = false,
+                    resolution = if (isSlowMo) effectiveSlowMoResolution else reconciled.resolution,
+                    frameRate = if (isSlowMo) slowMoTargetFrameRate else if (isTimeLapse) VideoFrameRate.FPS_30 else reconciled.frameRate,
+                    stabilization = if (isSlowMo) VideoStabilizationMode.OFF else reconciled.stabilization,
+                    activeExtensionMode = androidx.camera.extensions.ExtensionMode.NONE,
+                    captureMode = ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY,
+                    glFilterEffectTargets = desiredGlEffectTargets,
+                    previewImplMode = previewView.implementationMode
+                )
+            } else {
+                BoundPipelineConfig(
+                    lens = activeLens,
+                    isVideoMode = false,
+                    isSlowMotionMode = false,
+                    isProMode = activeMode == CameraMode.PRO,
+                    isPanoramaMode = activeMode == CameraMode.PANORAMA,
+                    resolution = VideoResolution.FHD_1080P,
+                    frameRate = VideoFrameRate.FPS_30,
+                    stabilization = VideoStabilizationMode.OFF,
+                    activeExtensionMode = desiredExtensionMode,
+                    captureMode = resolvedStillCaptureMode,
+                    aspectRatioMode = aspectRatioMode,
+                    hdOutputOption = hdOutputOption,
+                    preferHighQualityIsp = preferHighQualityIsp,
+                    glFilterEffectTargets = desiredGlEffectTargets,
+                    previewImplMode = previewView.implementationMode
+                )
+            }
+
+            // Avoid duplicate camera bindings if the exact target pipeline is already bound
+            if (lastBoundConfig == desiredBindConfig && activeCamera != null) {
+                return@LaunchedEffect
+            }
+
+            // Pre-query AE FPS ranges and OEM extension selector on Dispatchers.IO before touching main-thread bind
+            val prefetchedAeRanges = if (activeMode.isVideo) {
+                cachedAeRanges[activeLens] ?: withContext(Dispatchers.IO) {
+                    queryLensAeFpsRanges(context, activeLens)
+                }.also { cachedAeRanges[activeLens] = it }
+            } else {
+                emptyArray()
+            }
+            val prefetchedExtensionPair = if (!activeMode.isVideo) {
+                withContext(Dispatchers.IO) {
+                    com.example.core.camera.CameraExtensionsHelper.resolveCameraSelectorWithExtension(
+                        context = context,
+                        cameraProvider = cameraProvider,
+                        baseSelector = cameraSelector,
+                        extensionMode = desiredExtensionMode
                     )
                 }
+            } else {
+                cameraSelector to androidx.camera.extensions.ExtensionMode.NONE
+            }
 
-                // Avoid duplicate camera bindings if the exact target pipeline is already bound
-                if (lastBoundConfig == desiredBindConfig && activeCamera != null) {
-                    return@addListener
-                }
+            cameraProvider.unbindAll()
 
-                cameraProvider.unbindAll()
+            var boundCam: Camera? = null
+            var boundImgCap: ImageCapture? = null
+            var boundVidCap: VideoCapture<Recorder>? = null
+            var effectiveBoundReconciled = reconciled
+            var boundExtMode = androidx.camera.extensions.ExtensionMode.NONE
+            var boundGlPreview = false
+            var boundGlVideo = false
 
-                var boundCam: Camera? = null
-                var boundImgCap: ImageCapture? = null
-                var boundVidCap: VideoCapture<Recorder>? = null
-                var effectiveBoundReconciled = reconciled
-                var boundExtMode = androidx.camera.extensions.ExtensionMode.NONE
-
-                if (activeMode.isVideo) {
-                    val isSlowMo = activeMode == CameraMode.SLOW_MOTION
-                    val aeRanges = cachedAeRanges.getOrPut(activeLens) {
-                        queryLensAeFpsRanges(context, activeLens)
-                    }
+            if (activeMode.isVideo) {
+                val isSlowMo = activeMode == CameraMode.SLOW_MOTION
+                val aeRanges = prefetchedAeRanges
                     val effectiveVideoFps = if (isSlowMo) {
                         slowMoSpeed.expectedFps
                     } else {
@@ -1053,19 +1141,60 @@ fun CameraXViewfinder(
                         val configuredVideoCapture = buildConfiguredVideoCapture(
                             useCustomQhdResolution = targetVideoRes == VideoResolution.QHD_2K
                         )
-                        // In Video mode, prioritize Preview + VideoCapture so 4K UHD, 2K QHD, 60 FPS, and
-                        // Stabilization are never throttled by an unused 3rd JPEG stream.
-                        boundCam = cameraProvider.bindToLifecycle(
-                            cameraLifecycleOwner,
-                            cameraSelector,
-                            preview,
-                            configuredVideoCapture
-                        )
-                        boundVidCap = configuredVideoCapture
-                        Log.d(
-                            TAG,
-                            "Bound Video pipeline (${reconciled.resolution.displayName} @ ${reconciled.frameRate.displayName}, Stab=${reconciled.stabilization.displayName}) on ${activeLens.displayName}"
-                        )
+                        // In standard Video mode, attach our real-time OpenGL ES CameraEffect to BOTH
+                        // Preview and VideoCapture so live preview and recorded MP4 share the exact GPU look
+                        // with instant 0 ms filter switching and zero post-recording transcode delay.
+                        val useGlVideoGroup = (activeMode == CameraMode.VIDEO && desiredGlEffectTargets != 0)
+                        if (useGlVideoGroup) {
+                            try {
+                                val glVideoEffect = GpuCameraFilterEngine.createGlCameraEffect(
+                                    targets = CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE,
+                                    processor = glFilterProcessor
+                                )
+                                val videoUseCaseGroup = UseCaseGroup.Builder()
+                                    .addUseCase(preview)
+                                    .addUseCase(configuredVideoCapture)
+                                    .addEffect(glVideoEffect)
+                                    .build()
+                                boundCam = cameraProvider.bindToLifecycle(
+                                    cameraLifecycleOwner,
+                                    cameraSelector,
+                                    videoUseCaseGroup
+                                )
+                                boundVidCap = configuredVideoCapture
+                                boundGlPreview = true
+                                boundGlVideo = true
+                                Log.d(
+                                    TAG,
+                                    "Bound GPU-filtered Video pipeline (${reconciled.resolution.displayName} @ ${reconciled.frameRate.displayName}, Stab=${reconciled.stabilization.displayName}) on ${activeLens.displayName}"
+                                )
+                            } catch (glExc: Exception) {
+                                Log.w(TAG, "GPU Video CameraEffect bind rejected by device; falling back to standard Video bind", glExc)
+                                cameraProvider.unbindAll()
+                                boundCam = cameraProvider.bindToLifecycle(
+                                    cameraLifecycleOwner,
+                                    cameraSelector,
+                                    preview,
+                                    configuredVideoCapture
+                                )
+                                boundVidCap = configuredVideoCapture
+                                boundGlPreview = false
+                                boundGlVideo = false
+                            }
+                        } else {
+                            // In Slow-Mo / Time-Lapse, prioritize raw Preview + VideoCapture without effects.
+                            boundCam = cameraProvider.bindToLifecycle(
+                                cameraLifecycleOwner,
+                                cameraSelector,
+                                preview,
+                                configuredVideoCapture
+                            )
+                            boundVidCap = configuredVideoCapture
+                            Log.d(
+                                TAG,
+                                "Bound Video pipeline (${reconciled.resolution.displayName} @ ${reconciled.frameRate.displayName}, Stab=${reconciled.stabilization.displayName}) on ${activeLens.displayName}"
+                            )
+                        }
                     } catch (excPrimary: Exception) {
                         Log.w(TAG, "Primary video configuration failed to bind, attempting standard QualitySelector fallback", excPrimary)
                         try {
@@ -1257,12 +1386,7 @@ fun CameraXViewfinder(
                         return builder.build()
                     }
 
-                    val (resolvedSelector, candidateExtMode) = com.example.core.camera.CameraExtensionsHelper.resolveCameraSelectorWithExtension(
-                        context = context,
-                        cameraProvider = cameraProvider,
-                        baseSelector = cameraSelector,
-                        extensionMode = desiredExtensionMode
-                    )
+                    val (resolvedSelector, candidateExtMode) = prefetchedExtensionPair
                     val initialCaptureMode = resolveStillCaptureModeForExtension(
                         resolvedStillCaptureMode = resolvedStillCaptureMode,
                         candidateExtensionMode = candidateExtMode
@@ -1309,6 +1433,49 @@ fun CameraXViewfinder(
                             boundImgCap = imageCapture
                             boundExtMode = androidx.camera.extensions.ExtensionMode.NONE
                             Log.d(TAG, "Successfully bound Preview + ImageCapture + ImageAnalysis for Panorama Mode")
+                        } else if (activeMode == CameraMode.PHOTO) {
+                            // In Photo mode, attach real-time GPU OpenGL ES CameraEffect to Preview ONLY
+                            // (keeping ImageCapture full-res / ZSL untouched; saved JPEG applies matching GPU shader).
+                            try {
+                                val glPreviewEffect = GpuCameraFilterEngine.createGlCameraEffect(
+                                    targets = CameraEffect.PREVIEW,
+                                    processor = glFilterProcessor
+                                )
+                                val photoUseCaseGroup = UseCaseGroup.Builder()
+                                    .addUseCase(preview)
+                                    .addUseCase(imageCapture)
+                                    .addEffect(glPreviewEffect)
+                                    .build()
+                                boundCam = cameraProvider.bindToLifecycle(
+                                    cameraLifecycleOwner,
+                                    resolvedSelector,
+                                    photoUseCaseGroup
+                                )
+                                boundImgCap = imageCapture
+                                boundExtMode = candidateExtMode
+                                boundGlPreview = true
+                                Log.d(
+                                    TAG,
+                                    "Successfully bound GPU-filtered Photo Preview + ImageCapture (captureMode=$initialCaptureMode, ext=${com.example.core.camera.CameraExtensionsHelper.extensionModeDisplayName(boundExtMode)}, hqIsp=$preferHighQualityIsp)"
+                                )
+                            } catch (glExc: Exception) {
+                                Log.w(TAG, "GPU Photo Preview CameraEffect declined (ext=$candidateExtMode); binding standard Preview + ImageCapture with TextureView GPU fallback", glExc)
+                                cameraProvider.unbindAll()
+                                if (!effectivePreviewFilter.isOriginal &&
+                                    previewView.implementationMode != PreviewView.ImplementationMode.COMPATIBLE
+                                ) {
+                                    previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                                }
+                                boundCam = cameraProvider.bindToLifecycle(
+                                    cameraLifecycleOwner,
+                                    resolvedSelector,
+                                    preview,
+                                    imageCapture
+                                )
+                                boundImgCap = imageCapture
+                                boundExtMode = candidateExtMode
+                                boundGlPreview = false
+                            }
                         } else {
                             boundCam = cameraProvider.bindToLifecycle(
                                 cameraLifecycleOwner,
@@ -1355,6 +1522,24 @@ fun CameraXViewfinder(
                 boundImageCapture = boundImgCap
                 boundVideoCapture = boundVidCap
                 activeExtensionMode = boundExtMode
+                isGlPreviewEffectBound = boundGlPreview
+                isGlVideoEffectBound = boundGlVideo
+
+                // Immediately sync GPU filter state & fallback after bind so live preview matches selectedFilter
+                glFilterProcessor.activePreset = effectivePreviewFilter
+                val postBindBackend = GpuCameraFilterEngine.applyFilterToPreviewViewFallback(
+                    previewView = previewView,
+                    camera2TextureView = camera2PreviewTextureView,
+                    preset = effectivePreviewFilter,
+                    glProcessorActiveOnPreview = boundGlPreview && !isDirectCamera2RecordingActive
+                )
+                FilterDebugTracker.recordPreviewFilter(
+                    mode = activeMode,
+                    selectedFilter = selectedFilter,
+                    effectiveFilter = effectivePreviewFilter,
+                    wasAppliedToPreview = !effectivePreviewFilter.isOriginal,
+                    backend = postBindBackend
+                )
 
                 // Verify actual bound VideoCapture stream resolution so we never falsely claim 2K or 4K if CameraX fell back
                 val actualStreamSize = boundVidCap?.resolutionInfo?.resolution
@@ -1467,19 +1652,20 @@ fun CameraXViewfinder(
                             timeLapseSpeed = if (isTimeLapse) timeLapseSpeed else TimeLapseSpeed.SPEED_30X,
                             resolution = if (isSlowMo) effectiveSlowMoResolution else effectiveBoundReconciled.resolution,
                             frameRate = if (isSlowMo) slowMoTargetFrameRate else if (isTimeLapse) VideoFrameRate.FPS_30 else effectiveBoundReconciled.frameRate,
-                            stabilization = if (isSlowMo) VideoStabilizationMode.OFF else effectiveBoundReconciled.stabilization
+                            stabilization = if (isSlowMo) VideoStabilizationMode.OFF else effectiveBoundReconciled.stabilization,
+                            glFilterEffectTargets = desiredGlEffectTargets,
+                            previewImplMode = previewView.implementationMode
                         )
                     } else {
-                        desiredBindConfig
+                        desiredBindConfig.copy(previewImplMode = previewView.implementationMode)
                     }
                 }
 
                 Log.d(TAG, "CameraX successfully bound to lifecycle for ${activeLens.displayName}")
-            } catch (exc: Exception) {
-                Log.e(TAG, "Failed to bind CameraX use cases", exc)
-                onCameraError?.invoke("Failed to initialize camera stream: ${exc.localizedMessage}")
-            }
-        }, ContextCompat.getMainExecutor(context))
+        } catch (exc: Exception) {
+            Log.e(TAG, "Failed to bind CameraX use cases", exc)
+            onCameraError?.invoke("Failed to initialize camera stream: ${exc.localizedMessage}")
+        }
     }
 
     // Observe live CameraX ZoomState so dynamic zoom bounds from the active camera stay synchronized
@@ -2161,6 +2347,16 @@ fun CameraXViewfinder(
 
         if (shouldUseDedicatedHdMaxResCapture && hdMaxSource != null) {
             showShutterFlashOverlay = true
+            latestOnShutterProgressChanged?.invoke(
+                ShutterProgressState(
+                    mode = ShutterProgressMode.HD,
+                    phase = ShutterProgressPhase.CAPTURING,
+                    progress = 0.25f,
+                    isIndeterminateCapture = true,
+                    statusLabel = "HD",
+                    detailLabel = "Capturing HD…"
+                )
+            )
             val displayRot = previewView.display?.rotation ?: android.view.Surface.ROTATION_0
             val captureFlash = latestFlashMode
             val captureEvIdx = latestAutoExposureIndex
@@ -2187,6 +2383,17 @@ fun CameraXViewfinder(
                     )
                     val frameCapturedAtMs = System.currentTimeMillis()
                     if (hdResult != null && hdResult.jpegBytes.isNotEmpty()) {
+                        mainExecutor.execute {
+                            latestOnShutterProgressChanged?.invoke(
+                                ShutterProgressState(
+                                    mode = ShutterProgressMode.HD,
+                                    phase = ShutterProgressPhase.PROCESSING,
+                                    progress = 0.7f,
+                                    statusLabel = "Saving…",
+                                    detailLabel = "Processing HD…"
+                                )
+                            )
+                        }
                         if (captureSoundsEnabled) {
                             runCatching {
                                 val sound = android.media.MediaActionSound()
@@ -2243,12 +2450,32 @@ fun CameraXViewfinder(
                                 width = processedPayload?.width ?: hdResult.width,
                                 height = processedPayload?.height ?: hdResult.height
                             )
+                            FilterDebugTracker.recordSavedFileFilter(
+                                mediaType = "Photo",
+                                modeName = captureMode.displayName,
+                                selectedFilter = latestSelectedFilter,
+                                effectiveFilter = captureSelectedFilter,
+                                wasAppliedToFile = false,
+                                backend = "Bypass(HD)"
+                            )
                             logSavedPhotoDimensions(context, savedUri, "HD_MAX_RES")
                             isCaptureInFlight.set(false)
                             mainExecutor.execute {
                                 isCapturing = false
                                 rebindTrigger++
                                 onCaptureSuccess?.invoke(savedUri)
+                                latestOnShutterProgressChanged?.invoke(
+                                    ShutterProgressState(
+                                        mode = ShutterProgressMode.HD,
+                                        phase = ShutterProgressPhase.COMPLETED,
+                                        progress = 1f,
+                                        statusLabel = "Saved",
+                                        detailLabel = "Saved"
+                                    )
+                                )
+                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                }, 750L)
                             }
                             return@execute
                         }
@@ -2257,6 +2484,7 @@ fun CameraXViewfinder(
                     mainExecutor.execute {
                         isCapturing = false
                         rebindTrigger++
+                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                         onCaptureError?.invoke("Unable to capture maximum-resolution HD photo on this sensor.")
                     }
                 } catch (e: Throwable) {
@@ -2265,6 +2493,7 @@ fun CameraXViewfinder(
                     mainExecutor.execute {
                         isCapturing = false
                         rebindTrigger++
+                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                         onCaptureError?.invoke("HD capture failed: ${e.localizedMessage ?: "unknown error"}")
                     }
                 }
@@ -3069,6 +3298,20 @@ fun CameraXViewfinder(
 
                             if (shouldRunSoftwareEvHdr) {
                                 // Real EV-bracketed 3-frame HDR (-1.5 EV, 0 EV, +1.5 EV)
+                                val totalHdrFrames = 3
+                                mainExecutor.execute {
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.PHOTO,
+                                            phase = ShutterProgressPhase.CAPTURING,
+                                            currentFrame = 1,
+                                            totalFrames = totalHdrFrames,
+                                            progress = 1f / totalHdrFrames,
+                                            statusLabel = "1/$totalHdrFrames",
+                                            detailLabel = "HDR • Frame 1 of $totalHdrFrames"
+                                        )
+                                    )
+                                }
                                 val companionFrames = mutableListOf<ByteArray>()
                                 val camControl = activeCamera?.cameraControl
                                 val evSupported = captureLensCaps?.isExposureCompensationSupported == true && camControl != null
@@ -3083,6 +3326,20 @@ fun CameraXViewfinder(
                                 try {
                                     for ((idx, evOffset) in bracketOffsets.withIndex()) {
                                         if (activeLens != captureLens || activeMode != captureMode) break
+                                        val frameNum = idx + 2
+                                        mainExecutor.execute {
+                                            latestOnShutterProgressChanged?.invoke(
+                                                ShutterProgressState(
+                                                    mode = ShutterProgressMode.PHOTO,
+                                                    phase = ShutterProgressPhase.CAPTURING,
+                                                    currentFrame = frameNum,
+                                                    totalFrames = totalHdrFrames,
+                                                    progress = frameNum.toFloat() / totalHdrFrames,
+                                                    statusLabel = "$frameNum/$totalHdrFrames",
+                                                    detailLabel = "HDR • Frame $frameNum of $totalHdrFrames"
+                                                )
+                                            )
+                                        }
                                         if (evSupported && evRange != null && evOffset != 0) {
                                             val targetEv = com.example.core.camera.clampExposureIndex(
                                                 captureBaseEvIndex + evOffset,
@@ -3142,6 +3399,20 @@ fun CameraXViewfinder(
                                     }
                                     isCaptureInFlight.set(false)
                                     mainExecutor.execute { isCapturing = false }
+                                }
+
+                                mainExecutor.execute {
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.PHOTO,
+                                            phase = ShutterProgressPhase.PROCESSING,
+                                            currentFrame = companionFrames.size + 1,
+                                            totalFrames = totalHdrFrames,
+                                            progress = 0.65f,
+                                            statusLabel = "HDR",
+                                            detailLabel = "Merging HDR…"
+                                        )
+                                    )
                                 }
 
                                 val supportPath = captureLensCaps?.hdrSupportPath
@@ -3206,8 +3477,34 @@ fun CameraXViewfinder(
 
                                 try {
                                     if (merger != null) {
+                                        mainExecutor.execute {
+                                            latestOnShutterProgressChanged?.invoke(
+                                                ShutterProgressState(
+                                                    mode = ShutterProgressMode.PHOTO,
+                                                    phase = ShutterProgressPhase.CAPTURING,
+                                                    currentFrame = 1,
+                                                    totalFrames = plannedCount,
+                                                    progress = 1f / plannedCount.toFloat(),
+                                                    statusLabel = "1/$plannedCount",
+                                                    detailLabel = "Frame 1 of $plannedCount"
+                                                )
+                                            )
+                                        }
                                         for (frameIdx in 2..plannedCount) {
                                             if (activeLens != captureLens || activeMode != captureMode) break
+                                            mainExecutor.execute {
+                                                latestOnShutterProgressChanged?.invoke(
+                                                    ShutterProgressState(
+                                                        mode = ShutterProgressMode.PHOTO,
+                                                        phase = ShutterProgressPhase.CAPTURING,
+                                                        currentFrame = frameIdx,
+                                                        totalFrames = plannedCount,
+                                                        progress = frameIdx.toFloat() / plannedCount.toFloat(),
+                                                        statusLabel = "$frameIdx/$plannedCount",
+                                                        detailLabel = "Frame $frameIdx of $plannedCount"
+                                                    )
+                                                )
+                                            }
                                             val latch = java.util.concurrent.CountDownLatch(1)
                                             val timedOut = java.util.concurrent.atomic.AtomicBoolean(false)
                                             var nextBytes: ByteArray? = null
@@ -3256,6 +3553,22 @@ fun CameraXViewfinder(
                                 } finally {
                                     isCaptureInFlight.set(false)
                                     mainExecutor.execute { isCapturing = false }
+                                }
+
+                                if (merger != null && merger.framesMerged >= 2) {
+                                    mainExecutor.execute {
+                                        latestOnShutterProgressChanged?.invoke(
+                                            ShutterProgressState(
+                                                mode = ShutterProgressMode.PHOTO,
+                                                phase = ShutterProgressPhase.PROCESSING,
+                                                currentFrame = merger.framesMerged,
+                                                totalFrames = plannedCount,
+                                                progress = 0.7f,
+                                                statusLabel = "Merging…",
+                                                detailLabel = "Merging ${merger.framesMerged} frames…"
+                                            )
+                                        )
+                                    }
                                 }
 
                                 val mergedPayload = if (merger != null && merger.framesMerged >= 2) {
@@ -3320,7 +3633,9 @@ fun CameraXViewfinder(
                             return@saveTask
                         }
 
-                        val finalPhotoPayload = if (!isDngOnly && !captureSelectedFilter.isOriginal) {
+                        val filterStartMs = System.currentTimeMillis()
+                        val shouldApplyStillFilter = !isDngOnly && !captureSelectedFilter.isOriginal
+                        val finalPhotoPayload = if (shouldApplyStillFilter) {
                             com.example.core.processing.CameraFilterProcessor.applyFilterToPhotoPayload(
                                 payload = processedPayload,
                                 preset = captureSelectedFilter,
@@ -3329,6 +3644,20 @@ fun CameraXViewfinder(
                         } else {
                             processedPayload
                         }
+                        val filterDurationMs = (System.currentTimeMillis() - filterStartMs).coerceAtLeast(0L)
+                        FilterDebugTracker.recordSavedFileFilter(
+                            mediaType = "Photo",
+                            modeName = captureMode.displayName,
+                            selectedFilter = latestSelectedFilter,
+                            effectiveFilter = captureSelectedFilter,
+                            wasAppliedToFile = shouldApplyStillFilter,
+                            backend = if (shouldApplyStillFilter) {
+                                com.example.core.processing.CameraFilterProcessor.lastStillFilterBackend
+                            } else {
+                                "Bypass(Original)"
+                            },
+                            durationMs = filterDurationMs
+                        )
 
                         val saveStartMs = System.currentTimeMillis()
                         if (captureMode == CameraMode.PORTRAIT) {
@@ -3501,6 +3830,22 @@ fun CameraXViewfinder(
                                     android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                                         latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                     }, 850L)
+                                } else if (!isSingleFrameFastHandoff && captureMode == CameraMode.PHOTO) {
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.PHOTO,
+                                            phase = ShutterProgressPhase.COMPLETED,
+                                            progress = 1f,
+                                            statusLabel = "Saved",
+                                            detailLabel = "Saved",
+                                            allowConcurrentCapture = true
+                                        )
+                                    )
+                                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                        if (stillJobsInFlight.get() == 0) {
+                                            latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                        }
+                                    }, 750L)
                                 }
                                 portraitFallbackReason?.let { reason ->
                                     val userMsg = if (reason.startsWith("No subject found", ignoreCase = true)) {
@@ -3521,7 +3866,7 @@ fun CameraXViewfinder(
                                 }
                                 if (captureMode == CameraMode.NIGHT_SIGHT) {
                                     emitNightSightProgress(NightSightProgressState())
-                                } else if (captureMode == CameraMode.ASTRO) {
+                                } else if (captureMode == CameraMode.ASTRO || !isSingleFrameFastHandoff) {
                                     latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                 }
                                 onCaptureError?.invoke("Failed to create MediaStore entry.")
@@ -3538,7 +3883,7 @@ fun CameraXViewfinder(
                             }
                             if (captureMode == CameraMode.NIGHT_SIGHT) {
                                 emitNightSightProgress(NightSightProgressState())
-                            } else if (captureMode == CameraMode.ASTRO) {
+                            } else if (captureMode == CameraMode.ASTRO || !isSingleFrameFastHandoff) {
                                 latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                             }
                             onCaptureError?.invoke("Photo processing failed: ${e.localizedMessage}")
@@ -3619,8 +3964,77 @@ fun CameraXViewfinder(
                                 }
                             }
                         } else {
-                            val queued = photoSaveQueue.tryEnqueue(runProcessingAndSave)
+                            // Photo / HD / Pro single-frame: only show the unified shutter progress ring if
+                            // processing/saving takes longer than SHUTTER_PROGRESS_SHOW_DELAY_MS (180 ms),
+                            // so instant shots never flash a spinner while slower/filtered saves show crisp feedback.
+                            val stillJobDone = java.util.concurrent.atomic.AtomicBoolean(false)
+                            val stillProgressDisplayed = java.util.concurrent.atomic.AtomicBoolean(false)
+                            val queuedStillCount = stillJobsInFlight.incrementAndGet()
+                            val progressMode = captureMode.toShutterProgressMode()
+                            val progressHandler = android.os.Handler(android.os.Looper.getMainLooper())
+                            val showProgressRunnable = Runnable {
+                                if (!stillJobDone.get()) {
+                                    stillProgressDisplayed.set(true)
+                                    val inFlightNow = stillJobsInFlight.get().coerceAtLeast(1)
+                                    val actionText = if (!captureSelectedFilter.isOriginal) "Applying filter…" else "Saving…"
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = progressMode,
+                                            phase = ShutterProgressPhase.PROCESSING,
+                                            progress = 0f,
+                                            statusLabel = actionText,
+                                            detailLabel = if (inFlightNow > 1) "${captureMode.displayName}: $actionText ($inFlightNow queued)" else "${captureMode.displayName}: $actionText",
+                                            allowConcurrentCapture = !photoSaveQueue.isFull
+                                        )
+                                    )
+                                }
+                            }
+                            progressHandler.postDelayed(showProgressRunnable, SHUTTER_PROGRESS_SHOW_DELAY_MS)
+                            val queued = photoSaveQueue.tryEnqueue {
+                                try {
+                                    runProcessingAndSave()
+                                } finally {
+                                    stillJobDone.set(true)
+                                    progressHandler.removeCallbacks(showProgressRunnable)
+                                    val remaining = stillJobsInFlight.decrementAndGet().coerceAtLeast(0)
+                                    if (stillProgressDisplayed.get() || queuedStillCount > 1) {
+                                        mainExecutor.execute {
+                                            if (remaining == 0) {
+                                                latestOnShutterProgressChanged?.invoke(
+                                                    ShutterProgressState(
+                                                        mode = progressMode,
+                                                        phase = ShutterProgressPhase.COMPLETED,
+                                                        progress = 1f,
+                                                        statusLabel = "Saved",
+                                                        detailLabel = "Saved",
+                                                        allowConcurrentCapture = true
+                                                    )
+                                                )
+                                                progressHandler.postDelayed({
+                                                    if (stillJobsInFlight.get() == 0) {
+                                                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                                    }
+                                                }, 700L)
+                                            } else {
+                                                latestOnShutterProgressChanged?.invoke(
+                                                    ShutterProgressState(
+                                                        mode = progressMode,
+                                                        phase = ShutterProgressPhase.PROCESSING,
+                                                        progress = 0f,
+                                                        statusLabel = "Saving…",
+                                                        detailLabel = "${captureMode.displayName}: Saving ($remaining queued)",
+                                                        allowConcurrentCapture = !photoSaveQueue.isFull
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if (!queued) {
+                                stillJobDone.set(true)
+                                progressHandler.removeCallbacks(showProgressRunnable)
+                                stillJobsInFlight.decrementAndGet()
                                 mainExecutor.execute {
                                     onCaptureError?.invoke("Save queue full — wait a moment before next shot.")
                                 }
@@ -3638,7 +4052,7 @@ fun CameraXViewfinder(
                         isCapturing = false
                         if (captureMode == CameraMode.NIGHT_SIGHT) {
                             emitNightSightProgress(NightSightProgressState())
-                        } else if (captureMode == CameraMode.ASTRO) {
+                        } else if (captureMode == CameraMode.ASTRO || captureMode == CameraMode.HD || captureMode == CameraMode.PHOTO) {
                             latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                         }
                         onCaptureError?.invoke("Photo capture failed: ${exception.localizedMessage}")
@@ -3814,6 +4228,18 @@ fun CameraXViewfinder(
                     isCaptureLagging = false
                 )
             )
+            latestOnShutterProgressChanged?.invoke(
+                ShutterProgressState(
+                    mode = ShutterProgressMode.PANORAMA,
+                    phase = ShutterProgressPhase.CAPTURING,
+                    currentFrame = maxOf(1, panoramaKeyframes.size),
+                    totalFrames = PanoramaProcessor.DEFAULT_TARGET_FRAMES,
+                    progress = 0f,
+                    statusLabel = "0%",
+                    detailLabel = formatPanoramaProgressCaption(0f, maxOf(1, panoramaKeyframes.size)),
+                    canStopAndSave = false
+                )
+            )
             // Lock AE and AWB after anchor exposure settles so brightness/color stay uniform across sweep
             val cam = activeCamera
             if (cam != null) {
@@ -3861,6 +4287,7 @@ fun CameraXViewfinder(
                     isCaptureLagging = false
                 )
             )
+            latestOnShutterProgressChanged?.invoke(ShutterProgressState())
         }
     }
 
@@ -3884,6 +4311,7 @@ fun CameraXViewfinder(
                 isCaptureLagging = false
             )
         )
+        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
     }
 
     // Handle manual Panorama step capture trigger (useful on emulators or step-by-step sweeps)
@@ -3947,7 +4375,10 @@ fun CameraXViewfinder(
         val captureDirection = latestPanoramaDirection
         val captureSaveLocation = isSaveLocationEnabled
         val captureSoundsEnabled = isCameraSoundsEnabled
-        val captureSelectedFilter = latestSelectedFilter
+        val captureSelectedFilter = com.example.core.processing.CameraFilterProcessor.resolveEffectiveFilter(
+            CameraMode.PANORAMA,
+            latestSelectedFilter
+        )
         val mainExecutor = ContextCompat.getMainExecutor(context)
 
         // Unlock Camera2 AE/AWB now that capture sweep has finished
@@ -3983,6 +4414,7 @@ fun CameraXViewfinder(
                     isCaptureLagging = false
                 )
             )
+            latestOnShutterProgressChanged?.invoke(ShutterProgressState())
             onCaptureError?.invoke(
                 "Panorama not saved: move your phone in the selected direction to capture at least ${PanoramaProcessor.MIN_REQUIRED_FRAMES} overlapping frames."
             )
@@ -4001,6 +4433,17 @@ fun CameraXViewfinder(
                 normalizedSpeed = 0f,
                 guidanceStatus = PanoramaGuidanceStatus.STITCHING,
                 isCaptureLagging = false
+            )
+        )
+        latestOnShutterProgressChanged?.invoke(
+            ShutterProgressState(
+                mode = ShutterProgressMode.PANORAMA,
+                phase = ShutterProgressPhase.PROCESSING,
+                currentFrame = framesToStitch.size,
+                totalFrames = PanoramaProcessor.DEFAULT_TARGET_FRAMES,
+                progress = 0f,
+                statusLabel = "Stitching…",
+                detailLabel = "Stitching panorama…"
             )
         )
 
@@ -4081,7 +4524,20 @@ fun CameraXViewfinder(
                             )
                             if (savedItem != null) {
                                 onCaptureSuccess?.invoke(savedItem.uri)
+                                latestOnShutterProgressChanged?.invoke(
+                                    ShutterProgressState(
+                                        mode = ShutterProgressMode.PANORAMA,
+                                        phase = ShutterProgressPhase.COMPLETED,
+                                        progress = 1f,
+                                        statusLabel = "Saved",
+                                        detailLabel = "Saved"
+                                    )
+                                )
+                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                }, 850L)
                             } else {
+                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                 onCaptureError?.invoke("Failed to save stitched panorama to MediaStore.")
                             }
                         }
@@ -4102,6 +4558,7 @@ fun CameraXViewfinder(
                                     guidanceStatus = PanoramaGuidanceStatus.READY
                                 )
                             )
+                            latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                             onCaptureError?.invoke(outcome.reason)
                         }
                     }
@@ -4124,19 +4581,40 @@ fun CameraXViewfinder(
                             guidanceStatus = PanoramaGuidanceStatus.READY
                         )
                     )
+                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                     onCaptureError?.invoke("Panorama stitching failed: ${e.localizedMessage ?: "unknown error"}")
                 }
             }
         }
     }
 
-    // Duration clock ticker while direct Camera2 MediaRecorder video recording is active
+    // Duration clock ticker & unified shutter progress while direct Camera2 MediaRecorder video recording is active
     LaunchedEffect(isDirectCamera2RecordingActive) {
         if (!isDirectCamera2RecordingActive) return@LaunchedEffect
         val startMs = System.currentTimeMillis()
+        var lastEmittedSec = -1L
         while (isDirectCamera2RecordingActive) {
-            onRecordingDurationChanged?.invoke((System.currentTimeMillis() - startMs) / 1000L)
-            delay(500L)
+            val sec = ((System.currentTimeMillis() - startMs) / 1000L).coerceAtLeast(0L)
+            onRecordingDurationChanged?.invoke(sec)
+            if (sec != lastEmittedSec) {
+                lastEmittedSec = sec
+                latestOnShutterProgressChanged?.invoke(
+                    ShutterProgressState(
+                        mode = ShutterProgressMode.VIDEO,
+                        phase = ShutterProgressPhase.CAPTURING,
+                        isIndeterminateCapture = true,
+                        framePulseCount = sec.toInt(),
+                        elapsedSeconds = sec,
+                        statusLabel = formatShutterElapsedTime(sec),
+                        detailLabel = formatVideoRecordingCaption(
+                            elapsedSeconds = sec,
+                            isSlowMotion = false,
+                            fpsLabel = "${latestVideoFrameRate.fps}fps"
+                        )
+                    )
+                )
+            }
+            delay(250L)
         }
     }
 
@@ -4153,9 +4631,22 @@ fun CameraXViewfinder(
             val recLensCaps = cachedCapabilities[activeLens]
             val targetCameraId = recLensCaps?.camera2CameraId
             val directSurfaceTexture = camera2PreviewTextureView.surfaceTexture
+            val effectiveRecFilter = com.example.core.processing.CameraFilterProcessor.resolveEffectiveFilter(
+                recordingMode,
+                latestSelectedFilter
+            )
 
-            // Direct Camera2 + MediaRecorder path for standard Video mode
+            // When a color filter is active in Video mode and our real-time GPU OpenGL ES CameraEffect
+            // is bound to VideoCapture, record via CameraX VideoCapture so the shader burns the exact
+            // preview look directly into every video frame in real time at full FPS (0 ms post-transcode!).
+            val shouldUseRealTimeGlVideoCapture = recordingMode == CameraMode.VIDEO &&
+                !effectiveRecFilter.isOriginal &&
+                isGlVideoEffectBound &&
+                boundVideoCapture != null
+
+            // Direct Camera2 + MediaRecorder path for unfiltered standard Video mode (or when GL effect unavailable)
             if (recordingMode == CameraMode.VIDEO &&
+                !shouldUseRealTimeGlVideoCapture &&
                 targetCameraId != null &&
                 camera2PreviewTextureView.isAvailable &&
                 directSurfaceTexture != null
@@ -4264,6 +4755,8 @@ fun CameraXViewfinder(
                     latestVideoFrameRate.fps
                 }
                 val recordingSelectedFilter = com.example.core.processing.CameraFilterProcessor.resolveEffectiveFilter(recordingMode, latestSelectedFilter)
+                val videoFilterBakedInRealTime = (recordingMode == CameraMode.VIDEO && !recordingSelectedFilter.isOriginal && isGlVideoEffectBound)
+                val videoShutterMode = recordingMode.toShutterProgressMode()
                 val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(System.currentTimeMillis())
                 val displayName = when (recordingMode) {
                     CameraMode.SLOW_MOTION -> "VID_SLOMO_${recordingSlowMoSpeed.expectedFps}FPS_$timeStamp.mp4"
@@ -4322,6 +4815,22 @@ fun CameraXViewfinder(
                                         )
                                     )
                                 )
+                            } else {
+                                latestOnShutterProgressChanged?.invoke(
+                                    ShutterProgressState(
+                                        mode = videoShutterMode,
+                                        phase = ShutterProgressPhase.CAPTURING,
+                                        isIndeterminateCapture = true,
+                                        framePulseCount = 0,
+                                        elapsedSeconds = 0L,
+                                        statusLabel = "00:00",
+                                        detailLabel = formatVideoRecordingCaption(
+                                            elapsedSeconds = 0L,
+                                            isSlowMotion = recordingMode == CameraMode.SLOW_MOTION,
+                                            fpsLabel = "${recordingRequestedFps}fps"
+                                        )
+                                    )
+                                )
                             }
                         }
                         is VideoRecordEvent.Status -> {
@@ -4372,6 +4881,22 @@ fun CameraXViewfinder(
                                         Log.w(TAG, "Error auto-stopping time-lapse at duration limit", e)
                                     }
                                 }
+                            } else {
+                                latestOnShutterProgressChanged?.invoke(
+                                    ShutterProgressState(
+                                        mode = videoShutterMode,
+                                        phase = ShutterProgressPhase.CAPTURING,
+                                        isIndeterminateCapture = true,
+                                        framePulseCount = seconds.toInt(),
+                                        elapsedSeconds = seconds,
+                                        statusLabel = formatShutterElapsedTime(seconds),
+                                        detailLabel = formatVideoRecordingCaption(
+                                            elapsedSeconds = seconds,
+                                            isSlowMotion = recordingMode == CameraMode.SLOW_MOTION,
+                                            fpsLabel = "${recordingRequestedFps}fps"
+                                        )
+                                    )
+                                )
                             }
                         }
                         is VideoRecordEvent.Finalize -> {
@@ -4394,6 +4919,21 @@ fun CameraXViewfinder(
                                             progress = 0.05f,
                                             statusLabel = "5%",
                                             detailLabel = "Building time-lapse… 5%"
+                                        )
+                                    )
+                                } else {
+                                    val finalizeLabel = when {
+                                        recordingMode == CameraMode.SLOW_MOTION -> "Processing slow-mo…"
+                                        !recordingSelectedFilter.isOriginal && !videoFilterBakedInRealTime -> "Applying filter…"
+                                        else -> "Saving video…"
+                                    }
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = videoShutterMode,
+                                            phase = ShutterProgressPhase.PROCESSING,
+                                            progress = 0f,
+                                            statusLabel = finalizeLabel,
+                                            detailLabel = finalizeLabel
                                         )
                                     )
                                 }
@@ -4454,19 +4994,63 @@ fun CameraXViewfinder(
                                             else -> tempRecordFile
                                         }
 
-                                        finalVideoFile = if (!recordingSelectedFilter.isOriginal && modeProcessedFile != null && modeProcessedFile.exists()) {
+                                        finalVideoFile = if (videoFilterBakedInRealTime) {
+                                            FilterDebugTracker.recordSavedFileFilter(
+                                                mediaType = "Video",
+                                                modeName = recordingMode.displayName,
+                                                selectedFilter = latestSelectedFilter,
+                                                effectiveFilter = recordingSelectedFilter,
+                                                wasAppliedToFile = true,
+                                                backend = "GPU-RealTime-CameraEffect"
+                                            )
+                                            modeProcessedFile
+                                        } else if (!recordingSelectedFilter.isOriginal && modeProcessedFile != null && modeProcessedFile.exists()) {
+                                            val videoFilterStartMs = System.currentTimeMillis()
                                             val filteredVideo = com.example.core.processing.CameraFilterProcessor.processVideoFileWithFilter(
                                                 context = context,
                                                 inputFile = modeProcessedFile,
-                                                preset = recordingSelectedFilter
+                                                preset = recordingSelectedFilter,
+                                                onProgress = { p ->
+                                                    val pct = (p * 100f).toInt().coerceIn(5, 99)
+                                                    mainExecutor.execute {
+                                                        latestOnShutterProgressChanged?.invoke(
+                                                            ShutterProgressState(
+                                                                mode = videoShutterMode,
+                                                                phase = ShutterProgressPhase.PROCESSING,
+                                                                progress = p,
+                                                                statusLabel = "$pct%",
+                                                                detailLabel = "Applying filter… $pct%"
+                                                            )
+                                                        )
+                                                    }
+                                                }
                                             )
-                                            if (filteredVideo != null && filteredVideo !== modeProcessedFile) {
+                                            val videoFilterDurationMs = (System.currentTimeMillis() - videoFilterStartMs).coerceAtLeast(0L)
+                                            val wasFiltered = filteredVideo != null && filteredVideo !== modeProcessedFile
+                                            FilterDebugTracker.recordSavedFileFilter(
+                                                mediaType = "Video",
+                                                modeName = recordingMode.displayName,
+                                                selectedFilter = latestSelectedFilter,
+                                                effectiveFilter = recordingSelectedFilter,
+                                                wasAppliedToFile = wasFiltered,
+                                                backend = if (wasFiltered) com.example.core.processing.CameraFilterProcessor.lastVideoFilterBackend else "FilterFailed",
+                                                durationMs = videoFilterDurationMs
+                                            )
+                                            if (wasFiltered && filteredVideo != null) {
                                                 runCatching { modeProcessedFile.delete() }
                                                 filteredVideo
                                             } else {
                                                 modeProcessedFile
                                             }
                                         } else {
+                                            FilterDebugTracker.recordSavedFileFilter(
+                                                mediaType = "Video",
+                                                modeName = recordingMode.displayName,
+                                                selectedFilter = latestSelectedFilter,
+                                                effectiveFilter = recordingSelectedFilter,
+                                                wasAppliedToFile = false,
+                                                backend = "Bypass(Original)"
+                                            )
                                             modeProcessedFile
                                         }
 
@@ -4475,9 +5059,7 @@ fun CameraXViewfinder(
                                                 TimeLapseRecordingService.stop(context)
                                             }
                                             mainExecutor.execute {
-                                                if (isTimeLapseSession) {
-                                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
-                                                }
+                                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                                 val modeLabel = if (recordingMode == CameraMode.TIME_LAPSE) "time-lapse" else "slow-motion"
                                                 onRecordingError?.invoke("Failed to finalize $modeLabel video output.")
                                             }
@@ -4507,29 +5089,25 @@ fun CameraXViewfinder(
                                         mainExecutor.execute {
                                             if (savedMediaStoreUri != null && savedMediaStoreUri != Uri.EMPTY) {
                                                 onRecordingSuccess?.invoke(savedMediaStoreUri)
-                                                if (isTimeLapseSession) {
-                                                    latestOnShutterProgressChanged?.invoke(
-                                                        ShutterProgressState(
-                                                            mode = ShutterProgressMode.TIME_LAPSE,
-                                                            phase = ShutterProgressPhase.COMPLETED,
-                                                            currentFrame = capturedFrameSnapshot,
-                                                            totalFrames = timeLapseTargetFrames ?: 0,
-                                                            progress = 1f,
-                                                            statusLabel = "Saved",
-                                                            detailLabel = "Saved"
-                                                        )
+                                                latestOnShutterProgressChanged?.invoke(
+                                                    ShutterProgressState(
+                                                        mode = videoShutterMode,
+                                                        phase = ShutterProgressPhase.COMPLETED,
+                                                        currentFrame = if (isTimeLapseSession) capturedFrameSnapshot else 0,
+                                                        totalFrames = if (isTimeLapseSession) (timeLapseTargetFrames ?: 0) else 0,
+                                                        progress = 1f,
+                                                        statusLabel = "Saved",
+                                                        detailLabel = "Saved"
                                                     )
-                                                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
-                                                    }, 850L)
-                                                }
+                                                )
+                                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                                }, 850L)
                                                 timeLapseFallbackNotice?.let { notice ->
                                                     onRecordingError?.invoke(notice)
                                                 }
                                             } else {
-                                                if (isTimeLapseSession) {
-                                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
-                                                }
+                                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                                 onRecordingError?.invoke("Failed to save recorded video to MediaStore.")
                                             }
                                         }
@@ -4577,9 +5155,7 @@ fun CameraXViewfinder(
                                                 }, 850L)
                                                 onRecordingError?.invoke("Time-lapse processing failed — saved raw recording so nothing was lost.")
                                             } else {
-                                                if (isTimeLapseSession) {
-                                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
-                                                }
+                                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                                 onRecordingError?.invoke("Failed to save recorded video: ${e.localizedMessage}")
                                             }
                                         }
@@ -4588,8 +5164,8 @@ fun CameraXViewfinder(
                             } else {
                                 if (isTimeLapseSession) {
                                     TimeLapseRecordingService.stop(context)
-                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                 }
+                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                 runCatching { tempRecordFile.delete() }
                                 Log.e(TAG, "Video recording finalize error code ${recordEvent.error}")
                                 onRecordingError?.invoke("Video recording completed with error code ${recordEvent.error}")
@@ -4603,8 +5179,8 @@ fun CameraXViewfinder(
                 if (recordingMode == CameraMode.TIME_LAPSE) {
                     cameraLifecycleOwner.keepAlive = false
                     TimeLapseRecordingService.stop(context)
-                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                 }
+                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                 onRecordingError?.invoke("Failed to start video recording: ${e.localizedMessage}")
                 onRecordingStateChanged?.invoke(false)
                 activeRecording = null
@@ -4619,6 +5195,15 @@ fun CameraXViewfinder(
                 activeCamera2DirectRecorder = null
                 isDirectCamera2RecordingActive = false
                 onRecordingStateChanged?.invoke(false)
+                latestOnShutterProgressChanged?.invoke(
+                    ShutterProgressState(
+                        mode = ShutterProgressMode.VIDEO,
+                        phase = ShutterProgressPhase.PROCESSING,
+                        progress = 0f,
+                        statusLabel = if (!recFilter.isOriginal) "Applying filter…" else "Saving…",
+                        detailLabel = if (!recFilter.isOriginal) "Applying filter to video…" else "Saving video…"
+                    )
+                )
 
                 companionCaptureExecutor.execute {
                     var finalVideoFile: java.io.File? = null
@@ -4629,18 +5214,52 @@ fun CameraXViewfinder(
 
                         if (recordedFile != null && recordedFile.exists() && recordedFile.length() > 0L) {
                             finalVideoFile = if (!recFilter.isOriginal) {
+                                val filterStartMs = System.currentTimeMillis()
                                 val filtered = com.example.core.processing.CameraFilterProcessor.processVideoFileWithFilter(
                                     context = context,
                                     inputFile = recordedFile,
-                                    preset = recFilter
+                                    preset = recFilter,
+                                    onProgress = { p ->
+                                        val pct = (p * 100f).toInt().coerceIn(5, 99)
+                                        mainExecutor.execute {
+                                            latestOnShutterProgressChanged?.invoke(
+                                                ShutterProgressState(
+                                                    mode = ShutterProgressMode.VIDEO,
+                                                    phase = ShutterProgressPhase.PROCESSING,
+                                                    progress = p,
+                                                    statusLabel = "$pct%",
+                                                    detailLabel = "Applying filter… $pct%"
+                                                )
+                                            )
+                                        }
+                                    }
                                 )
-                                if (filtered != null && filtered !== recordedFile) {
+                                val filterDurMs = (System.currentTimeMillis() - filterStartMs).coerceAtLeast(0L)
+                                val wasFiltered = filtered != null && filtered !== recordedFile
+                                FilterDebugTracker.recordSavedFileFilter(
+                                    mediaType = "Video",
+                                    modeName = CameraMode.VIDEO.displayName,
+                                    selectedFilter = latestSelectedFilter,
+                                    effectiveFilter = recFilter,
+                                    wasAppliedToFile = wasFiltered,
+                                    backend = if (wasFiltered) com.example.core.processing.CameraFilterProcessor.lastVideoFilterBackend else "FilterFailed",
+                                    durationMs = filterDurMs
+                                )
+                                if (wasFiltered && filtered != null) {
                                     runCatching { recordedFile.delete() }
                                     filtered
                                 } else {
                                     recordedFile
                                 }
                             } else {
+                                FilterDebugTracker.recordSavedFileFilter(
+                                    mediaType = "Video",
+                                    modeName = CameraMode.VIDEO.displayName,
+                                    selectedFilter = latestSelectedFilter,
+                                    effectiveFilter = recFilter,
+                                    wasAppliedToFile = false,
+                                    backend = "Bypass(Original)"
+                                )
                                 recordedFile
                             }
 
@@ -4665,12 +5284,26 @@ fun CameraXViewfinder(
                             mainExecutor.execute {
                                 if (savedUri != null && savedUri != Uri.EMPTY) {
                                     onRecordingSuccess?.invoke(savedUri)
+                                    latestOnShutterProgressChanged?.invoke(
+                                        ShutterProgressState(
+                                            mode = ShutterProgressMode.VIDEO,
+                                            phase = ShutterProgressPhase.COMPLETED,
+                                            progress = 1f,
+                                            statusLabel = "Saved",
+                                            detailLabel = "Saved"
+                                        )
+                                    )
+                                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                        latestOnShutterProgressChanged?.invoke(ShutterProgressState())
+                                    }, 850L)
                                 } else {
+                                    latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                     onRecordingError?.invoke("Failed to save recorded video to DCIM/Camera.")
                                 }
                             }
                         } else {
                             mainExecutor.execute {
+                                latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                                 onRecordingError?.invoke("Video recording was too short or failed to save.")
                             }
                         }
@@ -4679,6 +5312,7 @@ fun CameraXViewfinder(
                         runCatching { finalVideoFile?.delete() }
                         mainExecutor.execute {
                             rebindTrigger++
+                            latestOnShutterProgressChanged?.invoke(ShutterProgressState())
                             onRecordingError?.invoke("Failed to finalize video: ${e.localizedMessage ?: "unknown error"}")
                         }
                     }
@@ -4755,21 +5389,12 @@ fun CameraXViewfinder(
             )
         }
 
-        // Real Focus Peaking edge overlay directly over the viewfinder surface
-        if (activeMode == CameraMode.PRO && proFocusPeakingEnabled && currentPeakingFrame != null) {
-            Canvas(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .testTag("pro_focus_peaking_overlay")
-            ) {
-                currentPeakingFrame?.let { frame ->
-                    drawImage(
-                        image = frame.bitmap.asImageBitmap(),
-                        dstSize = IntSize(size.width.toInt(), size.height.toInt()),
-                        filterQuality = FilterQuality.Low
-                    )
-                }
-            }
+        // Real Focus Peaking edge overlay isolated in its own recomposition scope
+        if (activeMode == CameraMode.PRO && proFocusPeakingEnabled) {
+            FocusPeakingOverlay(
+                frameState = currentPeakingFrameState,
+                modifier = Modifier.fillMaxSize()
+            )
         }
 
         // Self-timer countdown visual feedback overlay with tap-to-cancel support
@@ -6094,4 +6719,22 @@ internal fun saveVideoFileToMediaStore(
         null
     }
 }
+
+@Composable
+private fun FocusPeakingOverlay(
+    frameState: State<FocusPeakingFrame?>,
+    modifier: Modifier = Modifier
+) {
+    val frame = frameState.value ?: return
+    Canvas(
+        modifier = modifier.testTag("pro_focus_peaking_overlay")
+    ) {
+        drawImage(
+            image = frame.bitmap.asImageBitmap(),
+            dstSize = IntSize(size.width.toInt(), size.height.toInt()),
+            filterQuality = FilterQuality.Low
+        )
+    }
+}
+
 

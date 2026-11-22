@@ -33,8 +33,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -170,22 +169,25 @@ fun CameraModeSelector(
             modifier = Modifier
                 .fillMaxWidth()
                 .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
-                .drawWithContent {
-                    drawContent()
+                .drawWithCache {
                     val fadeFraction = if (size.width > 0f) {
                         (40.dp.toPx() / size.width).coerceIn(0.06f, 0.22f)
                     } else {
                         0.12f
                     }
-                    drawRect(
-                        brush = Brush.horizontalGradient(
-                            0f to Color.Transparent,
-                            fadeFraction to Color.Black,
-                            (1f - fadeFraction) to Color.Black,
-                            1f to Color.Transparent
-                        ),
-                        blendMode = BlendMode.DstIn
+                    val fadeBrush = Brush.horizontalGradient(
+                        0f to Color.Transparent,
+                        fadeFraction to Color.Black,
+                        (1f - fadeFraction) to Color.Black,
+                        1f to Color.Transparent
                     )
+                    onDrawWithContent {
+                        drawContent()
+                        drawRect(
+                            brush = fadeBrush,
+                            blendMode = BlendMode.DstIn
+                        )
+                    }
                 }
                 .testTag("mode_selector_lazy_row"),
             contentPadding = PaddingValues(start = halfViewportWidth, end = halfViewportWidth),
@@ -226,7 +228,10 @@ fun CameraModeSelector(
                 Surface(
                     modifier = Modifier
                         .padding(horizontal = 4.dp)
-                        .scale(scale)
+                        .graphicsLayer {
+                            scaleX = scale
+                            scaleY = scale
+                        }
                         .testTag("mode_item_${mode.name.lowercase()}")
                         .clickable(
                             interactionSource = interactionSource,
@@ -263,7 +268,10 @@ fun CameraModeSelector(
                         onClick = onMoreClick,
                         modifier = Modifier
                             .padding(horizontal = 4.dp)
-                            .scale(moreScale)
+                            .graphicsLayer {
+                                scaleX = moreScale
+                                scaleY = moreScale
+                            }
                             .testTag("mode_item_more"),
                         shape = RoundedCornerShape(20.dp),
                         color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.7f),

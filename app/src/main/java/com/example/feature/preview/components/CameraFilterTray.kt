@@ -42,19 +42,21 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.ripple
+import android.graphics.Bitmap
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -66,6 +68,8 @@ import com.example.core.preferences.CameraFilterCategory
 import com.example.core.preferences.CameraFilterPreset
 import com.example.core.processing.CameraFilterProcessor
 import com.example.ui.theme.CameraMotionTokens
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Compact, horizontally browsable Filter Selector Tray.
@@ -169,7 +173,10 @@ fun CameraFilterTray(
                             color = bgColor,
                             shape = CircleShape,
                             modifier = Modifier
-                                .scale(tabScale)
+                                .graphicsLayer {
+                                    scaleX = tabScale
+                                    scaleY = tabScale
+                                }
                                 .clip(CircleShape)
                                 .clickable(
                                     interactionSource = interactionSource,
@@ -358,14 +365,24 @@ private fun FilterPresetThumbnailCard(
         label = "filter_label_text"
     )
 
-    val thumbnailBitmap = remember(preset) {
-        CameraFilterProcessor.getOrCreateThumbnail(preset, sizePx = 88)
+    val cachedThumb = remember(preset) {
+        CameraFilterProcessor.getCachedThumbnailOrNull(preset, sizePx = 88)
+    }
+    val thumbnailBitmap by produceState<Bitmap?>(initialValue = cachedThumb, key1 = preset) {
+        if (value == null) {
+            value = withContext(Dispatchers.Default) {
+                CameraFilterProcessor.getOrCreateThumbnail(preset, sizePx = 88)
+            }
+        }
     }
 
     Column(
         modifier = Modifier
             .width(68.dp)
-            .scale(cardScale)
+            .graphicsLayer {
+                scaleX = cardScale
+                scaleY = cardScale
+            }
             .clip(RoundedCornerShape(14.dp))
             .clickable(
                 interactionSource = interactionSource,
@@ -381,6 +398,7 @@ private fun FilterPresetThumbnailCard(
             modifier = Modifier
                 .size(56.dp)
                 .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
                 .border(
                     width = borderWidth,
                     color = borderColor,
@@ -389,12 +407,21 @@ private fun FilterPresetThumbnailCard(
                 .testTag("filter_thumbnail_${preset.id}"),
             contentAlignment = Alignment.Center
         ) {
-            Image(
-                bitmap = thumbnailBitmap.asImageBitmap(),
-                contentDescription = "${preset.displayName} filter preview",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
+            val loadedBitmap = thumbnailBitmap?.takeIf { !it.isRecycled }
+            if (loadedBitmap != null) {
+                Image(
+                    bitmap = loadedBitmap.asImageBitmap(),
+                    contentDescription = "${preset.displayName} filter preview",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                )
+            }
 
             if (isSelected) {
                 Box(

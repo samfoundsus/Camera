@@ -1009,7 +1009,14 @@ fun SettingsScreen(
 
     if (showHardwareDebugDialog) {
         val clipboardManager = LocalClipboardManager.current
-        val debugReport = remember(context) { collectCameraHardwareDebugReport(context) }
+        val debugReport by androidx.compose.runtime.produceState<CameraHardwareDebugReport?>(
+            initialValue = null,
+            key1 = context
+        ) {
+            value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                collectCameraHardwareDebugReport(context)
+            }
+        }
         var copiedBanner by remember { mutableStateOf(false) }
         val activeVerifiedLensCaps = (capabilitiesState as? CameraCapabilitiesState.Verified)?.currentLensCapabilities
 
@@ -1049,6 +1056,12 @@ fun SettingsScreen(
         val recentPortraitTimings = remember(showHardwareDebugDialog) {
             com.example.core.camera.PortraitStageTimingTracker.getRecentRecords()
         }
+        val frameTimingSnapshot = remember(showHardwareDebugDialog) {
+            com.example.core.camera.UiPerformanceMonitor.getSnapshot()
+        }
+        val filterVerificationSummary = remember(showHardwareDebugDialog) {
+            com.example.core.camera.FilterDebugTracker.formatMultilineSummary()
+        }
 
         CameraHardwareDebugDialog(
             report = debugReport,
@@ -1059,10 +1072,15 @@ fun SettingsScreen(
             activeIspSummary = activeIspSummary,
             recentLatencyRecords = recentLatencies,
             recentPortraitTimings = recentPortraitTimings,
+            frameTimingSnapshot = frameTimingSnapshot,
+            filterVerificationSummary = filterVerificationSummary,
             copied = copiedBanner,
             onCopyReport = {
-                clipboardManager.setText(AnnotatedString(formatHardwareDebugReportText(debugReport)))
-                copiedBanner = true
+                val loaded = debugReport
+                if (loaded != null) {
+                    clipboardManager.setText(AnnotatedString(formatHardwareDebugReportText(loaded)))
+                    copiedBanner = true
+                }
             },
             onDismiss = { showHardwareDebugDialog = false }
         )
@@ -1071,7 +1089,7 @@ fun SettingsScreen(
 
 @Composable
 internal fun CameraHardwareDebugDialog(
-    report: CameraHardwareDebugReport,
+    report: CameraHardwareDebugReport?,
     activePhotoResolvedSize: String?,
     activeHdNativeResolvedSize: String?,
     activeHdBinnedResolvedSize: String?,
@@ -1079,6 +1097,8 @@ internal fun CameraHardwareDebugDialog(
     activeIspSummary: String?,
     recentLatencyRecords: List<com.example.core.camera.CaptureLatencyRecord>,
     recentPortraitTimings: List<com.example.core.camera.PortraitStageTimings> = emptyList(),
+    frameTimingSnapshot: com.example.core.camera.UiFrameTimingSnapshot = com.example.core.camera.UiPerformanceMonitor.getSnapshot(),
+    filterVerificationSummary: String = com.example.core.camera.FilterDebugTracker.formatMultilineSummary(),
     copied: Boolean,
     onCopyReport: () -> Unit,
     onDismiss: () -> Unit
@@ -1093,7 +1113,11 @@ internal fun CameraHardwareDebugDialog(
                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
                 )
                 Text(
-                    text = "${report.deviceModel} (${report.androidVersionLabel}) • ${report.cameras.size} camera ID(s)",
+                    text = if (report != null) {
+                        "${report.deviceModel} (${report.androidVersionLabel}) • ${report.cameras.size} camera ID(s)"
+                    } else {
+                        "Loading Camera2 hardware telemetry…"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1151,6 +1175,50 @@ internal fun CameraHardwareDebugDialog(
                                 )
                             }
                         }
+                    }
+                }
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.72f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("hardware_debug_frame_timing_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "UI Frame Timing & Main-Thread Stalls (>16ms)",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = frameTimingSnapshot.formatMultilineSummary(),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                        )
+                    }
+                }
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("hardware_debug_filter_status_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "Filter Pipeline Verification (Preview & Saved Files)",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = filterVerificationSummary,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                        )
                     }
                 }
                 Surface(
@@ -1217,14 +1285,27 @@ internal fun CameraHardwareDebugDialog(
                         }
                     }
                 }
-                if (report.cameras.isEmpty()) {
+                if (report == null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "Querying Camera2 stream maps and MediaCodec capabilities on background thread…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                } else if (report.cameras.isEmpty()) {
                     Text(
                         text = "No Camera2 camera IDs reported by CameraManager on this environment.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                report.cameras.forEach { cam ->
+                report?.cameras?.forEach { cam ->
                     Surface(
                         color = MaterialTheme.colorScheme.surfaceContainerHigh,
                         shape = RoundedCornerShape(12.dp),
@@ -1389,7 +1470,7 @@ internal fun CameraHardwareDebugDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onCopyReport) {
+            TextButton(onClick = onCopyReport, enabled = report != null) {
                 Text(if (copied) "Copied" else "Copy Report")
             }
         }
@@ -1398,6 +1479,20 @@ internal fun CameraHardwareDebugDialog(
 
 internal fun formatHardwareDebugReportText(report: CameraHardwareDebugReport): String = buildString {
     append(report.formatPlainText())
+    appendLine()
+    appendLine("=== UI Frame Timing & Main-Thread Stalls (>16ms) ===")
+    appendLine(com.example.core.camera.UiPerformanceMonitor.getSnapshot().formatMultilineSummary())
+    appendLine()
+    appendLine("=== Filter Pipeline Verification (Preview & Saved Files) ===")
+    appendLine(com.example.core.camera.FilterDebugTracker.formatMultilineSummary())
+    val latencyRecords = com.example.core.camera.CaptureLatencyTracker.getRecentRecords()
+    if (latencyRecords.isNotEmpty()) {
+        appendLine()
+        appendLine("=== Capture Latency (Shutter -> Saved) ===")
+        latencyRecords.forEach { rec ->
+            appendLine("  • ${rec.formatSummaryLine()}")
+        }
+    }
     val portraitRecords = com.example.core.camera.PortraitStageTimingTracker.getRecentRecords()
     if (portraitRecords.isNotEmpty()) {
         appendLine()

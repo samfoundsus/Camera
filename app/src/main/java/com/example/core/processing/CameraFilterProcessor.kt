@@ -21,6 +21,9 @@ import com.example.core.preferences.CameraFilterPreset
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
@@ -335,6 +338,24 @@ object CameraFilterProcessor {
     @Volatile
     private var defaultSampleBitmap: Bitmap? = null
 
+    @Volatile
+    var lastStillFilterBackend: String = "Bypass"
+        private set
+
+    @Volatile
+    var lastVideoFilterBackend: String = "Bypass"
+        private set
+
+    private val cpuWorkerCount: Int = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
+    private val cpuThreadCounter = AtomicInteger(1)
+    private val cpuFilterExecutor by lazy {
+        Executors.newFixedThreadPool(cpuWorkerCount) { runnable ->
+            Thread(runnable, "FilterCpuWorker-${cpuThreadCounter.getAndIncrement()}").apply {
+                isDaemon = true
+            }
+        }
+    }
+
     /**
      * Authoritative check whether color filters are supported in [mode].
      * Filters are supported exclusively in Camera/Photo ([com.example.core.model.CameraMode.PHOTO])
@@ -582,84 +603,103 @@ object CameraFilterProcessor {
 
         val fullIntensity = clampedIntensity >= 0.999f
 
-        for (i in pixels.indices) {
-            val c = pixels[i]
-            val a = c and -0x1000000
-            val origR = (c shr 16) and 0xFF
-            val origG = (c shr 8) and 0xFF
-            val origB = c and 0xFF
+        fun processRange(startIdx: Int, endIdxExclusive: Int) {
+            for (i in startIdx until endIdxExclusive) {
+                val c = pixels[i]
+                val a = c and -0x1000000
+                val origR = (c shr 16) and 0xFF
+                val origG = (c shr 8) and 0xFF
+                val origB = c and 0xFF
 
-            var r: Float
-            var g: Float
-            var b: Float
+                var r: Float
+                var g: Float
+                var b: Float
 
-            if (isMono) {
-                val luma = (origR * lumaR + origG * lumaG + origB * lumaB).toInt().coerceIn(0, 255)
-                val toned = rLut[luma].toFloat()
-                r = toned
-                g = toned
-                b = toned
-            } else {
-                // Detect warm skin-tone region (R > G > B with moderate chroma) to protect natural skin rendering
-                var effectiveSat = baseSat
-                var effectiveWarmthMix = 1.0f
-                if (skinProtect > 0.01f && origR > origG && origG > origB) {
-                    val rgDiff = origR - origG
-                    val gbDiff = origG - origB
-                    if (rgDiff in 8..95 && gbDiff in 5..85 && origR in 65..245) {
-                        val skinFactor = (skinProtect * 0.55f).coerceIn(0f, 0.65f)
-                        if (effectiveSat > 1.0f) {
-                            effectiveSat = 1.0f + (effectiveSat - 1.0f) * (1.0f - skinFactor)
+                if (isMono) {
+                    val luma = (origR * lumaR + origG * lumaG + origB * lumaB).toInt().coerceIn(0, 255)
+                    val toned = rLut[luma].toFloat()
+                    r = toned
+                    g = toned
+                    b = toned
+                } else {
+                    var effectiveSat = baseSat
+                    var effectiveWarmthMix = 1.0f
+                    if (skinProtect > 0.01f && origR > origG && origG > origB) {
+                        val rgDiff = origR - origG
+                        val gbDiff = origG - origB
+                        if (rgDiff in 8..95 && gbDiff in 5..85 && origR in 65..245) {
+                            val skinFactor = (skinProtect * 0.55f).coerceIn(0f, 0.65f)
+                            if (effectiveSat > 1.0f) {
+                                effectiveSat = 1.0f + (effectiveSat - 1.0f) * (1.0f - skinFactor)
+                            }
+                            effectiveWarmthMix = 1.0f - skinFactor * 0.45f
                         }
-                        effectiveWarmthMix = 1.0f - skinFactor * 0.45f
+                    }
+
+                    val rw = 1.0f + (rWarmthMul - 1.0f) * effectiveWarmthMix
+                    val gw = 1.0f + (gWarmthMul - 1.0f) * effectiveWarmthMix
+                    val bw = 1.0f + (bWarmthMul - 1.0f) * effectiveWarmthMix
+
+                    val wR = (origR * rw).toInt().coerceIn(0, 255)
+                    val wG = (origG * gw).toInt().coerceIn(0, 255)
+                    val wB = (origB * bw).toInt().coerceIn(0, 255)
+
+                    val tR = rLut[wR].toFloat()
+                    val tG = gLut[wG].toFloat()
+                    val tB = bLut[wB].toFloat()
+
+                    if (abs(effectiveSat - 1.0f) > 0.005f) {
+                        val luma = tR * lumaR + tG * lumaG + tB * lumaB
+                        r = luma + (tR - luma) * effectiveSat
+                        g = luma + (tG - luma) * effectiveSat
+                        b = luma + (tB - luma) * effectiveSat
+                    } else {
+                        r = tR
+                        g = tG
+                        b = tB
                     }
                 }
 
-                // Apply white-balance warmth & tint with optional skin-tone moderation
-                val rw = 1.0f + (rWarmthMul - 1.0f) * effectiveWarmthMix
-                val gw = 1.0f + (gWarmthMul - 1.0f) * effectiveWarmthMix
-                val bw = 1.0f + (bWarmthMul - 1.0f) * effectiveWarmthMix
-
-                val wR = (origR * rw).toInt().coerceIn(0, 255)
-                val wG = (origG * gw).toInt().coerceIn(0, 255)
-                val wB = (origB * bw).toInt().coerceIn(0, 255)
-
-                // Apply per-channel tone curve LUT (contrast, S-curve, shadow lift, highlight rolloff, split-toning)
-                val tR = rLut[wR].toFloat()
-                val tG = gLut[wG].toFloat()
-                val tB = bLut[wB].toFloat()
-
-                // Apply saturation around perceptual luminance
-                if (abs(effectiveSat - 1.0f) > 0.005f) {
-                    val luma = tR * lumaR + tG * lumaG + tB * lumaB
-                    r = luma + (tR - luma) * effectiveSat
-                    g = luma + (tG - luma) * effectiveSat
-                    b = luma + (tB - luma) * effectiveSat
-                } else {
-                    r = tR
-                    g = tG
-                    b = tB
+                if (!fullIntensity) {
+                    val inv = 1.0f - clampedIntensity
+                    r = origR * inv + r * clampedIntensity
+                    g = origG * inv + g * clampedIntensity
+                    b = origB * inv + b * clampedIntensity
                 }
+
+                val outR = (r + 0.5f).toInt().coerceIn(0, 255)
+                val outG = (g + 0.5f).toInt().coerceIn(0, 255)
+                val outB = (b + 0.5f).toInt().coerceIn(0, 255)
+
+                pixels[i] = a or (outR shl 16) or (outG shl 8) or outB
             }
+        }
 
-            if (!fullIntensity) {
-                val inv = 1.0f - clampedIntensity
-                r = origR * inv + r * clampedIntensity
-                g = origG * inv + g * clampedIntensity
-                b = origB * inv + b * clampedIntensity
+        if (pixels.size >= 262_144 && cpuWorkerCount > 1) {
+            val chunkCount = min(cpuWorkerCount, 6)
+            val chunkSize = (pixels.size + chunkCount - 1) / chunkCount
+            val tasks = ArrayList<Callable<Unit>>(chunkCount)
+            var start = 0
+            while (start < pixels.size) {
+                val s = start
+                val e = min(start + chunkSize, pixels.size)
+                tasks.add(Callable { processRange(s, e) })
+                start = e
             }
-
-            val outR = (r + 0.5f).toInt().coerceIn(0, 255)
-            val outG = (g + 0.5f).toInt().coerceIn(0, 255)
-            val outB = (b + 0.5f).toInt().coerceIn(0, 255)
-
-            pixels[i] = a or (outR shl 16) or (outG shl 8) or outB
+            runCatching {
+                cpuFilterExecutor.invokeAll(tasks).forEach { it.get() }
+            }.onFailure {
+                processRange(0, pixels.size)
+            }
+        } else {
+            processRange(0, pixels.size)
         }
     }
 
     /**
-     * Applies [preset] to [source] bitmap and returns a new filtered [Bitmap]
-     * (or returns a copy of [source] if [preset] is [CameraFilterPreset.ORIGINAL]).
+     * Applies [preset] to [source] bitmap on the GPU when available (AGSL / OpenGL ES),
+     * falling back transparently to the multi-threaded CPU LUT pipeline on headless/unsupported
+     * devices. Returns a copy of [source] untouched when [preset] is [CameraFilterPreset.ORIGINAL].
      */
     fun applyFilterToBitmap(
         source: Bitmap,
@@ -673,6 +713,7 @@ object CameraFilterProcessor {
         if (width <= 0 || height <= 0) return source
 
         if (params.isIdentity || intensity <= 0.001f) {
+            lastStillFilterBackend = "Bypass(Original)"
             return if (inPlaceIfMutable && source.isMutable) {
                 source
             } else {
@@ -680,6 +721,17 @@ object CameraFilterProcessor {
             }
         }
 
+        val gpuAttempt = GpuCameraFilterEngine.applyFilterToBitmapOnGpu(
+            source = source,
+            preset = preset,
+            intensity = intensity
+        )
+        if (gpuAttempt != null) {
+            lastStillFilterBackend = gpuAttempt.second
+            return gpuAttempt.first
+        }
+
+        lastStillFilterBackend = "CPU-MT-LUT"
         val target = if (inPlaceIfMutable && source.isMutable && source.config == Bitmap.Config.ARGB_8888) {
             source
         } else {
@@ -768,6 +820,34 @@ object CameraFilterProcessor {
     // =========================================================================
     // Representative Filter Thumbnail Generation & Caching
     // =========================================================================
+
+    /**
+     * Returns a cached thumbnail [Bitmap] immediately if already generated, or `null` if not yet warmed.
+     * Safe to call on the main thread without triggering pixel work.
+     */
+    fun getCachedThumbnailOrNull(
+        preset: CameraFilterPreset,
+        sizePx: Int = DEFAULT_THUMBNAIL_SIZE_PX
+    ): Bitmap? {
+        val safeSize = sizePx.coerceIn(48, 256)
+        val cacheKey = "${preset.id}_$safeSize"
+        synchronized(thumbnailCache) {
+            val cached = thumbnailCache.get(cacheKey)
+            return if (cached != null && !cached.isRecycled) cached else null
+        }
+    }
+
+    /**
+     * Pre-warms all tone LUTs and filter tray thumbnails on a background worker thread.
+     */
+    fun warmUpThumbnailsBlocking(sizePx: Int = 88) {
+        CameraFilterPreset.entries.forEach { preset ->
+            runCatching {
+                getOrBuildToneLut(preset)
+                getOrCreateThumbnail(preset, sizePx)
+            }
+        }
+    }
 
     /**
      * Returns a cached, filtered thumbnail [Bitmap] for [preset] generated by running the actual
@@ -916,27 +996,46 @@ object CameraFilterProcessor {
         context: Context,
         inputFile: File,
         preset: CameraFilterPreset,
-        intensity: Float = 1.0f
+        intensity: Float = 1.0f,
+        onProgress: ((Float) -> Unit)? = null
     ): File? {
         if (!inputFile.exists() || inputFile.length() == 0L) return null
         val params = getParameters(preset)
         if (params.isIdentity || intensity <= 0.001f) {
+            lastVideoFilterBackend = "Bypass(Original)"
             return inputFile
         }
 
         val outputFile = File.createTempFile("vid_filtered_${preset.id}_", ".mp4", context.cacheDir)
-        val transcoded = transcodeVideoWithFilter(
+        val gpuTranscoded = GpuCameraFilterEngine.transcodeVideoOnGpu(
             inputFile = inputFile,
             outputFile = outputFile,
             preset = preset,
-            intensity = intensity
+            intensity = intensity,
+            onProgress = onProgress
         )
-        if (transcoded && outputFile.exists() && outputFile.length() > 0L) {
+        if (gpuTranscoded && outputFile.exists() && outputFile.length() > 0L) {
+            lastVideoFilterBackend = "GPU-SurfaceTranscode"
             return outputFile
         }
 
+        runCatching { if (outputFile.exists()) outputFile.delete() }
+        val fallbackFile = File.createTempFile("vid_filtered_cpu_${preset.id}_", ".mp4", context.cacheDir)
+        val cpuTranscoded = transcodeVideoWithFilter(
+            inputFile = inputFile,
+            outputFile = fallbackFile,
+            preset = preset,
+            intensity = intensity
+        )
+        if (cpuTranscoded && fallbackFile.exists() && fallbackFile.length() > 0L) {
+            lastVideoFilterBackend = "CPU-VideoFallback"
+            onProgress?.invoke(1.0f)
+            return fallbackFile
+        }
+
         // Clean up failed output file and return original only if hardware codec is unavailable in JVM test
-        runCatching { outputFile.delete() }
+        runCatching { fallbackFile.delete() }
+        lastVideoFilterBackend = "UnfilteredFallback"
         return inputFile
     }
 

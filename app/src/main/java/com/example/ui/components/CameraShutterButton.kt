@@ -45,12 +45,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -69,12 +70,12 @@ import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 /**
- * Shared circular progress ring overlay used identically by Night Sight, Astrophotography,
- * and Time Lapse modes:
- * - [ShutterProgressPhase.CAPTURING] (determinate): fills 0° -> 360° smoothly as frames or duration advance.
- * - [ShutterProgressPhase.CAPTURING] (indeterminate, e.g. unlimited Time Lapse): crisp active ring that
- *   subtly pulses each time [ShutterProgressState.framePulseCount] increments.
- * - [ShutterProgressPhase.PROCESSING]: distinct spinning dual-arc indicator so processing never looks frozen.
+ * Shared circular progress ring overlay used across every camera mode:
+ * - [ShutterProgressPhase.CAPTURING] (determinate): fills 0° -> 360° smoothly as frames, sweep, or duration advance.
+ * - [ShutterProgressPhase.CAPTURING] (indeterminate, e.g. Video / Slow-Mo / unlimited Time Lapse): crisp active ring
+ *   that subtly pulses each time [ShutterProgressState.framePulseCount] increments.
+ * - [ShutterProgressPhase.PROCESSING]: distinct spinning dual-arc indicator (plus progress arc if percentage is known)
+ *   so processing never looks frozen.
  * - [ShutterProgressPhase.COMPLETED]: full 360° completion ring.
  */
 @Composable
@@ -98,142 +99,136 @@ fun ShutterProgressRing(
         label = "shared_shutter_capture_sweep"
     )
 
-    val captureRingColor = when (progressState.mode) {
-        ShutterProgressMode.TIME_LAPSE -> MaterialTheme.colorScheme.error
-        ShutterProgressMode.NIGHT_SIGHT,
-        ShutterProgressMode.ASTRO,
-        ShutterProgressMode.PORTRAIT -> MaterialTheme.colorScheme.primary
+    val captureRingColor = if (progressState.mode.isVideoLikeRecording) {
+        MaterialTheme.colorScheme.error
+    } else {
+        MaterialTheme.colorScheme.primary
     }
     val processingRingColor = MaterialTheme.colorScheme.tertiary
     val completedRingColor = MaterialTheme.colorScheme.tertiary
     val trackRingColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.20f)
 
-    val ringTag = when (progressState.mode) {
-        ShutterProgressMode.NIGHT_SIGHT -> when (phase) {
-            ShutterProgressPhase.CAPTURING -> "night_sight_shutter_capture_progress"
-            ShutterProgressPhase.PROCESSING -> "night_sight_shutter_processing_ring"
-            ShutterProgressPhase.COMPLETED -> "night_sight_shutter_completed"
-            ShutterProgressPhase.IDLE -> "night_sight_shutter_idle"
-        }
-        ShutterProgressMode.ASTRO -> when (phase) {
-            ShutterProgressPhase.CAPTURING -> "astro_shutter_capture_progress"
-            ShutterProgressPhase.PROCESSING -> "astro_shutter_processing_ring"
-            ShutterProgressPhase.COMPLETED -> "astro_shutter_completed"
-            ShutterProgressPhase.IDLE -> "astro_shutter_idle"
-        }
-        ShutterProgressMode.TIME_LAPSE -> when (phase) {
-            ShutterProgressPhase.CAPTURING -> "timelapse_shutter_capture_progress"
-            ShutterProgressPhase.PROCESSING -> "timelapse_shutter_processing_ring"
-            ShutterProgressPhase.COMPLETED -> "timelapse_shutter_completed"
-            ShutterProgressPhase.IDLE -> "timelapse_shutter_idle"
-        }
-        ShutterProgressMode.PORTRAIT -> when (phase) {
-            ShutterProgressPhase.CAPTURING -> "portrait_shutter_capture_progress"
-            ShutterProgressPhase.PROCESSING -> "portrait_shutter_processing_ring"
-            ShutterProgressPhase.COMPLETED -> "portrait_shutter_completed"
-            ShutterProgressPhase.IDLE -> "portrait_shutter_idle"
-        }
+    val modeTagPrefix = when (progressState.mode) {
+        ShutterProgressMode.NIGHT_SIGHT -> "night_sight"
+        ShutterProgressMode.ASTRO -> "astro"
+        ShutterProgressMode.TIME_LAPSE -> "timelapse"
+        ShutterProgressMode.PORTRAIT -> "portrait"
+        ShutterProgressMode.PHOTO -> "photo"
+        ShutterProgressMode.HD -> "hd"
+        ShutterProgressMode.PRO -> "pro"
+        ShutterProgressMode.PANORAMA -> "panorama"
+        ShutterProgressMode.VIDEO -> "video"
+        ShutterProgressMode.SLOW_MOTION -> "slow_motion"
+    }
+    val ringTag = when (phase) {
+        ShutterProgressPhase.CAPTURING -> "${modeTagPrefix}_shutter_capture_progress"
+        ShutterProgressPhase.PROCESSING -> "${modeTagPrefix}_shutter_processing_ring"
+        ShutterProgressPhase.COMPLETED -> "${modeTagPrefix}_shutter_completed"
+        ShutterProgressPhase.IDLE -> "${modeTagPrefix}_shutter_idle"
     }
 
-    Canvas(
+    Box(
         modifier = modifier
             .fillMaxSize()
             .testTag(ringTag)
-    ) {
-        val strokePx = 5.dp.toPx()
-        val inset = strokePx / 2f + 1.dp.toPx()
-        val arcSize = Size(size.width - inset * 2f, size.height - inset * 2f)
-        val topLeft = Offset(inset, inset)
+            .drawWithCache {
+                val strokePx = 5.dp.toPx()
+                val pulseExtraPx = 2.dp.toPx()
+                val inset = strokePx / 2f + 1.dp.toPx()
+                val arcSize = Size(size.width - inset * 2f, size.height - inset * 2f)
+                val topLeft = Offset(inset, inset)
+                val baseStroke = Stroke(width = strokePx, cap = StrokeCap.Round)
 
-        // Background track
-        drawArc(
-            color = trackRingColor,
-            startAngle = 0f,
-            sweepAngle = 360f,
-            useCenter = false,
-            topLeft = topLeft,
-            size = arcSize,
-            style = Stroke(width = strokePx, cap = StrokeCap.Round)
-        )
-
-        when (phase) {
-            ShutterProgressPhase.CAPTURING -> {
-                if (progressState.isIndeterminateCapture) {
-                    // Unlimited Time Lapse: steady active ring + visible pulse glow on each captured frame
+                onDrawBehind {
+                    // Background track
                     drawArc(
-                        color = captureRingColor.copy(alpha = 0.45f + 0.55f * framePulseAlpha),
-                        startAngle = -90f,
+                        color = trackRingColor,
+                        startAngle = 0f,
                         sweepAngle = 360f,
                         useCenter = false,
                         topLeft = topLeft,
                         size = arcSize,
-                        style = Stroke(
-                            width = strokePx + (2.dp.toPx() * framePulseAlpha),
-                            cap = StrokeCap.Round
-                        )
+                        style = baseStroke
                     )
-                    // Accent sweep indicator showing active cadence
-                    drawArc(
-                        color = captureRingColor,
-                        startAngle = processingSpinAngle,
-                        sweepAngle = 64f,
-                        useCenter = false,
-                        topLeft = topLeft,
-                        size = arcSize,
-                        style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                    )
-                } else {
-                    drawArc(
-                        color = captureRingColor,
-                        startAngle = -90f,
-                        sweepAngle = animatedCaptureSweep,
-                        useCenter = false,
-                        topLeft = topLeft,
-                        size = arcSize,
-                        style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                    )
+
+                    when (phase) {
+                        ShutterProgressPhase.CAPTURING -> {
+                            if (progressState.isIndeterminateCapture) {
+                                // Video / Slow-Mo / unlimited Time Lapse: steady active ring + pulse on each tick/frame
+                                drawArc(
+                                    color = captureRingColor.copy(alpha = 0.45f + 0.55f * framePulseAlpha),
+                                    startAngle = -90f,
+                                    sweepAngle = 360f,
+                                    useCenter = false,
+                                    topLeft = topLeft,
+                                    size = arcSize,
+                                    style = Stroke(
+                                        width = strokePx + (pulseExtraPx * framePulseAlpha),
+                                        cap = StrokeCap.Round
+                                    )
+                                )
+                                drawArc(
+                                    color = captureRingColor,
+                                    startAngle = processingSpinAngle,
+                                    sweepAngle = 64f,
+                                    useCenter = false,
+                                    topLeft = topLeft,
+                                    size = arcSize,
+                                    style = baseStroke
+                                )
+                            } else {
+                                drawArc(
+                                    color = captureRingColor,
+                                    startAngle = -90f,
+                                    sweepAngle = animatedCaptureSweep,
+                                    useCenter = false,
+                                    topLeft = topLeft,
+                                    size = arcSize,
+                                    style = baseStroke
+                                )
+                            }
+                        }
+                        ShutterProgressPhase.PROCESSING -> {
+                            // Clearly distinct spinning double-arc indicator so processing never looks frozen
+                            drawArc(
+                                color = processingRingColor,
+                                startAngle = processingSpinAngle,
+                                sweepAngle = 115f,
+                                useCenter = false,
+                                topLeft = topLeft,
+                                size = arcSize,
+                                style = baseStroke
+                            )
+                            drawArc(
+                                color = captureRingColor.copy(alpha = 0.65f),
+                                startAngle = processingSpinAngle + 180f,
+                                sweepAngle = 70f,
+                                useCenter = false,
+                                topLeft = topLeft,
+                                size = arcSize,
+                                style = baseStroke
+                            )
+                        }
+                        ShutterProgressPhase.COMPLETED -> {
+                            drawArc(
+                                color = completedRingColor,
+                                startAngle = -90f,
+                                sweepAngle = 360f,
+                                useCenter = false,
+                                topLeft = topLeft,
+                                size = arcSize,
+                                style = baseStroke
+                            )
+                        }
+                        ShutterProgressPhase.IDLE -> Unit
+                    }
                 }
             }
-            ShutterProgressPhase.PROCESSING -> {
-                // Clearly distinct spinning double-arc indicator so processing never looks frozen
-                drawArc(
-                    color = processingRingColor,
-                    startAngle = processingSpinAngle,
-                    sweepAngle = 115f,
-                    useCenter = false,
-                    topLeft = topLeft,
-                    size = arcSize,
-                    style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                )
-                drawArc(
-                    color = captureRingColor.copy(alpha = 0.65f),
-                    startAngle = processingSpinAngle + 180f,
-                    sweepAngle = 70f,
-                    useCenter = false,
-                    topLeft = topLeft,
-                    size = arcSize,
-                    style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                )
-            }
-            ShutterProgressPhase.COMPLETED -> {
-                drawArc(
-                    color = completedRingColor,
-                    startAngle = -90f,
-                    sweepAngle = 360f,
-                    useCenter = false,
-                    topLeft = topLeft,
-                    size = arcSize,
-                    style = Stroke(width = strokePx, cap = StrokeCap.Round)
-                )
-            }
-            ShutterProgressPhase.IDLE -> Unit
-        }
-    }
+    )
 }
 
 /**
- * Shared Material 3 status banner rendered immediately above the shutter bar for
- * Night Sight, Astrophotography, and Time Lapse modes.
+ * Shared Material 3 status banner rendered immediately above the shutter bar across all camera modes.
  *
  * Shows frame count, elapsed/remaining time, processing progress, "Saved" completion,
  * and during Astrophotography capture offers a clear "Stop & save" action so long sessions are never lost.
@@ -256,13 +251,21 @@ fun ShutterProgressStatusBanner(
         val containerColor = when (progressState.phase) {
             ShutterProgressPhase.COMPLETED -> MaterialTheme.colorScheme.tertiaryContainer
             ShutterProgressPhase.PROCESSING -> MaterialTheme.colorScheme.secondaryContainer
-            ShutterProgressPhase.CAPTURING -> MaterialTheme.colorScheme.surfaceContainerHigh
+            ShutterProgressPhase.CAPTURING -> if (progressState.mode.isVideoLikeRecording) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceContainerHigh
+            }
             ShutterProgressPhase.IDLE -> MaterialTheme.colorScheme.surfaceContainerHigh
         }
         val contentColor = when (progressState.phase) {
             ShutterProgressPhase.COMPLETED -> MaterialTheme.colorScheme.onTertiaryContainer
             ShutterProgressPhase.PROCESSING -> MaterialTheme.colorScheme.onSecondaryContainer
-            ShutterProgressPhase.CAPTURING -> MaterialTheme.colorScheme.onSurface
+            ShutterProgressPhase.CAPTURING -> if (progressState.mode.isVideoLikeRecording) {
+                MaterialTheme.colorScheme.onErrorContainer
+            } else {
+                MaterialTheme.colorScheme.onSurface
+            }
             ShutterProgressPhase.IDLE -> MaterialTheme.colorScheme.onSurface
         }
         val caption = progressState.detailLabel.ifBlank { progressState.statusLabel }
@@ -319,7 +322,7 @@ fun ShutterProgressStatusBanner(
 /**
  * Reusable Google Pixel-inspired prominent double-ring shutter button with touch feedback,
  * smooth video-recording shape morphing, capture confirmation pulse, and one shared multi-phase
- * circular progress component used by Night Sight, Astrophotography, and Time Lapse.
+ * circular progress component used across all camera modes.
  */
 @Composable
 fun CameraShutterButton(
@@ -354,8 +357,13 @@ fun CameraShutterButton(
     val isProgressCompleted = phase == ShutterProgressPhase.COMPLETED
     val isProgressActive = effectiveProgress.isActive
     val isTimeLapseCapturing = isProgressCapturing && effectiveProgress.mode == ShutterProgressMode.TIME_LAPSE
+    val isVideoLikeCapturing = isProgressCapturing && effectiveProgress.mode.isVideoLikeRecording
     val isAstroCapturing = isProgressCapturing && effectiveProgress.mode == ShutterProgressMode.ASTRO
     val isNightCapturing = isProgressCapturing && effectiveProgress.mode == ShutterProgressMode.NIGHT_SIGHT
+    val isPanoramaCapturing = isProgressCapturing && effectiveProgress.mode == ShutterProgressMode.PANORAMA
+    val isMultiFrameStillCapturing = isProgressCapturing &&
+        effectiveProgress.mode.supportsConcurrentPhotoQueue &&
+        effectiveProgress.totalFrames > 1
 
     var isCapturePulsing by remember { mutableStateOf(false) }
     LaunchedEffect(captureConfirmationTrigger) {
@@ -366,10 +374,10 @@ fun CameraShutterButton(
         }
     }
 
-    // Subtle pulse whenever an unlimited Time Lapse frame is captured
+    // Subtle pulse whenever an indeterminate recording emits a frame or second tick
     var isFramePulseActive by remember { mutableStateOf(false) }
     LaunchedEffect(effectiveProgress.framePulseCount) {
-        if (effectiveProgress.framePulseCount > 0 && isTimeLapseCapturing && effectiveProgress.isIndeterminateCapture) {
+        if (effectiveProgress.framePulseCount > 0 && isVideoLikeCapturing && effectiveProgress.isIndeterminateCapture) {
             isFramePulseActive = true
             delay(240L)
             isFramePulseActive = false
@@ -378,28 +386,41 @@ fun CameraShutterButton(
     val framePulseAlpha by animateFloatAsState(
         targetValue = if (isFramePulseActive) 1f else 0f,
         animationSpec = tween(durationMillis = 220),
-        label = "timelapse_frame_pulse_alpha"
+        label = "shutter_frame_pulse_alpha"
     )
 
-    val processingTransition = rememberInfiniteTransition(label = "shutter_progress_processing_anim")
-    val processingSpinAngle by processingTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1050, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "shutter_progress_spin"
-    )
-    val processingPulseScale by processingTransition.animateFloat(
-        initialValue = 0.94f,
-        targetValue = 1.04f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 700),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "shutter_progress_pulse"
-    )
+    val needsSpinAnim = isProgressProcessing || (isProgressCapturing && effectiveProgress.isIndeterminateCapture)
+    val processingSpinAngle = if (needsSpinAnim) {
+        val processingTransition = rememberInfiniteTransition(label = "shutter_progress_processing_anim")
+        val angle by processingTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 1050, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "shutter_progress_spin"
+        )
+        angle
+    } else {
+        0f
+    }
+
+    val processingPulseScale = if (isProgressProcessing) {
+        val pulseTransition = rememberInfiniteTransition(label = "shutter_progress_pulse_anim")
+        val pulse by pulseTransition.animateFloat(
+            initialValue = 0.96f,
+            targetValue = 1.03f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 700),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "shutter_progress_pulse"
+        )
+        pulse
+    } else {
+        1.0f
+    }
 
     val pressScale by animateFloatAsState(
         targetValue = when {
@@ -428,7 +449,7 @@ fun CameraShutterButton(
     )
 
     val targetInnerSize = when {
-        isTimeLapseCapturing -> 32.dp
+        isVideoLikeCapturing -> 32.dp
         isRecording -> 32.dp
         isProgressCapturing -> 56.dp
         isProgressProcessing -> 54.dp
@@ -441,7 +462,7 @@ fun CameraShutterButton(
     )
 
     val targetCornerRadius = when {
-        isTimeLapseCapturing || isRecording -> 8.dp
+        isVideoLikeCapturing || isRecording -> 8.dp
         else -> (innerSize / 2)
     }
     val animatedCornerRadius by animateDpAsState(
@@ -451,7 +472,7 @@ fun CameraShutterButton(
     )
 
     val targetInnerColor = when {
-        isTimeLapseCapturing -> MaterialTheme.colorScheme.error
+        isVideoLikeCapturing -> MaterialTheme.colorScheme.error
         isProgressCapturing -> MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.92f)
         isProgressProcessing -> MaterialTheme.colorScheme.tertiaryContainer
         isProgressCompleted -> MaterialTheme.colorScheme.tertiary
@@ -466,28 +487,30 @@ fun CameraShutterButton(
         label = "shutter_inner_color"
     )
 
-    // Shutter is strictly disabled during PROCESSING and COMPLETED for multi-frame / video build modes.
-    // For Portrait mode with bounded queue capacity (allowConcurrentCapture == true), allow taking the next
-    // photo while the previous portrait finishes processing in the background.
-    // During CAPTURING:
-    //  - Night Sight: tap cancels capture
-    //  - Astrophotography: tap offers "Stop and save what I have"
-    //  - Time Lapse: tap stops recording and begins building video
+    // Shutter clickability rules across all 10 modes:
+    // - IDLE: always enabled.
+    // - CAPTURING: enabled for stoppable/cancellable modes (Night Sight, Astro, Time Lapse, Video, Slow-Mo, Panorama),
+    //   and also enabled during Portrait CAPTURING compatibility, otherwise disabled while exposing.
+    // - PROCESSING: enabled ONLY when allowConcurrentCapture == true (Photo, HD, Portrait, Pro with free queue slot).
+    // - COMPLETED: enabled for concurrent still modes so consecutive shots never stall on the "Saved" badge.
     val isClickable = when (phase) {
         ShutterProgressPhase.IDLE -> true
-        ShutterProgressPhase.CAPTURING -> true
+        ShutterProgressPhase.CAPTURING -> isVideoLikeCapturing || isAstroCapturing || isNightCapturing ||
+            isPanoramaCapturing || effectiveProgress.canStopAndSave || effectiveProgress.allowConcurrentCapture
         ShutterProgressPhase.PROCESSING -> effectiveProgress.allowConcurrentCapture
-        ShutterProgressPhase.COMPLETED -> effectiveProgress.mode == ShutterProgressMode.PORTRAIT
+        ShutterProgressPhase.COMPLETED -> effectiveProgress.mode.supportsConcurrentPhotoQueue
     }
     val effectiveOnClick: () -> Unit = {
         when {
             isNightCapturing && shutterProgress.phase == ShutterProgressPhase.IDLE -> onCancelNightSightCapture()
-            isProgressCapturing -> onActiveProgressShutterClick()
+            isProgressCapturing && (isVideoLikeCapturing || isAstroCapturing || isNightCapturing || isPanoramaCapturing || effectiveProgress.canStopAndSave) ->
+                onActiveProgressShutterClick()
             isProgressProcessing && effectiveProgress.allowConcurrentCapture -> onClick()
-            isProgressCompleted && effectiveProgress.mode == ShutterProgressMode.PORTRAIT -> onClick()
+            isProgressCompleted && effectiveProgress.mode.supportsConcurrentPhotoQueue -> onClick()
             !isProgressActive -> onClick()
         }
     }
+
     val accessibilityLabel = when (phase) {
         ShutterProgressPhase.CAPTURING -> when (effectiveProgress.mode) {
             ShutterProgressMode.NIGHT_SIGHT ->
@@ -496,8 +519,20 @@ fun CameraShutterButton(
                 "Capturing Astrophotography frame ${effectiveProgress.currentFrame} of ${effectiveProgress.totalFrames}. Tap to stop and save what you have."
             ShutterProgressMode.TIME_LAPSE ->
                 "Recording Time Lapse, ${effectiveProgress.currentFrame} frames captured. Tap to stop recording."
+            ShutterProgressMode.VIDEO ->
+                "Recording video. Tap to stop recording."
+            ShutterProgressMode.SLOW_MOTION ->
+                "Recording slow motion video. Tap to stop recording."
+            ShutterProgressMode.PANORAMA ->
+                "Capturing panorama. Tap to finish and stitch."
             ShutterProgressMode.PORTRAIT ->
                 "Capturing Portrait photo"
+            ShutterProgressMode.HD ->
+                "Capturing HD photo"
+            ShutterProgressMode.PRO ->
+                "Capturing Pro photo"
+            ShutterProgressMode.PHOTO ->
+                "Capturing photo"
         }
         ShutterProgressPhase.PROCESSING -> {
             val modeName = when (effectiveProgress.mode) {
@@ -505,6 +540,12 @@ fun CameraShutterButton(
                 ShutterProgressMode.ASTRO -> "Astrophotography photo"
                 ShutterProgressMode.TIME_LAPSE -> "Time Lapse video"
                 ShutterProgressMode.PORTRAIT -> "Portrait photo"
+                ShutterProgressMode.PHOTO -> "Photo"
+                ShutterProgressMode.HD -> "HD photo"
+                ShutterProgressMode.PRO -> "Pro photo"
+                ShutterProgressMode.PANORAMA -> "Panorama"
+                ShutterProgressMode.VIDEO -> "Video"
+                ShutterProgressMode.SLOW_MOTION -> "Slow Motion video"
             }
             val nextHint = if (effectiveProgress.allowConcurrentCapture) ". Tap to capture next photo." else ""
             "Processing $modeName ${(effectiveProgress.progress * 100f).roundToInt()} percent$nextHint"
@@ -520,7 +561,10 @@ fun CameraShutterButton(
     Box(
         modifier = modifier
             .size(outerSize)
-            .scale(pressScale)
+            .graphicsLayer {
+                scaleX = pressScale
+                scaleY = pressScale
+            }
             .clip(CircleShape)
             .border(
                 width = 4.dp,
@@ -537,7 +581,7 @@ fun CameraShutterButton(
             .testTag("shutter_button"),
         contentAlignment = Alignment.Center
     ) {
-        // Shared outer circular progress ring across Night Sight, Astrophotography, and Time Lapse
+        // Shared outer circular progress ring across all camera modes
         ShutterProgressRing(
             progressState = effectiveProgress,
             processingSpinAngle = processingSpinAngle,
@@ -545,15 +589,47 @@ fun CameraShutterButton(
         )
 
         when {
-            isTimeLapseCapturing -> {
-                // Time Lapse recording: unmistakable red Stop square inside the shared progress/pulse ring
+            isVideoLikeCapturing -> {
+                // Video / Slow-Mo / Time Lapse recording: unmistakable red Stop square inside the shared ring
                 Box(
                     modifier = Modifier
                         .size(animatedInnerSize)
                         .clip(RoundedCornerShape(animatedCornerRadius))
                         .background(animatedInnerColor)
-                        .testTag("timelapse_stop_button")
+                        .testTag(
+                            if (isTimeLapseCapturing) "timelapse_stop_button" else "video_stop_button"
+                        )
                 )
+            }
+            isPanoramaCapturing -> {
+                Box(
+                    modifier = Modifier
+                        .size(animatedInnerSize)
+                        .clip(CircleShape)
+                        .background(animatedInnerColor)
+                        .testTag("panorama_capture_stop_button"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Stop,
+                            contentDescription = "Finish panorama capture",
+                            tint = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            text = "${(effectiveProgress.progress * 100f).roundToInt().coerceIn(0, 100)}%",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp
+                            ),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
             }
             isAstroCapturing -> {
                 Box(
@@ -619,6 +695,23 @@ fun CameraShutterButton(
                             )
                         }
                     }
+                }
+            }
+            isMultiFrameStillCapturing -> {
+                Box(
+                    modifier = Modifier
+                        .size(animatedInnerSize)
+                        .clip(CircleShape)
+                        .background(animatedInnerColor),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "${effectiveProgress.currentFrame}/${effectiveProgress.totalFrames}",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = FontWeight.Bold
+                        ),
+                        color = MaterialTheme.colorScheme.primary
+                    )
                 }
             }
             isProgressProcessing -> {

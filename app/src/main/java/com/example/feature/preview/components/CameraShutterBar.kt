@@ -32,9 +32,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
@@ -74,7 +73,9 @@ fun CameraShutterBar(
             nightSightProgress.toShutterProgressState()
         }
     }
-    val isCaptureBusy = effectiveProgress.isActive || effectiveProgress.phase == ShutterProgressPhase.COMPLETED
+    val isCaptureBusy = (effectiveProgress.phase == ShutterProgressPhase.CAPTURING) ||
+        (effectiveProgress.phase == ShutterProgressPhase.PROCESSING && !effectiveProgress.allowConcurrentCapture) ||
+        isRecording
 
     var lensFlipRotationTarget by remember { mutableFloatStateOf(0f) }
     var lastFlipTimestamp by remember { mutableLongStateOf(0L) }
@@ -138,7 +139,10 @@ fun CameraShutterBar(
                 Box(
                     modifier = Modifier
                         .size(52.dp)
-                        .scale(galleryScale)
+                        .graphicsLayer {
+                            scaleX = galleryScale
+                            scaleY = galleryScale
+                        }
                         .clip(CircleShape)
                         .background(MaterialTheme.colorScheme.surfaceContainerHigh)
                         .clickable(
@@ -192,7 +196,10 @@ fun CameraShutterBar(
                 Box(
                     modifier = Modifier
                         .size(52.dp)
-                        .scale(galleryScale)
+                        .graphicsLayer {
+                            scaleX = galleryScale
+                            scaleY = galleryScale
+                        }
                         .clip(CircleShape)
                         .background(MaterialTheme.colorScheme.surfaceContainerHigh)
                         .clickable(
@@ -231,7 +238,10 @@ fun CameraShutterBar(
                     color = MaterialTheme.colorScheme.surfaceContainerHigh,
                     modifier = Modifier
                         .size(52.dp)
-                        .scale(galleryScale)
+                        .graphicsLayer {
+                            scaleX = galleryScale
+                            scaleY = galleryScale
+                        }
                         .testTag("gallery_button"),
                     tonalElevation = 2.dp
                 ) {
@@ -272,7 +282,10 @@ fun CameraShutterBar(
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
                 modifier = Modifier
                     .size(52.dp)
-                    .scale(flipScale)
+                    .graphicsLayer {
+                        scaleX = flipScale
+                        scaleY = flipScale
+                    }
                     .testTag("lens_switch_button"),
                 tonalElevation = 2.dp
             ) {
@@ -290,7 +303,9 @@ fun CameraShutterBar(
                         ),
                         modifier = Modifier
                             .size(24.dp)
-                            .rotate(animatedRotation)
+                            .graphicsLayer {
+                                rotationZ = animatedRotation
+                            }
                     )
                 }
             }

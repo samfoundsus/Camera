@@ -268,7 +268,7 @@ fun CameraPreviewPlaceholder(
     var autoExposureSliderFloat by remember { mutableStateOf(0f) }
     var focusRequestSequence by remember { mutableLongStateOf(0L) }
     var exposureInteractionTick by remember { mutableLongStateOf(0L) }
-    var liveHistogramData by remember { mutableStateOf<LiveHistogramData?>(null) }
+    val liveHistogramDataState = remember { mutableStateOf<LiveHistogramData?>(null) }
 
     val safeEvMin = minOf(evIndexRange.first, evIndexRange.last)
     val safeEvMax = maxOf(evIndexRange.first, evIndexRange.last)
@@ -288,7 +288,7 @@ fun CameraPreviewPlaceholder(
             onExposureIndexChanged?.invoke(0)
         }
         if (activeMode != CameraMode.PRO) {
-            liveHistogramData = null
+            liveHistogramDataState.value = null
         }
     }
 
@@ -674,7 +674,7 @@ fun CameraPreviewPlaceholder(
                     onCapabilitiesDiscovered = onCapabilitiesDiscovered,
                     onVideoConfigApplied = onVideoConfigApplied,
                     onZoomRatioChanged = onZoomRatioChanged,
-                    onHistogramUpdated = { liveHistogramData = it },
+                    onHistogramUpdated = { liveHistogramDataState.value = it },
                     onFocusStatusChanged = { reqId, updatedStatus ->
                         if (activeFocusRequest?.requestId == reqId) {
                             focusIndicatorStatus = updatedStatus
@@ -1493,8 +1493,8 @@ fun CameraPreviewPlaceholder(
                     }
 
                     if (proHistogramEnabled) {
-                        ProLiveHistogramCard(
-                            data = liveHistogramData,
+                        ProLiveHistogramCardHost(
+                            dataState = liveHistogramDataState,
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
                                 .padding(14.dp)
@@ -2422,6 +2422,21 @@ fun CameraPreviewPlaceholder(
             }
         }
     }
+}
+
+/**
+ * Recomposition-isolated wrapper that reads [dataState] inside its own narrow scope so per-frame
+ * histogram updates never recompose the parent preview container.
+ */
+@Composable
+private fun ProLiveHistogramCardHost(
+    dataState: androidx.compose.runtime.State<LiveHistogramData?>,
+    modifier: Modifier = Modifier
+) {
+    ProLiveHistogramCard(
+        data = dataState.value,
+        modifier = modifier
+    )
 }
 
 /**

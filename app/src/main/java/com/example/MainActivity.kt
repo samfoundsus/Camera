@@ -57,6 +57,12 @@ class MainActivity : ComponentActivity() {
         currentVolumeAction = preferencesRepository.preferences.value.volumeButtonAction
         val capabilitiesRepository = com.example.core.camera.DefaultCameraCapabilitiesRepository()
 
+        // Pre-warm CameraX provider and filter LUTs/thumbnails asynchronously off the main thread
+        runCatching {
+            androidx.camera.lifecycle.ProcessCameraProvider.getInstance(applicationContext)
+        }
+        com.example.core.processing.GpuCameraFilterEngine.warmUpAsync()
+
         setContent {
             val preferences by preferencesRepository.preferences.collectAsStateWithLifecycle()
             var currentScreen by rememberSaveable { mutableStateOf(CameraScreenDestination.CAMERA) }
@@ -91,6 +97,7 @@ class MainActivity : ComponentActivity() {
             }
 
             LaunchedEffect(currentScreen) {
+                com.example.core.camera.UiPerformanceMonitor.setActiveScreen(currentScreen.name)
                 delay(CameraMotionTokens.DURATION_SCREEN_ENTER.toLong())
                 isNavigating = false
             }
@@ -199,9 +206,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        com.example.core.camera.UiPerformanceMonitor.attach(this)
         if (::preferencesRepository.isInitialized) {
             currentVolumeAction = preferencesRepository.preferences.value.volumeButtonAction
         }
+    }
+
+    override fun onPause() {
+        com.example.core.camera.UiPerformanceMonitor.detach()
+        super.onPause()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {

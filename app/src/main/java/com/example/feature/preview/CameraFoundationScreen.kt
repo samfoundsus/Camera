@@ -38,6 +38,7 @@ import com.example.core.camera.RecordingReadinessWarning
 import com.example.core.camera.ShutterProgressMode
 import com.example.core.camera.ShutterProgressPhase
 import com.example.core.camera.ShutterProgressState
+import com.example.core.camera.toShutterProgressMode
 import com.example.core.camera.toShutterProgressState
 import com.example.core.model.CameraMode
 import com.example.core.model.SystemDeviceInfo
@@ -310,7 +311,7 @@ fun CameraFoundationScreen(
         if (hardwareShutterTrigger > 0) {
             when {
                 (shutterProgress.phase == ShutterProgressPhase.PROCESSING && !shutterProgress.allowConcurrentCapture) ||
-                    (shutterProgress.phase == ShutterProgressPhase.COMPLETED && shutterProgress.mode != ShutterProgressMode.PORTRAIT) -> {
+                    (shutterProgress.phase == ShutterProgressPhase.COMPLETED && !shutterProgress.mode.supportsConcurrentPhotoQueue) -> {
                     // Shutter disabled while multi-frame/video processing or full-queue saving
                 }
                 selectedMode == CameraMode.TIME_LAPSE -> {
@@ -339,9 +340,9 @@ fun CameraFoundationScreen(
                     }
                 }
                 else -> {
-                    val allowPortraitNextShot = shutterProgress.mode == ShutterProgressMode.PORTRAIT &&
+                    val allowConcurrentNextShot = shutterProgress.mode.supportsConcurrentPhotoQueue &&
                         (shutterProgress.allowConcurrentCapture || shutterProgress.phase == ShutterProgressPhase.COMPLETED)
-                    if (!nightSightProgress.isActive && (!shutterProgress.isActive || allowPortraitNextShot)) {
+                    if (!nightSightProgress.isActive && (!shutterProgress.isActive || allowConcurrentNextShot)) {
                         photoCaptureTrigger++
                     }
                 }
@@ -373,7 +374,9 @@ fun CameraFoundationScreen(
     }
 
     LaunchedEffect(Unit) {
-        val discovered = queryDeviceCameraCapabilities(context)
+        val discovered = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            queryDeviceCameraCapabilities(context)
+        }
         if (discovered.isNotEmpty()) {
             capabilitiesRepository.setDiscoveredCapabilities(discovered)
         }
@@ -852,10 +855,7 @@ fun CameraFoundationScreen(
 
                 val activeShutterProgress = when {
                     shutterProgress.phase != ShutterProgressPhase.IDLE &&
-                        ((shutterProgress.mode == ShutterProgressMode.NIGHT_SIGHT && selectedMode == CameraMode.NIGHT_SIGHT) ||
-                            (shutterProgress.mode == ShutterProgressMode.ASTRO && selectedMode == CameraMode.ASTRO) ||
-                            (shutterProgress.mode == ShutterProgressMode.TIME_LAPSE && selectedMode == CameraMode.TIME_LAPSE) ||
-                            (shutterProgress.mode == ShutterProgressMode.PORTRAIT && selectedMode == CameraMode.PORTRAIT) ||
+                        (shutterProgress.mode == selectedMode.toShutterProgressMode() ||
                             shutterProgress.phase == ShutterProgressPhase.PROCESSING ||
                             shutterProgress.phase == ShutterProgressPhase.COMPLETED) -> shutterProgress
                     selectedMode == CameraMode.NIGHT_SIGHT && nightSightProgress.phase != NightSightCapturePhase.IDLE ->
@@ -889,13 +889,23 @@ fun CameraFoundationScreen(
                                     }
                                 }
                             }
-                            ShutterProgressMode.TIME_LAPSE -> {
+                            ShutterProgressMode.TIME_LAPSE,
+                            ShutterProgressMode.VIDEO,
+                            ShutterProgressMode.SLOW_MOTION -> {
                                 if (activeShutterProgress.phase == ShutterProgressPhase.CAPTURING && isRecordingState) {
                                     isRecordingState = false
                                 }
                             }
-                            ShutterProgressMode.PORTRAIT -> {
-                                // Portrait single-shot concurrent capture routes through onShutterClick
+                            ShutterProgressMode.PANORAMA -> {
+                                if (activeShutterProgress.phase == ShutterProgressPhase.CAPTURING) {
+                                    finishPanoramaCaptureSession()
+                                }
+                            }
+                            ShutterProgressMode.PHOTO,
+                            ShutterProgressMode.HD,
+                            ShutterProgressMode.PORTRAIT,
+                            ShutterProgressMode.PRO -> {
+                                // Still-mode concurrent captures route through onShutterClick
                             }
                         }
                     },
@@ -915,10 +925,10 @@ fun CameraFoundationScreen(
                     instantPreviewBitmap = instantPreviewThumbnail,
                     captureConfirmationTrigger = captureConfirmationTrigger,
                     onShutterClick = {
-                        val canCaptureNextPortrait = activeShutterProgress.mode == ShutterProgressMode.PORTRAIT &&
+                        val canCaptureNextConcurrentShot = activeShutterProgress.mode.supportsConcurrentPhotoQueue &&
                             (activeShutterProgress.allowConcurrentCapture || activeShutterProgress.phase == ShutterProgressPhase.COMPLETED)
                         when {
-                            (activeShutterProgress.isActive || activeShutterProgress.phase == ShutterProgressPhase.COMPLETED) && !canCaptureNextPortrait -> {
+                            (activeShutterProgress.isActive || activeShutterProgress.phase == ShutterProgressPhase.COMPLETED) && !canCaptureNextConcurrentShot -> {
                                 // Shutter is disabled while capturing/processing/saving; active-phase taps route through onActiveProgressShutterClick
                             }
                             selectedMode == CameraMode.TIME_LAPSE -> {
