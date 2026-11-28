@@ -50,6 +50,7 @@ class MainActivity : ComponentActivity() {
     private var hardwareZoomDeltaState = mutableFloatStateOf(0f)
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        com.example.core.camera.CrashLogManager.install(applicationContext)
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
@@ -57,11 +58,24 @@ class MainActivity : ComponentActivity() {
         currentVolumeAction = preferencesRepository.preferences.value.volumeButtonAction
         val capabilitiesRepository = com.example.core.camera.DefaultCameraCapabilitiesRepository()
 
-        // Pre-warm CameraX provider and filter LUTs/thumbnails asynchronously off the main thread
-        runCatching {
-            androidx.camera.lifecycle.ProcessCameraProvider.getInstance(applicationContext)
+        // Only pre-warm CameraX after CAMERA permission is already granted so cold launch
+        // before permission approval never triggers premature HAL/Camera2 startup on emulators.
+        try {
+            val hasCameraPermission = androidx.core.content.ContextCompat.checkSelfPermission(
+                applicationContext,
+                android.Manifest.permission.CAMERA
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (hasCameraPermission) {
+                androidx.camera.lifecycle.ProcessCameraProvider.getInstance(applicationContext)
+            }
+        } catch (t: Throwable) {
+            com.example.core.camera.CrashLogManager.recordNonFatalError("MainActivity.CameraProviderWarmUp", t)
         }
-        com.example.core.processing.GpuCameraFilterEngine.warmUpAsync()
+        try {
+            com.example.core.processing.GpuCameraFilterEngine.warmUpAsync()
+        } catch (t: Throwable) {
+            com.example.core.camera.CrashLogManager.recordNonFatalError("MainActivity.FilterWarmUp", t)
+        }
 
         setContent {
             val preferences by preferencesRepository.preferences.collectAsStateWithLifecycle()
@@ -206,7 +220,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        com.example.core.camera.UiPerformanceMonitor.attach(this)
+        try {
+            com.example.core.camera.UiPerformanceMonitor.attach(this)
+        } catch (t: Throwable) {
+            com.example.core.camera.CrashLogManager.recordNonFatalError("MainActivity.UiPerformanceMonitor", t)
+        }
         if (::preferencesRepository.isInitialized) {
             currentVolumeAction = preferencesRepository.preferences.value.volumeButtonAction
         }
@@ -215,6 +233,11 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         com.example.core.camera.UiPerformanceMonitor.detach()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        com.example.core.camera.UiPerformanceMonitor.detach()
+        super.onDestroy()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {

@@ -146,10 +146,20 @@ object UiPerformanceMonitor {
         activeScreenName = screenName
     }
 
+    private fun isRobolectricRuntime(): Boolean {
+        val fingerprint = Build.FINGERPRINT?.lowercase(Locale.US).orEmpty()
+        val hardware = Build.HARDWARE?.lowercase(Locale.US).orEmpty()
+        val product = Build.PRODUCT?.lowercase(Locale.US).orEmpty()
+        return fingerprint.contains("robolectric") ||
+            hardware.contains("robolectric") ||
+            product.contains("robolectric")
+    }
+
     /**
      * Attaches lightweight frame timing & main-thread stall monitoring to [activity].
      */
     fun attach(activity: Activity) {
+        if (isRobolectricRuntime()) return
         if (isMonitoring && attachedWindow === activity.window) return
         detach()
         isMonitoring = true

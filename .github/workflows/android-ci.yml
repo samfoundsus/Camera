@@ -40,6 +40,7 @@ jobs:
         run: chmod +x gradlew
 
       - name: Run Unit Tests
+        timeout-minutes: 15
         run: ./gradlew testDebugUnitTest --continue
 
       - name: Upload Test Reports

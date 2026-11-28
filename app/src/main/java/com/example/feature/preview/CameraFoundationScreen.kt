@@ -161,8 +161,15 @@ fun CameraFoundationScreen(
     val coroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(context) {
-        val latestUri = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            com.example.core.storage.MediaStorePhotoSaver.queryLatestGalleryMediaUri(context)
+        val latestUri = try {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                com.example.core.storage.MediaStorePhotoSaver.queryLatestGalleryMediaUri(context)
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            com.example.core.camera.CrashLogManager.recordNonFatalError("StartupGalleryQuery", t)
+            null
         }
         if (lastCapturedPhotoUri == null && latestUri != null) {
             lastCapturedPhotoUri = latestUri
@@ -173,8 +180,15 @@ fun CameraFoundationScreen(
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
                 coroutineScope.launch {
-                    val latestUri = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        com.example.core.storage.MediaStorePhotoSaver.queryLatestGalleryMediaUri(context)
+                    val latestUri = try {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            com.example.core.storage.MediaStorePhotoSaver.queryLatestGalleryMediaUri(context)
+                        }
+                    } catch (ce: kotlinx.coroutines.CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        com.example.core.camera.CrashLogManager.recordNonFatalError("ResumeGalleryQuery", t)
+                        null
                     }
                     if (latestUri != null) {
                         lastCapturedPhotoUri = latestUri
@@ -374,8 +388,15 @@ fun CameraFoundationScreen(
     }
 
     LaunchedEffect(Unit) {
-        val discovered = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            queryDeviceCameraCapabilities(context)
+        val discovered = try {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                queryDeviceCameraCapabilities(context)
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            com.example.core.camera.CrashLogManager.recordNonFatalError("StartupCapabilityDiscovery", t)
+            emptyMap()
         }
         if (discovered.isNotEmpty()) {
             capabilitiesRepository.setDiscoveredCapabilities(discovered)

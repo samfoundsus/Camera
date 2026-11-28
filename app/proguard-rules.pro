@@ -1,21 +1,23 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# Preserve source file names and line numbers for readable crash stack traces in release/minified builds.
+-keepattributes SourceFile,LineNumberTable
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# CameraX / Camera2Interop / Extensions reflection safety (including QHD custom resolution reflection)
+-keep class androidx.camera.** { *; }
+-keep class com.google.common.util.concurrent.ListenableFuture { *; }
+-keepclassmembers class androidx.camera.video.VideoCapture$Builder {
+    public * setCustomOrderedResolutions(...);
+}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# ML Kit Subject Segmentation safety
+-keep class com.google.mlkit.** { *; }
+-dontwarn com.google.mlkit.**
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Moshi / Kotlinx Serialization & reflective model adapters
+-keep class com.squareup.moshi.** { *; }
+-keep class kotlinx.serialization.** { *; }
+
+# Keep GPU filter / crash diagnostics classes intact for debugging and stack trace attribution
+-keep class com.example.core.camera.CrashLogManager { *; }
+-keep class com.example.core.processing.GpuCameraFilterEngine { *; }
+-keep class com.example.core.processing.GlFilterSurfaceProcessor { *; }

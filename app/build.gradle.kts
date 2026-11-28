@@ -1,4 +1,7 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.time.Duration
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
+import org.gradle.api.tasks.testing.logging.TestLogEvent
 
 plugins {
   alias(libs.plugins.android.application)
@@ -65,7 +68,33 @@ android {
     compose = true
     buildConfig = true
   }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+      all { test ->
+        test.timeout.set(Duration.ofMinutes(12))
+        test.testLogging {
+          events(
+            TestLogEvent.FAILED,
+            TestLogEvent.SKIPPED
+          )
+          exceptionFormat = TestExceptionFormat.FULL
+          showExceptions = true
+          showCauses = true
+          showStackTraces = true
+          showStandardStreams = false
+          error {
+            events(TestLogEvent.FAILED)
+            exceptionFormat = TestExceptionFormat.FULL
+            showExceptions = true
+            showCauses = true
+            showStackTraces = true
+            showStandardStreams = true
+          }
+        }
+      }
+    }
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true

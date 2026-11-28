@@ -45,7 +45,10 @@ import org.robolectric.annotation.Config
 @Config(sdk = [34])
 class ExampleRobolectricTest {
 
-    @get:Rule
+    @get:Rule(order = 0)
+    val testTimeoutRule = MainThreadSafeTimeoutRule(30_000L)
+
+    @get:Rule(order = 1)
     val composeTestRule = createComposeRule()
 
     @Test
@@ -147,7 +150,7 @@ class ExampleRobolectricTest {
         val correction = itemCenter - vCenter
 
         // Apply scroll correction
-        kotlinx.coroutines.runBlocking {
+        kotlinx.coroutines.test.runTest(timeout = kotlin.time.Duration.parse("10s")) {
             testState.scrollBy(correction.toFloat())
         }
         composeTestRule.waitForIdle()
@@ -1837,37 +1840,39 @@ class ExampleRobolectricTest {
     @Test
     fun testPhase254_volumeButtonActionHandlingAndDuplicateEventProtection() {
         val activityController = org.robolectric.Robolectric.buildActivity(MainActivity::class.java).create().start().resume()
-        val activity = activityController.get()
+        try {
+            val activity = activityController.get()
 
-        // 1. Default action is VOLUME: key events pass through to super
-        val downEventVol = android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_VOLUME_DOWN)
-        val handledVol = activity.onKeyDown(android.view.KeyEvent.KEYCODE_VOLUME_DOWN, downEventVol)
-        // System volume handling returns false on Robolectric dummy activity
-        assertFalse(handledVol)
+            // 1. Default action is VOLUME: key events pass through to super
+            val downEventVol = android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_VOLUME_DOWN)
+            val handledVol = activity.onKeyDown(android.view.KeyEvent.KEYCODE_VOLUME_DOWN, downEventVol)
+            // System volume handling returns false on Robolectric dummy activity
+            assertFalse(handledVol)
 
-        // 2. Set VolumeButtonAction to SHUTTER via repo
-        val repo = com.example.core.preferences.CameraPreferencesRepository(ApplicationProvider.getApplicationContext())
-        repo.setVolumeButtonAction(com.example.core.preferences.VolumeButtonAction.SHUTTER)
+            // 2. Set VolumeButtonAction to SHUTTER via repo
+            val repo = com.example.core.preferences.CameraPreferencesRepository(ApplicationProvider.getApplicationContext())
+            repo.setVolumeButtonAction(com.example.core.preferences.VolumeButtonAction.SHUTTER)
 
-        // Re-resume activity to pick up preferences
-        activityController.pause().resume()
+            // Re-resume activity to pick up preferences
+            activityController.pause().resume()
 
-        // First key down (repeatCount = 0) -> triggers shutter capture
-        val downEventShutter0 = android.view.KeyEvent(0L, 0L, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_VOLUME_DOWN, 0)
-        val handledShutter0 = activity.onKeyDown(android.view.KeyEvent.KEYCODE_VOLUME_DOWN, downEventShutter0)
-        assertTrue("Volume button shutter must intercept key event", handledShutter0)
+            // First key down (repeatCount = 0) -> triggers shutter capture
+            val downEventShutter0 = android.view.KeyEvent(0L, 0L, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_VOLUME_DOWN, 0)
+            val handledShutter0 = activity.onKeyDown(android.view.KeyEvent.KEYCODE_VOLUME_DOWN, downEventShutter0)
+            assertTrue("Volume button shutter must intercept key event", handledShutter0)
 
-        // Repeat key down (repeatCount = 1, e.g. long press) -> must NOT trigger duplicate shutter capture
-        val downEventShutter1 = android.view.KeyEvent(0L, 0L, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_VOLUME_DOWN, 1)
-        val handledShutter1 = activity.onKeyDown(android.view.KeyEvent.KEYCODE_VOLUME_DOWN, downEventShutter1)
-        assertTrue("Volume button shutter long press must still intercept event without duplicate trigger", handledShutter1)
+            // Repeat key down (repeatCount = 1, e.g. long press) -> must NOT trigger duplicate shutter capture
+            val downEventShutter1 = android.view.KeyEvent(0L, 0L, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_VOLUME_DOWN, 1)
+            val handledShutter1 = activity.onKeyDown(android.view.KeyEvent.KEYCODE_VOLUME_DOWN, downEventShutter1)
+            assertTrue("Volume button shutter long press must still intercept event without duplicate trigger", handledShutter1)
 
-        // Key up event -> consumed when volume action is non-VOLUME
-        val upEventShutter = android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_VOLUME_DOWN)
-        val handledUp = activity.onKeyUp(android.view.KeyEvent.KEYCODE_VOLUME_DOWN, upEventShutter)
-        assertTrue("Key up event must be consumed for custom volume button actions", handledUp)
-
-        activityController.destroy()
+            // Key up event -> consumed when volume action is non-VOLUME
+            val upEventShutter = android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_VOLUME_DOWN)
+            val handledUp = activity.onKeyUp(android.view.KeyEvent.KEYCODE_VOLUME_DOWN, upEventShutter)
+            assertTrue("Key up event must be consumed for custom volume button actions", handledUp)
+        } finally {
+            activityController.pause().stop().destroy()
+        }
     }
 
     @Test

@@ -66,8 +66,64 @@ object GpuCameraFilterEngine {
     private const val TAG = "GpuCameraFilterEngine"
     private const val EGL_RECORDABLE_ANDROID = 0x3142
     private const val MAX_GPU_TILE_DIM = 4096
+    private const val MIN_GPU_BITMAP_DIM_PX = 257
 
     private val warmedUp = AtomicBoolean(false)
+    private val glSurfaceProcessorFailed = AtomicBoolean(false)
+
+    /**
+     * Detects Android Emulator / Robolectric virtual environments where basic virtual camera HALs
+     * and software SwiftShader/Goldfish GL drivers often reject CameraX `CameraEffect` SurfaceProcessor
+     * or offscreen `HardwareRenderer`/EGL pipelines.
+     */
+    fun isEmulatorEnvironment(): Boolean {
+        val fingerprint = Build.FINGERPRINT.orEmpty().lowercase()
+        val model = Build.MODEL.orEmpty().lowercase()
+        val manufacturer = Build.MANUFACTURER.orEmpty().lowercase()
+        val brand = Build.BRAND.orEmpty().lowercase()
+        val device = Build.DEVICE.orEmpty().lowercase()
+        val product = Build.PRODUCT.orEmpty().lowercase()
+        val hardware = Build.HARDWARE.orEmpty().lowercase()
+
+        return fingerprint == "robolectric" ||
+            hardware == "robolectric" ||
+            fingerprint.startsWith("generic") ||
+            fingerprint.startsWith("unknown") ||
+            fingerprint.contains("emulator") ||
+            fingerprint.contains("sdk_gphone") ||
+            model.contains("google_sdk") ||
+            model.contains("emulator") ||
+            model.contains("android sdk built for") ||
+            model.contains("sdk_gphone") ||
+            manufacturer.contains("genymotion") ||
+            hardware.contains("goldfish") ||
+            hardware.contains("ranchu") ||
+            hardware.contains("vbox86") ||
+            product.contains("sdk_gphone") ||
+            product.contains("sdk_x86") ||
+            product.contains("emulator") ||
+            product.contains("simulator") ||
+            product.contains("vbox86p") ||
+            (brand.startsWith("generic") && device.startsWith("generic"))
+    }
+
+    /**
+     * Returns `true` only when real-time CameraX [CameraEffect] OpenGL ES [GlFilterSurfaceProcessor]
+     * is safe to attach. Disabled on emulators/Robolectric and automatically disabled if a runtime
+     * GL error ever occurs so the camera falls back cleanly to standard CameraX + TextureView/CPU.
+     */
+    fun isGpuCameraEffectSupported(): Boolean {
+        if (isJvmOrRobolectricEnvironment() || isEmulatorEnvironment()) return false
+        return !glSurfaceProcessorFailed.get()
+    }
+
+    internal fun markGlSurfaceProcessorFailed() {
+        glSurfaceProcessorFailed.set(true)
+    }
+
+    internal fun resetGlSurfaceProcessorFailureForTesting() {
+        glSurfaceProcessorFailed.set(false)
+    }
 
     private const val VERTEX_SHADER_SOURCE = """
         attribute vec4 aPosition;
@@ -285,48 +341,154 @@ object GpuCameraFilterEngine {
     """.trimIndent()
 
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-    private fun createConfiguredAgslShader(
-        preset: CameraFilterPreset,
-        intensity: Float
-    ): RuntimeShader {
-        val params = CameraFilterProcessor.getParameters(preset)
-        return RuntimeShader(buildAgslFilterShaderSource()).apply {
-            setFloatUniform("uIsIdentity", if (params.isIdentity) 1f else 0f)
-            setFloatUniform("uIntensity", intensity.coerceIn(0f, 1f))
-            setFloatUniform("uIsMono", if (params.isMonochrome) 1f else 0f)
-            setFloatUniform("uContrast", params.contrast)
-            setFloatUniform("uSaturation", params.saturation)
-            setFloatUniform("uWarmth", params.warmth)
-            setFloatUniform("uTint", params.tint)
-            setFloatUniform("uExposure", params.exposureOffset)
-            setFloatUniform("uShadowLift", params.shadowLift)
-            setFloatUniform("uHighlightRolloff", params.highlightRolloff)
-            setFloatUniform("uSCurve", params.sCurveStrength)
-            setFloatUniform("uSkinProtect", params.skinToneProtection)
-            setFloatUniform("uLumaWeights", params.lumaR, params.lumaG, params.lumaB)
-            setFloatUniform("uShadowTint", params.shadowTintR, params.shadowTintG, params.shadowTintB)
-            setFloatUniform("uHighlightTint", params.highlightTintR, params.highlightTintG, params.highlightTintB)
+    private object Api33AgslHelper {
+        fun createConfiguredAgslShader(
+            preset: CameraFilterPreset,
+            intensity: Float
+        ): RuntimeShader {
+            val params = CameraFilterProcessor.getParameters(preset)
+            return RuntimeShader(buildAgslFilterShaderSource()).apply {
+                setFloatUniform("uIsIdentity", if (params.isIdentity) 1f else 0f)
+                setFloatUniform("uIntensity", intensity.coerceIn(0f, 1f))
+                setFloatUniform("uIsMono", if (params.isMonochrome) 1f else 0f)
+                setFloatUniform("uContrast", params.contrast)
+                setFloatUniform("uSaturation", params.saturation)
+                setFloatUniform("uWarmth", params.warmth)
+                setFloatUniform("uTint", params.tint)
+                setFloatUniform("uExposure", params.exposureOffset)
+                setFloatUniform("uShadowLift", params.shadowLift)
+                setFloatUniform("uHighlightRolloff", params.highlightRolloff)
+                setFloatUniform("uSCurve", params.sCurveStrength)
+                setFloatUniform("uSkinProtect", params.skinToneProtection)
+                setFloatUniform("uLumaWeights", params.lumaR, params.lumaG, params.lumaB)
+                setFloatUniform("uShadowTint", params.shadowTintR, params.shadowTintG, params.shadowTintB)
+                setFloatUniform("uHighlightTint", params.highlightTintR, params.highlightTintG, params.highlightTintB)
+            }
+        }
+
+        fun applyAgslEffectToTextureView(
+            textureView: TextureView,
+            preset: CameraFilterPreset
+        ): Boolean {
+            return runCatching {
+                val shader = createConfiguredAgslShader(preset, 1.0f)
+                val effect = RenderEffect.createRuntimeShaderEffect(shader, "inputShader")
+                textureView.setLayerType(View.LAYER_TYPE_NONE, null)
+                textureView.setRenderEffect(effect)
+                true
+            }.onFailure { err ->
+                com.example.core.camera.CrashLogManager.recordNonFatalError("TextureView-AGSL", err)
+            }.getOrDefault(false)
+        }
+
+        fun renderAgslTile(
+            tile: Bitmap,
+            preset: CameraFilterPreset,
+            intensity: Float
+        ): Bitmap? {
+            val width = tile.width
+            val height = tile.height
+            val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            val renderer = HardwareRenderer()
+            val renderNode = RenderNode("CameraFilterNode")
+            try {
+                renderNode.setPosition(0, 0, width, height)
+                val shader = createConfiguredAgslShader(preset, intensity)
+                shader.setInputShader(
+                    "inputShader",
+                    BitmapShader(tile, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                )
+                val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+                    this.shader = shader
+                }
+                val recCanvas = renderNode.beginRecording()
+                try {
+                    recCanvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+                } finally {
+                    renderNode.endRecording()
+                }
+
+                renderer.setSurface(imageReader.surface)
+                renderer.setContentRoot(renderNode)
+                renderer.createRenderRequest()
+                    .setWaitForPresent(true)
+                    .syncAndDraw()
+
+                val image = imageReader.acquireLatestImage() ?: return null
+                try {
+                    val plane = image.planes[0]
+                    val buffer = plane.buffer
+                    val pixelStride = plane.pixelStride
+                    val rowStride = plane.rowStride
+                    val rowPadding = rowStride - pixelStride * width
+                    val paddedWidth = width + rowPadding / max(pixelStride, 1)
+                    val paddedBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
+                    buffer.rewind()
+                    paddedBitmap.copyPixelsFromBuffer(buffer)
+                    return if (paddedWidth == width) {
+                        paddedBitmap
+                    } else {
+                        val cropped = Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
+                        paddedBitmap.recycle()
+                        cropped
+                    }
+                } finally {
+                    image.close()
+                }
+            } finally {
+                runCatching { renderer.destroy() }
+                runCatching { imageReader.close() }
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private object Api31RenderEffectHelper {
+        fun clearRenderEffect(view: View) {
+            runCatching { view.setRenderEffect(null) }
+        }
+
+        fun applyColorFilterEffectToTextureView(
+            textureView: TextureView,
+            preset: CameraFilterPreset
+        ): Boolean {
+            return runCatching {
+                val cf = CameraFilterProcessor.createColorMatrixColorFilter(preset)
+                textureView.setLayerType(View.LAYER_TYPE_NONE, null)
+                textureView.setRenderEffect(cf?.let { RenderEffect.createColorFilterEffect(it) })
+                cf != null
+            }.onFailure { err ->
+                com.example.core.camera.CrashLogManager.recordNonFatalError("TextureView-RenderEffect", err)
+            }.getOrDefault(false)
         }
     }
 
     /**
      * Pre-warms filter LUTs and filter tray thumbnails on a low-priority background thread so
      * opening the filter panel or capturing the first filtered photo has zero main-thread stutter.
+     * Strictly uses CPU LUTs for tiny thumbnails — never touches EGL or HardwareRenderer during launch.
      */
     fun warmUpAsync() {
         if (!warmedUp.compareAndSet(false, true)) return
-        val thread = Thread(
-            {
-                runCatching {
-                    CameraFilterProcessor.warmUpThumbnailsBlocking()
-                }
-            },
-            "CameraFilterWarmUp"
-        ).apply {
-            isDaemon = true
-            priority = Thread.MIN_PRIORITY
+        runCatching {
+            val thread = Thread(
+                {
+                    runCatching {
+                        CameraFilterProcessor.warmUpThumbnailsBlocking()
+                    }.onFailure { err ->
+                        com.example.core.camera.CrashLogManager.recordNonFatalError("FilterWarmUp", err)
+                    }
+                },
+                "CameraFilterWarmUp"
+            ).apply {
+                isDaemon = true
+                priority = Thread.MIN_PRIORITY
+            }
+            thread.start()
+        }.onFailure { err ->
+            warmedUp.set(false)
+            com.example.core.camera.CrashLogManager.recordNonFatalError("FilterWarmUpStart", err)
         }
-        thread.start()
     }
 
     /**
@@ -388,7 +550,7 @@ object GpuCameraFilterEngine {
         // Always clear outer FrameLayout so it never conflicts with child TextureView rendering.
         if (previewView != null) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                runCatching { previewView.setRenderEffect(null) }
+                Api31RenderEffectHelper.clearRenderEffect(previewView)
             }
             if (previewView.layerType != View.LAYER_TYPE_NONE) {
                 runCatching { previewView.setLayerType(View.LAYER_TYPE_NONE, null) }
@@ -425,7 +587,7 @@ object GpuCameraFilterEngine {
 
     private fun clearTextureViewEffect(textureView: TextureView) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            runCatching { textureView.setRenderEffect(null) }
+            Api31RenderEffectHelper.clearRenderEffect(textureView)
         }
         runCatching { textureView.setLayerType(View.LAYER_TYPE_NONE, null) }
     }
@@ -434,25 +596,16 @@ object GpuCameraFilterEngine {
         textureView: TextureView,
         preset: CameraFilterPreset
     ): String {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val appliedAgsl = runCatching {
-                val shader = createConfiguredAgslShader(preset, 1.0f)
-                val effect = RenderEffect.createRuntimeShaderEffect(shader, "inputShader")
-                textureView.setLayerType(View.LAYER_TYPE_NONE, null)
-                textureView.setRenderEffect(effect)
-                true
-            }.getOrDefault(false)
-            if (appliedAgsl) return "GPU-TextureView-AGSL"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !isEmulatorEnvironment()) {
+            if (Api33AgslHelper.applyAgslEffectToTextureView(textureView, preset)) {
+                return "GPU-TextureView-AGSL"
+            }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val appliedRenderEffect = runCatching {
-                val cf = CameraFilterProcessor.createColorMatrixColorFilter(preset)
-                textureView.setLayerType(View.LAYER_TYPE_NONE, null)
-                textureView.setRenderEffect(cf?.let { RenderEffect.createColorFilterEffect(it) })
-                cf != null
-            }.getOrDefault(false)
-            if (appliedRenderEffect) return "GPU-TextureView-RenderEffect"
+            if (Api31RenderEffectHelper.applyColorFilterEffectToTextureView(textureView, preset)) {
+                return "GPU-TextureView-RenderEffect"
+            }
         }
 
         val cf = CameraFilterProcessor.createColorMatrixColorFilter(preset)
@@ -485,14 +638,20 @@ object GpuCameraFilterEngine {
         val height = source.height
         if (width <= 0 || height <= 0) return null
 
-        // Skip GPU attempt in Robolectric/JVM unit tests where native RenderNode/EGL drivers don't exist
-        if (isJvmOrRobolectricEnvironment()) {
+        // Skip GPU attempt for tiny bitmaps (such as 88x88 filter tray thumbnails warmed up at startup)
+        // or on Robolectric / basic emulator software GPU environments — CPU LUTs handle them safely in <1ms.
+        if ((width < MIN_GPU_BITMAP_DIM_PX && height < MIN_GPU_BITMAP_DIM_PX) ||
+            isJvmOrRobolectricEnvironment() ||
+            isEmulatorEnvironment()
+        ) {
             return null
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val agslResult = runCatching {
                 applyFilterWithAgslHardwareRenderer(source, preset, intensity)
+            }.onFailure { err ->
+                com.example.core.camera.CrashLogManager.recordNonFatalError("BitmapFilter-AGSL", err)
             }.getOrNull()
             if (agslResult != null) {
                 return agslResult to "GPU-AGSL"
@@ -501,6 +660,8 @@ object GpuCameraFilterEngine {
 
         val glesResult = runCatching {
             applyFilterWithEglOffscreen(source, preset, intensity)
+        }.onFailure { err ->
+            com.example.core.camera.CrashLogManager.recordNonFatalError("BitmapFilter-EGL", err)
         }.getOrNull()
         if (glesResult != null) {
             return glesResult to "GPU-GLES"
@@ -524,7 +685,7 @@ object GpuCameraFilterEngine {
         val width = source.width
         val height = source.height
         if (width <= MAX_GPU_TILE_DIM && height <= MAX_GPU_TILE_DIM) {
-            return renderAgslTile(source, preset, intensity)
+            return Api33AgslHelper.renderAgslTile(source, preset, intensity)
         }
 
         // Tile very large bitmaps (e.g., 12–108 MP) so we never exceed GPU texture limits
@@ -538,7 +699,7 @@ object GpuCameraFilterEngine {
                 val tileW = min(MAX_GPU_TILE_DIM, width - x)
                 val sub = Bitmap.createBitmap(source, x, y, tileW, tileH)
                 try {
-                    val rendered = renderAgslTile(sub, preset, intensity) ?: run {
+                    val rendered = Api33AgslHelper.renderAgslTile(sub, preset, intensity) ?: run {
                         outBitmap.recycle()
                         return null
                     }
@@ -555,67 +716,6 @@ object GpuCameraFilterEngine {
             y += tileH
         }
         return outBitmap
-    }
-
-    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-    private fun renderAgslTile(
-        tile: Bitmap,
-        preset: CameraFilterPreset,
-        intensity: Float
-    ): Bitmap? {
-        val width = tile.width
-        val height = tile.height
-        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        val renderer = HardwareRenderer()
-        val renderNode = RenderNode("CameraFilterNode")
-        try {
-            renderNode.setPosition(0, 0, width, height)
-            val shader = createConfiguredAgslShader(preset, intensity)
-            shader.setInputShader(
-                "inputShader",
-                BitmapShader(tile, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-            )
-            val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
-                this.shader = shader
-            }
-            val recCanvas = renderNode.beginRecording()
-            try {
-                recCanvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
-            } finally {
-                renderNode.endRecording()
-            }
-
-            renderer.setSurface(imageReader.surface)
-            renderer.setContentRoot(renderNode)
-            renderer.createRenderRequest()
-                .setWaitForPresent(true)
-                .syncAndDraw()
-
-            val image = imageReader.acquireLatestImage() ?: return null
-            try {
-                val plane = image.planes[0]
-                val buffer = plane.buffer
-                val pixelStride = plane.pixelStride
-                val rowStride = plane.rowStride
-                val rowPadding = rowStride - pixelStride * width
-                val paddedWidth = width + rowPadding / max(pixelStride, 1)
-                val paddedBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
-                buffer.rewind()
-                paddedBitmap.copyPixelsFromBuffer(buffer)
-                return if (paddedWidth == width) {
-                    paddedBitmap
-                } else {
-                    val cropped = Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
-                    paddedBitmap.recycle()
-                    cropped
-                }
-            } finally {
-                image.close()
-            }
-        } finally {
-            runCatching { renderer.destroy() }
-            runCatching { imageReader.close() }
-        }
     }
 
     private fun applyFilterWithEglOffscreen(
@@ -749,7 +849,9 @@ object GpuCameraFilterEngine {
             if (eglContext != EGL14.EGL_NO_CONTEXT) {
                 runCatching { EGL14.eglDestroyContext(eglDisplay, eglContext) }
             }
-            runCatching { EGL14.eglTerminate(eglDisplay) }
+            // NEVER call EGL14.eglTerminate(EGL_DEFAULT_DISPLAY): EGL_DEFAULT_DISPLAY is shared
+            // process-wide with HWUI/RenderThread (Compose). Terminating it kills the UI RenderThread!
+            runCatching { EGL14.eglReleaseThread() }
         }
     }
 
@@ -769,7 +871,7 @@ object GpuCameraFilterEngine {
         intensity: Float = 1.0f,
         onProgress: ((Float) -> Unit)? = null
     ): Boolean {
-        if (isJvmOrRobolectricEnvironment()) return false
+        if (isJvmOrRobolectricEnvironment() || isEmulatorEnvironment()) return false
         if (!inputFile.exists() || inputFile.length() == 0L) return false
 
         val params = CameraFilterProcessor.getParameters(preset)
@@ -1026,7 +1128,15 @@ object GpuCameraFilterEngine {
                             audioInfo.offset = 0
                             audioInfo.size = sampleSize
                             audioInfo.presentationTimeUs = audioExtractor.sampleTime
-                            audioInfo.flags = audioExtractor.sampleFlags
+                            val sampleFlags = audioExtractor.sampleFlags
+                            var bufferFlags = 0
+                            if ((sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                                bufferFlags = bufferFlags or MediaCodec.BUFFER_FLAG_KEY_FRAME
+                            }
+                            if ((sampleFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME) != 0) {
+                                bufferFlags = bufferFlags or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+                            }
+                            audioInfo.flags = bufferFlags
                             muxer.writeSampleData(muxerAudioTrack, audioBuffer, audioInfo)
                             if (!audioExtractor.advance()) break
                         }
@@ -1069,7 +1179,8 @@ object GpuCameraFilterEngine {
                 if (eglContext != EGL14.EGL_NO_CONTEXT) {
                     runCatching { EGL14.eglDestroyContext(eglDisplay, eglContext) }
                 }
-                runCatching { EGL14.eglTerminate(eglDisplay) }
+                // Never call eglTerminate on EGL_DEFAULT_DISPLAY (shared with HWUI RenderThread)
+                runCatching { EGL14.eglReleaseThread() }
             }
         }
     }
@@ -1253,6 +1364,8 @@ object GpuCameraFilterEngine {
             GLES20.glUniform3f(shadowTintLoc, params.shadowTintR, params.shadowTintG, params.shadowTintB)
             GLES20.glUniform3f(highlightTintLoc, params.highlightTintR, params.highlightTintG, params.highlightTintB)
 
+            if (positionLoc < 0 || texCoordLoc < 0) return
+
             GLES20.glEnableVertexAttribArray(positionLoc)
             GLES20.glVertexAttribPointer(positionLoc, 2, GLES20.GL_FLOAT, false, 0, quadPositions)
             GLES20.glEnableVertexAttribArray(texCoordLoc)
@@ -1312,13 +1425,21 @@ object GpuCameraFilterEngine {
  * `Preview` and `VideoCapture` output surfaces with zero main-thread blocking and instant,
  * rebind-free filter switching whenever [activePreset] changes.
  */
-class GlFilterSurfaceProcessor : SurfaceProcessor {
+class GlFilterSurfaceProcessor(
+    private val onGlRuntimeError: ((Throwable) -> Unit)? = null
+) : SurfaceProcessor {
     private val glThread = HandlerThread("GlCameraFilterThread").apply { start() }
     private val glHandler = Handler(glThread.looper)
 
     val glExecutor: Executor = Executor { command ->
         if (!released.get()) {
-            glHandler.post(command)
+            glHandler.post {
+                try {
+                    command.run()
+                } catch (t: Throwable) {
+                    handleGlFailure("glExecutor", t)
+                }
+            }
         }
     }
 
@@ -1329,6 +1450,7 @@ class GlFilterSurfaceProcessor : SurfaceProcessor {
     var activeIntensity: Float = 1.0f
 
     private val released = AtomicBoolean(false)
+    private val errorReported = AtomicBoolean(false)
     private val activeOutputCount = AtomicInteger(0)
     private val renderedFrameCounter = AtomicLong(0L)
 
@@ -1359,126 +1481,162 @@ class GlFilterSurfaceProcessor : SurfaceProcessor {
     private val inputTexMatrix = FloatArray(16)
     private val outputTexMatrix = FloatArray(16)
 
+    private fun handleGlFailure(stage: String, throwable: Throwable) {
+        com.example.core.camera.CrashLogManager.recordNonFatalError("GlFilterSurfaceProcessor.$stage", throwable)
+        GpuCameraFilterEngine.markGlSurfaceProcessorFailed()
+        if (errorReported.compareAndSet(false, true)) {
+            runCatching { onGlRuntimeError?.invoke(throwable) }
+        }
+    }
+
     private fun ensureGlInitialized(): Boolean {
         if (eglContext != EGL14.EGL_NO_CONTEXT && filterProgram?.isValid == true) {
             return true
         }
-        eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-        if (eglDisplay == EGL14.EGL_NO_DISPLAY) return false
-        val versions = IntArray(2)
-        if (!EGL14.eglInitialize(eglDisplay, versions, 0, versions, 1)) return false
+        return try {
+            eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+            if (eglDisplay == EGL14.EGL_NO_DISPLAY) return false
+            val versions = IntArray(2)
+            if (!EGL14.eglInitialize(eglDisplay, versions, 0, versions, 1)) return false
 
-        val config = GpuCameraFilterEngine.chooseEglConfig(eglDisplay, recordable = true) ?: return false
-        eglConfig = config
-        val ctxAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
-        eglContext = EGL14.eglCreateContext(eglDisplay, config, EGL14.EGL_NO_CONTEXT, ctxAttribs, 0)
-        if (eglContext == EGL14.EGL_NO_CONTEXT) return false
+            val config = GpuCameraFilterEngine.chooseEglConfig(eglDisplay, recordable = true) ?: return false
+            eglConfig = config
+            val ctxAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+            eglContext = EGL14.eglCreateContext(eglDisplay, config, EGL14.EGL_NO_CONTEXT, ctxAttribs, 0)
+            if (eglContext == EGL14.EGL_NO_CONTEXT) return false
 
-        val pbufferAttribs = intArrayOf(
-            EGL14.EGL_WIDTH, 1,
-            EGL14.EGL_HEIGHT, 1,
-            EGL14.EGL_NONE
-        )
-        tempPbufferSurface = EGL14.eglCreatePbufferSurface(eglDisplay, config, pbufferAttribs, 0)
-        if (tempPbufferSurface == EGL14.EGL_NO_SURFACE) return false
+            val pbufferAttribs = intArrayOf(
+                EGL14.EGL_WIDTH, 1,
+                EGL14.EGL_HEIGHT, 1,
+                EGL14.EGL_NONE
+            )
+            tempPbufferSurface = EGL14.eglCreatePbufferSurface(eglDisplay, config, pbufferAttribs, 0)
+            if (tempPbufferSurface == EGL14.EGL_NO_SURFACE) return false
 
-        if (!EGL14.eglMakeCurrent(eglDisplay, tempPbufferSurface, tempPbufferSurface, eglContext)) {
-            return false
+            if (!EGL14.eglMakeCurrent(eglDisplay, tempPbufferSurface, tempPbufferSurface, eglContext)) {
+                return false
+            }
+
+            filterProgram = GpuCameraFilterEngine.GlFilterProgram(isExternalOes = true)
+            filterProgram?.isValid == true
+        } catch (t: Throwable) {
+            handleGlFailure("ensureGlInitialized", t)
+            false
         }
-
-        filterProgram = GpuCameraFilterEngine.GlFilterProgram(isExternalOes = true)
-        return filterProgram?.isValid == true
     }
 
     override fun onInputSurface(request: SurfaceRequest) {
         if (released.get()) {
-            request.willNotProvideSurface()
+            runCatching { request.willNotProvideSurface() }
             return
         }
         glExecutor.execute {
             if (released.get() || !ensureGlInitialized()) {
-                request.willNotProvideSurface()
+                runCatching { request.willNotProvideSurface() }
+                if (!released.get()) {
+                    handleGlFailure("onInputSurface.init", IllegalStateException("EGL/GLSL initialization failed"))
+                }
                 return@execute
             }
 
-            // Release any stale input surface from a previous pipeline bind
-            releaseInputSurfaceInternal()
+            try {
+                // Release any stale input surface from a previous pipeline bind
+                releaseInputSurfaceInternal()
 
-            EGL14.eglMakeCurrent(eglDisplay, tempPbufferSurface, tempPbufferSurface, eglContext)
-            val textures = IntArray(1)
-            GLES20.glGenTextures(1, textures, 0)
-            inputTextureId = textures[0]
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inputTextureId)
-            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-
-            val st = SurfaceTexture(inputTextureId).apply {
-                setDefaultBufferSize(request.resolution.width, request.resolution.height)
-                setOnFrameAvailableListener({ renderAvailableFrame() }, glHandler)
-            }
-            val surface = Surface(st)
-            inputSurfaceTexture = st
-            inputSurface = surface
-
-            request.provideSurface(surface, glExecutor) {
-                // Only clean up if this callback belongs to the current surface
-                if (inputSurface === surface) {
-                    releaseInputSurfaceInternal()
-                } else {
-                    runCatching { surface.release() }
-                    runCatching { st.release() }
+                if (!EGL14.eglMakeCurrent(eglDisplay, tempPbufferSurface, tempPbufferSurface, eglContext)) {
+                    throw IllegalStateException("eglMakeCurrent failed in onInputSurface")
                 }
+                val textures = IntArray(1)
+                GLES20.glGenTextures(1, textures, 0)
+                inputTextureId = textures[0]
+                if (inputTextureId == 0) {
+                    throw IllegalStateException("glGenTextures returned 0")
+                }
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, inputTextureId)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+                val st = SurfaceTexture(inputTextureId).apply {
+                    setDefaultBufferSize(request.resolution.width, request.resolution.height)
+                    setOnFrameAvailableListener({ renderAvailableFrame() }, glHandler)
+                }
+                val surface = Surface(st)
+                inputSurfaceTexture = st
+                inputSurface = surface
+
+                request.provideSurface(surface, glExecutor) {
+                    // Only clean up if this callback belongs to the current surface
+                    if (inputSurface === surface) {
+                        releaseInputSurfaceInternal()
+                    } else {
+                        runCatching { surface.release() }
+                        runCatching { st.release() }
+                    }
+                }
+            } catch (t: Throwable) {
+                releaseInputSurfaceInternal()
+                runCatching { request.willNotProvideSurface() }
+                handleGlFailure("onInputSurface", t)
             }
         }
     }
 
     override fun onOutputSurface(surfaceOutput: SurfaceOutput) {
         if (released.get()) {
-            surfaceOutput.close()
+            runCatching { surfaceOutput.close() }
             return
         }
         glExecutor.execute {
             if (released.get() || !ensureGlInitialized()) {
-                surfaceOutput.close()
-                return@execute
-            }
-
-            val surface = surfaceOutput.getSurface(glExecutor) { event ->
-                if (event.eventCode == SurfaceOutput.Event.EVENT_REQUEST_CLOSE) {
-                    removeOutputSurfaceInternal(surfaceOutput)
-                    runCatching { surfaceOutput.close() }
+                runCatching { surfaceOutput.close() }
+                if (!released.get()) {
+                    handleGlFailure("onOutputSurface.init", IllegalStateException("EGL/GLSL initialization failed"))
                 }
-            }
-
-            val config = eglConfig ?: run {
-                surfaceOutput.close()
                 return@execute
             }
 
-            val eglWindowSurface = runCatching {
-                EGL14.eglCreateWindowSurface(
-                    eglDisplay,
-                    config,
-                    surface,
-                    intArrayOf(EGL14.EGL_NONE),
-                    0
+            try {
+                val surface = surfaceOutput.getSurface(glExecutor) { event ->
+                    if (event.eventCode == SurfaceOutput.Event.EVENT_REQUEST_CLOSE) {
+                        removeOutputSurfaceInternal(surfaceOutput)
+                        runCatching { surfaceOutput.close() }
+                    }
+                }
+
+                val config = eglConfig ?: run {
+                    runCatching { surfaceOutput.close() }
+                    return@execute
+                }
+
+                val eglWindowSurface = runCatching {
+                    EGL14.eglCreateWindowSurface(
+                        eglDisplay,
+                        config,
+                        surface,
+                        intArrayOf(EGL14.EGL_NONE),
+                        0
+                    )
+                }.getOrDefault(EGL14.EGL_NO_SURFACE)
+
+                if (eglWindowSurface == EGL14.EGL_NO_SURFACE) {
+                    runCatching { surfaceOutput.close() }
+                    handleGlFailure("onOutputSurface.window", IllegalStateException("eglCreateWindowSurface returned EGL_NO_SURFACE"))
+                    return@execute
+                }
+
+                outputTargets[surfaceOutput] = OutputTarget(
+                    surfaceOutput = surfaceOutput,
+                    surface = surface,
+                    eglSurface = eglWindowSurface,
+                    size = surfaceOutput.size
                 )
-            }.getOrDefault(EGL14.EGL_NO_SURFACE)
-
-            if (eglWindowSurface == EGL14.EGL_NO_SURFACE) {
-                surfaceOutput.close()
-                return@execute
+                activeOutputCount.set(outputTargets.size)
+            } catch (t: Throwable) {
+                runCatching { surfaceOutput.close() }
+                handleGlFailure("onOutputSurface", t)
             }
-
-            outputTargets[surfaceOutput] = OutputTarget(
-                surfaceOutput = surfaceOutput,
-                surface = surface,
-                eglSurface = eglWindowSurface,
-                size = surfaceOutput.size
-            )
-            activeOutputCount.set(outputTargets.size)
         }
     }
 
@@ -1488,46 +1646,46 @@ class GlFilterSurfaceProcessor : SurfaceProcessor {
         val program = filterProgram ?: return
         if (!program.isValid || inputTextureId == 0) return
 
-        runCatching {
+        try {
             if (eglDisplay != EGL14.EGL_NO_DISPLAY && tempPbufferSurface != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglMakeCurrent(eglDisplay, tempPbufferSurface, tempPbufferSurface, eglContext)
             }
             st.updateTexImage()
             st.getTransformMatrix(inputTexMatrix)
-        }.onFailure {
-            return
-        }
 
-        if (outputTargets.isEmpty()) return
+            if (outputTargets.isEmpty()) return
 
-        val timestampNs = st.timestamp
-        val preset = activePreset
-        val intensity = activeIntensity
-        val params = CameraFilterProcessor.getParameters(preset)
+            val timestampNs = st.timestamp
+            val preset = activePreset
+            val intensity = activeIntensity
+            val params = CameraFilterProcessor.getParameters(preset)
 
-        val iterator = outputTargets.values.iterator()
-        while (iterator.hasNext()) {
-            val target = iterator.next()
-            if (!target.surface.isValid) continue
-            runCatching {
-                target.surfaceOutput.updateTransformMatrix(outputTexMatrix, inputTexMatrix)
-                if (EGL14.eglMakeCurrent(eglDisplay, target.eglSurface, target.eglSurface, eglContext)) {
-                    GLES20.glViewport(0, 0, target.size.width, target.size.height)
-                    program.draw(
-                        textureId = inputTextureId,
-                        texMatrix = outputTexMatrix,
-                        params = params,
-                        intensity = intensity,
-                        flipVertical = false
-                    )
-                    if (timestampNs > 0L) {
-                        EGLExt.eglPresentationTimeANDROID(eglDisplay, target.eglSurface, timestampNs)
+            val iterator = outputTargets.values.iterator()
+            while (iterator.hasNext()) {
+                val target = iterator.next()
+                if (!target.surface.isValid) continue
+                runCatching {
+                    target.surfaceOutput.updateTransformMatrix(outputTexMatrix, inputTexMatrix)
+                    if (EGL14.eglMakeCurrent(eglDisplay, target.eglSurface, target.eglSurface, eglContext)) {
+                        GLES20.glViewport(0, 0, target.size.width, target.size.height)
+                        program.draw(
+                            textureId = inputTextureId,
+                            texMatrix = outputTexMatrix,
+                            params = params,
+                            intensity = intensity,
+                            flipVertical = false
+                        )
+                        if (timestampNs > 0L) {
+                            EGLExt.eglPresentationTimeANDROID(eglDisplay, target.eglSurface, timestampNs)
+                        }
+                        EGL14.eglSwapBuffers(eglDisplay, target.eglSurface)
                     }
-                    EGL14.eglSwapBuffers(eglDisplay, target.eglSurface)
                 }
             }
+            renderedFrameCounter.incrementAndGet()
+        } catch (t: Throwable) {
+            handleGlFailure("renderAvailableFrame", t)
         }
-        renderedFrameCounter.incrementAndGet()
     }
 
     private fun removeOutputSurfaceInternal(surfaceOutput: SurfaceOutput) {
@@ -1558,39 +1716,45 @@ class GlFilterSurfaceProcessor : SurfaceProcessor {
 
     fun release() {
         if (!released.compareAndSet(false, true)) return
-        glHandler.post {
-            releaseInputSurfaceInternal()
-            val outputs = outputTargets.keys.toList()
-            outputs.forEach { out ->
-                removeOutputSurfaceInternal(out)
-                runCatching { out.close() }
-            }
-            outputTargets.clear()
-            activeOutputCount.set(0)
-            filterProgram?.release()
-            filterProgram = null
-            if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+        runCatching {
+            glHandler.post {
                 runCatching {
-                    EGL14.eglMakeCurrent(
-                        eglDisplay,
-                        EGL14.EGL_NO_SURFACE,
-                        EGL14.EGL_NO_SURFACE,
-                        EGL14.EGL_NO_CONTEXT
-                    )
+                    releaseInputSurfaceInternal()
+                    val outputs = outputTargets.keys.toList()
+                    outputs.forEach { out ->
+                        removeOutputSurfaceInternal(out)
+                        runCatching { out.close() }
+                    }
+                    outputTargets.clear()
+                    activeOutputCount.set(0)
+                    filterProgram?.release()
+                    filterProgram = null
+                    if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                        runCatching {
+                            EGL14.eglMakeCurrent(
+                                eglDisplay,
+                                EGL14.EGL_NO_SURFACE,
+                                EGL14.EGL_NO_SURFACE,
+                                EGL14.EGL_NO_CONTEXT
+                            )
+                        }
+                        if (tempPbufferSurface != EGL14.EGL_NO_SURFACE) {
+                            runCatching { EGL14.eglDestroySurface(eglDisplay, tempPbufferSurface) }
+                        }
+                        if (eglContext != EGL14.EGL_NO_CONTEXT) {
+                            runCatching { EGL14.eglDestroyContext(eglDisplay, eglContext) }
+                        }
+                        // NEVER call EGL14.eglTerminate(EGL_DEFAULT_DISPLAY): it is shared process-wide
+                        // with HWUI RenderThread! Only release this thread's EGL state.
+                        runCatching { EGL14.eglReleaseThread() }
+                    }
+                    eglDisplay = EGL14.EGL_NO_DISPLAY
+                    eglContext = EGL14.EGL_NO_CONTEXT
+                    tempPbufferSurface = EGL14.EGL_NO_SURFACE
+                    eglConfig = null
                 }
-                if (tempPbufferSurface != EGL14.EGL_NO_SURFACE) {
-                    runCatching { EGL14.eglDestroySurface(eglDisplay, tempPbufferSurface) }
-                }
-                if (eglContext != EGL14.EGL_NO_CONTEXT) {
-                    runCatching { EGL14.eglDestroyContext(eglDisplay, eglContext) }
-                }
-                runCatching { EGL14.eglTerminate(eglDisplay) }
+                runCatching { glThread.quitSafely() }
             }
-            eglDisplay = EGL14.EGL_NO_DISPLAY
-            eglContext = EGL14.EGL_NO_CONTEXT
-            tempPbufferSurface = EGL14.EGL_NO_SURFACE
-            eglConfig = null
-            glThread.quitSafely()
         }
     }
 }

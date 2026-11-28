@@ -526,10 +526,16 @@ fun CameraXViewfinder(
 
     // Preload and warm up heavy mode resources on background threads so first capture/panel open is instant.
     LaunchedEffect(activeMode) {
-        when (activeMode) {
-            CameraMode.PORTRAIT -> PortraitProcessor.warmUpSegmentationModelAsync()
-            CameraMode.PHOTO, CameraMode.VIDEO -> GpuCameraFilterEngine.warmUpAsync()
-            else -> Unit
+        try {
+            when (activeMode) {
+                CameraMode.PORTRAIT -> PortraitProcessor.warmUpSegmentationModelAsync()
+                CameraMode.PHOTO, CameraMode.VIDEO -> GpuCameraFilterEngine.warmUpAsync()
+                else -> Unit
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            com.example.core.camera.CrashLogManager.recordNonFatalError("CameraXViewfinder.ModeWarmUp", t)
         }
     }
 
@@ -666,9 +672,24 @@ fun CameraXViewfinder(
     }
 
     // Real-time GPU OpenGL ES 2.0 SurfaceProcessor shared across Photo preview and Video preview + recording.
-    val glFilterProcessor = remember { GlFilterSurfaceProcessor() }
+    var glRuntimeFailed by remember { mutableStateOf(false) }
     var isGlPreviewEffectBound by remember { mutableStateOf(false) }
     var isGlVideoEffectBound by remember { mutableStateOf(false) }
+    val glFilterProcessor = remember {
+        GlFilterSurfaceProcessor(
+            onGlRuntimeError = { err ->
+                Log.w(TAG, "GL SurfaceProcessor runtime failure; falling back to standard CameraX preview", err)
+                ContextCompat.getMainExecutor(context).execute {
+                    if (!glRuntimeFailed) {
+                        glRuntimeFailed = true
+                        isGlPreviewEffectBound = false
+                        isGlVideoEffectBound = false
+                        rebindTrigger++
+                    }
+                }
+            }
+        )
+    }
 
     DisposableEffect(glFilterProcessor) {
         onDispose {
@@ -919,10 +940,15 @@ fun CameraXViewfinder(
                 activeMode = activeMode,
                 photoCaptureSpeedMode = photoCaptureSpeedMode
             )
-            val desiredGlEffectTargets = when (activeMode) {
-                CameraMode.VIDEO -> CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE
-                CameraMode.PHOTO -> CameraEffect.PREVIEW
-                else -> 0
+            val canUseGlCameraEffect = GpuCameraFilterEngine.isGpuCameraEffectSupported() && !glRuntimeFailed
+            val desiredGlEffectTargets = if (!canUseGlCameraEffect) {
+                0
+            } else {
+                when (activeMode) {
+                    CameraMode.VIDEO -> CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE
+                    CameraMode.PHOTO -> CameraEffect.PREVIEW
+                    else -> 0
+                }
             }
 
             val desiredBindConfig = if (activeMode.isVideo) {
@@ -1149,7 +1175,17 @@ fun CameraXViewfinder(
                             try {
                                 val glVideoEffect = GpuCameraFilterEngine.createGlCameraEffect(
                                     targets = CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE,
-                                    processor = glFilterProcessor
+                                    processor = glFilterProcessor,
+                                    onError = { err ->
+                                        com.example.core.camera.CrashLogManager.recordNonFatalError("GlVideoCameraEffect", err)
+                                        GpuCameraFilterEngine.markGlSurfaceProcessorFailed()
+                                        ContextCompat.getMainExecutor(context).execute {
+                                            if (!glRuntimeFailed) {
+                                                glRuntimeFailed = true
+                                                rebindTrigger++
+                                            }
+                                        }
+                                    }
                                 )
                                 val videoUseCaseGroup = UseCaseGroup.Builder()
                                     .addUseCase(preview)
@@ -1168,7 +1204,9 @@ fun CameraXViewfinder(
                                     TAG,
                                     "Bound GPU-filtered Video pipeline (${reconciled.resolution.displayName} @ ${reconciled.frameRate.displayName}, Stab=${reconciled.stabilization.displayName}) on ${activeLens.displayName}"
                                 )
-                            } catch (glExc: Exception) {
+                            } catch (glExc: Throwable) {
+                                if (glExc is kotlinx.coroutines.CancellationException) throw glExc
+                                com.example.core.camera.CrashLogManager.recordNonFatalError("GlVideoEffectBind", glExc)
                                 Log.w(TAG, "GPU Video CameraEffect bind rejected by device; falling back to standard Video bind", glExc)
                                 cameraProvider.unbindAll()
                                 boundCam = cameraProvider.bindToLifecycle(
@@ -1433,13 +1471,23 @@ fun CameraXViewfinder(
                             boundImgCap = imageCapture
                             boundExtMode = androidx.camera.extensions.ExtensionMode.NONE
                             Log.d(TAG, "Successfully bound Preview + ImageCapture + ImageAnalysis for Panorama Mode")
-                        } else if (activeMode == CameraMode.PHOTO) {
-                            // In Photo mode, attach real-time GPU OpenGL ES CameraEffect to Preview ONLY
+                        } else if (activeMode == CameraMode.PHOTO && desiredGlEffectTargets != 0) {
+                            // In Photo mode on supported hardware, attach real-time GPU OpenGL ES CameraEffect to Preview ONLY
                             // (keeping ImageCapture full-res / ZSL untouched; saved JPEG applies matching GPU shader).
                             try {
                                 val glPreviewEffect = GpuCameraFilterEngine.createGlCameraEffect(
                                     targets = CameraEffect.PREVIEW,
-                                    processor = glFilterProcessor
+                                    processor = glFilterProcessor,
+                                    onError = { err ->
+                                        com.example.core.camera.CrashLogManager.recordNonFatalError("GlPhotoCameraEffect", err)
+                                        GpuCameraFilterEngine.markGlSurfaceProcessorFailed()
+                                        ContextCompat.getMainExecutor(context).execute {
+                                            if (!glRuntimeFailed) {
+                                                glRuntimeFailed = true
+                                                rebindTrigger++
+                                            }
+                                        }
+                                    }
                                 )
                                 val photoUseCaseGroup = UseCaseGroup.Builder()
                                     .addUseCase(preview)
@@ -1458,7 +1506,9 @@ fun CameraXViewfinder(
                                     TAG,
                                     "Successfully bound GPU-filtered Photo Preview + ImageCapture (captureMode=$initialCaptureMode, ext=${com.example.core.camera.CameraExtensionsHelper.extensionModeDisplayName(boundExtMode)}, hqIsp=$preferHighQualityIsp)"
                                 )
-                            } catch (glExc: Exception) {
+                            } catch (glExc: Throwable) {
+                                if (glExc is kotlinx.coroutines.CancellationException) throw glExc
+                                com.example.core.camera.CrashLogManager.recordNonFatalError("GlPhotoEffectBind", glExc)
                                 Log.w(TAG, "GPU Photo Preview CameraEffect declined (ext=$candidateExtMode); binding standard Preview + ImageCapture with TextureView GPU fallback", glExc)
                                 cameraProvider.unbindAll()
                                 if (!effectivePreviewFilter.isOriginal &&
@@ -1662,9 +1712,12 @@ fun CameraXViewfinder(
                 }
 
                 Log.d(TAG, "CameraX successfully bound to lifecycle for ${activeLens.displayName}")
-        } catch (exc: Exception) {
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (exc: Throwable) {
+            com.example.core.camera.CrashLogManager.recordNonFatalError("CameraXBindPipeline", exc)
             Log.e(TAG, "Failed to bind CameraX use cases", exc)
-            onCameraError?.invoke("Failed to initialize camera stream: ${exc.localizedMessage}")
+            onCameraError?.invoke("Failed to initialize camera stream: ${exc.localizedMessage ?: exc.javaClass.simpleName}")
         }
     }
 
@@ -5997,7 +6050,8 @@ fun queryDeviceCameraCapabilities(
                         }
                     }
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                com.example.core.camera.CrashLogManager.recordNonFatalError("CameraXCapabilityQuery", e)
                 Log.w(TAG, "Unable to query CameraX VideoCapabilities/Extensions for ${lens.displayName}", e)
             }
             val ispQualityCapabilities = com.example.core.camera.IspQualityCapabilities.fromCameraCharacteristics(
@@ -6191,7 +6245,8 @@ fun queryDeviceCameraCapabilities(
 
             capabilitiesMap[lens] = lensCap
         }
-    } catch (exc: Exception) {
+    } catch (exc: Throwable) {
+        com.example.core.camera.CrashLogManager.recordNonFatalError("Camera2CapabilityDiscovery", exc)
         Log.e(TAG, "Error discovering Camera2 characteristics", exc)
     }
     return capabilitiesMap

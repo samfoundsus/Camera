@@ -69,7 +69,10 @@ import java.util.concurrent.atomic.AtomicReference
 @Config(sdk = [35])
 class CaptureSpeedAndQualityTest {
 
-    @get:Rule
+    @get:Rule(order = 0)
+    val testTimeoutRule = MainThreadSafeTimeoutRule(30_000L)
+
+    @get:Rule(order = 1)
     val composeTestRule = createComposeRule()
 
     @Before

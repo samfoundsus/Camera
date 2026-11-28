@@ -81,7 +81,10 @@ import kotlin.math.abs
 @Config(sdk = [35])
 class CameraFourFixesVerificationTest {
 
-    @get:Rule
+    @get:Rule(order = 0)
+    val testTimeoutRule = MainThreadSafeTimeoutRule(30_000L)
+
+    @get:Rule(order = 1)
     val composeTestRule = createComposeRule()
 
     // =========================================================================
@@ -498,24 +501,26 @@ class CameraFourFixesVerificationTest {
         assertEquals(0, shutterClicks)
 
         // During PROCESSING: distinct spinning ring visible, button disabled
-        stateHolder.value = NightSightProgressState(
-            phase = NightSightCapturePhase.PROCESSING,
-            currentFrame = 6,
-            totalFrames = 6,
-            progress = 0.55f,
-            statusLabel = "55%"
-        )
-        composeTestRule.mainClock.advanceTimeBy(250L)
+        applyComposeStateAndAdvance(250L) {
+            stateHolder.value = NightSightProgressState(
+                phase = NightSightCapturePhase.PROCESSING,
+                currentFrame = 6,
+                totalFrames = 6,
+                progress = 0.55f,
+                statusLabel = "55%"
+            )
+        }
         composeTestRule.onNodeWithTag("night_sight_shutter_processing_ring", useUnmergedTree = true).assertIsDisplayed()
         composeTestRule.onNodeWithText("55%", useUnmergedTree = true).assertIsDisplayed()
 
         // On COMPLETED: completion ring displayed
-        stateHolder.value = NightSightProgressState(
-            phase = NightSightCapturePhase.COMPLETED,
-            progress = 1.0f,
-            statusLabel = "Saved"
-        )
-        composeTestRule.mainClock.advanceTimeBy(250L)
+        applyComposeStateAndAdvance(250L) {
+            stateHolder.value = NightSightProgressState(
+                phase = NightSightCapturePhase.COMPLETED,
+                progress = 1.0f,
+                statusLabel = "Saved"
+            )
+        }
         composeTestRule.onNodeWithTag("night_sight_shutter_completed", useUnmergedTree = true).assertIsDisplayed()
     }
 
@@ -778,17 +783,18 @@ class CameraFourFixesVerificationTest {
         assertEquals(0, idleShutterClicks)
 
         // 2. ASTRO PROCESSING: distinct spinning processing ring + percentage, shutter strictly disabled
-        stateHolder.value = ShutterProgressState(
-            mode = ShutterProgressMode.ASTRO,
-            phase = ShutterProgressPhase.PROCESSING,
-            currentFrame = 3,
-            totalFrames = 10,
-            progress = 0.45f,
-            statusLabel = "45%",
-            detailLabel = "Aligning & stacking… 45%",
-            canStopAndSave = false
-        )
-        composeTestRule.mainClock.advanceTimeBy(250L)
+        applyComposeStateAndAdvance(250L) {
+            stateHolder.value = ShutterProgressState(
+                mode = ShutterProgressMode.ASTRO,
+                phase = ShutterProgressPhase.PROCESSING,
+                currentFrame = 3,
+                totalFrames = 10,
+                progress = 0.45f,
+                statusLabel = "45%",
+                detailLabel = "Aligning & stacking… 45%",
+                canStopAndSave = false
+            )
+        }
         composeTestRule.onNodeWithTag("astro_shutter_processing_ring", useUnmergedTree = true).assertIsDisplayed()
         composeTestRule.onNodeWithText("Aligning & stacking… 45%", useUnmergedTree = true).assertIsDisplayed()
         composeTestRule.onNodeWithTag("shutter_button").performClick()
@@ -797,21 +803,22 @@ class CameraFourFixesVerificationTest {
         assertEquals(0, idleShutterClicks)
 
         // 3. TIME LAPSE CAPTURING (unlimited pulse): stop button + elapsed & frame count near shutter
-        modeHolder.value = CameraMode.TIME_LAPSE
-        stateHolder.value = ShutterProgressState(
-            mode = ShutterProgressMode.TIME_LAPSE,
-            phase = ShutterProgressPhase.CAPTURING,
-            currentFrame = 15,
-            totalFrames = 0,
-            progress = 0f,
-            isIndeterminateCapture = true,
-            framePulseCount = 15,
-            elapsedSeconds = 15L,
-            remainingSeconds = null,
-            statusLabel = "00:15",
-            detailLabel = formatTimeLapseCaptureCaption(15L, 15, null, null)
-        )
-        composeTestRule.mainClock.advanceTimeBy(250L)
+        applyComposeStateAndAdvance(250L) {
+            modeHolder.value = CameraMode.TIME_LAPSE
+            stateHolder.value = ShutterProgressState(
+                mode = ShutterProgressMode.TIME_LAPSE,
+                phase = ShutterProgressPhase.CAPTURING,
+                currentFrame = 15,
+                totalFrames = 0,
+                progress = 0f,
+                isIndeterminateCapture = true,
+                framePulseCount = 15,
+                elapsedSeconds = 15L,
+                remainingSeconds = null,
+                statusLabel = "00:15",
+                detailLabel = formatTimeLapseCaptureCaption(15L, 15, null, null)
+            )
+        }
         composeTestRule.onNodeWithTag("timelapse_shutter_capture_progress", useUnmergedTree = true).assertIsDisplayed()
         composeTestRule.onNodeWithText("00:15 • 15 frames", useUnmergedTree = true).assertIsDisplayed()
         composeTestRule.onNodeWithTag("shutter_button").performClick()
@@ -819,26 +826,28 @@ class CameraFourFixesVerificationTest {
         assertEquals(2, activeShutterClicks)
 
         // 4. TIME LAPSE PROCESSING -> COMPLETED ("Saved")
-        stateHolder.value = ShutterProgressState(
-            mode = ShutterProgressMode.TIME_LAPSE,
-            phase = ShutterProgressPhase.PROCESSING,
-            currentFrame = 15,
-            progress = 0.60f,
-            statusLabel = "60%",
-            detailLabel = "Building time-lapse… 60%"
-        )
-        composeTestRule.mainClock.advanceTimeBy(250L)
+        applyComposeStateAndAdvance(250L) {
+            stateHolder.value = ShutterProgressState(
+                mode = ShutterProgressMode.TIME_LAPSE,
+                phase = ShutterProgressPhase.PROCESSING,
+                currentFrame = 15,
+                progress = 0.60f,
+                statusLabel = "60%",
+                detailLabel = "Building time-lapse… 60%"
+            )
+        }
         composeTestRule.onNodeWithTag("timelapse_shutter_processing_ring", useUnmergedTree = true).assertIsDisplayed()
         composeTestRule.onNodeWithText("Building time-lapse… 60%", useUnmergedTree = true).assertIsDisplayed()
 
-        stateHolder.value = ShutterProgressState(
-            mode = ShutterProgressMode.TIME_LAPSE,
-            phase = ShutterProgressPhase.COMPLETED,
-            progress = 1.0f,
-            statusLabel = "Saved",
-            detailLabel = "Saved"
-        )
-        composeTestRule.mainClock.advanceTimeBy(250L)
+        applyComposeStateAndAdvance(250L) {
+            stateHolder.value = ShutterProgressState(
+                mode = ShutterProgressMode.TIME_LAPSE,
+                phase = ShutterProgressPhase.COMPLETED,
+                progress = 1.0f,
+                statusLabel = "Saved",
+                detailLabel = "Saved"
+            )
+        }
         composeTestRule.onNodeWithTag("timelapse_shutter_completed", useUnmergedTree = true).assertIsDisplayed()
         composeTestRule.onNodeWithText("Saved", useUnmergedTree = true).assertIsDisplayed()
     }
@@ -1041,26 +1050,28 @@ class CameraFourFixesVerificationTest {
         assertEquals("Portrait shutter should allow next shot while background queue has capacity", 1, shutterClicks)
 
         // 3. When queue is full (allowConcurrentCapture = false), shutter blocks duplicate clicks
-        stateHolder.value = stateHolder.value.copy(
-            detailLabel = "Processing 3 portraits…",
-            allowConcurrentCapture = false
-        )
-        composeTestRule.mainClock.advanceTimeBy(250L)
+        applyComposeStateAndAdvance(250L) {
+            stateHolder.value = stateHolder.value.copy(
+                detailLabel = "Processing 3 portraits…",
+                allowConcurrentCapture = false
+            )
+        }
         composeTestRule.onNodeWithTag("shutter_button").performClick()
         composeTestRule.mainClock.advanceTimeBy(100L)
         assertEquals("Portrait shutter should stay disabled when background queue is full", 1, shutterClicks)
 
         // 4. Completion transitions to "Saved" ring & clears instant preview once saved URI replaces it
-        thumbHolder.value = null
-        stateHolder.value = ShutterProgressState(
-            mode = ShutterProgressMode.PORTRAIT,
-            phase = ShutterProgressPhase.COMPLETED,
-            progress = 1.0f,
-            statusLabel = "Saved",
-            detailLabel = "Saved",
-            allowConcurrentCapture = true
-        )
-        composeTestRule.mainClock.advanceTimeBy(250L)
+        applyComposeStateAndAdvance(250L) {
+            thumbHolder.value = null
+            stateHolder.value = ShutterProgressState(
+                mode = ShutterProgressMode.PORTRAIT,
+                phase = ShutterProgressPhase.COMPLETED,
+                progress = 1.0f,
+                statusLabel = "Saved",
+                detailLabel = "Saved",
+                allowConcurrentCapture = true
+            )
+        }
         composeTestRule.onNodeWithTag("portrait_shutter_completed", useUnmergedTree = true).assertIsDisplayed()
         composeTestRule.onNodeWithText("Saved", useUnmergedTree = true).assertIsDisplayed()
 
@@ -1070,5 +1081,13 @@ class CameraFourFixesVerificationTest {
         assertEquals(2, shutterClicks)
 
         instantThumb.recycle()
+    }
+
+    private fun applyComposeStateAndAdvance(advanceMs: Long = 250L, update: () -> Unit) {
+        composeTestRule.runOnUiThread {
+            update()
+            androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications()
+        }
+        composeTestRule.mainClock.advanceTimeBy(advanceMs)
     }
 }

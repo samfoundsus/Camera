@@ -705,7 +705,8 @@ object CameraFilterProcessor {
         source: Bitmap,
         preset: CameraFilterPreset,
         intensity: Float = 1.0f,
-        inPlaceIfMutable: Boolean = false
+        inPlaceIfMutable: Boolean = false,
+        allowGpu: Boolean = true
     ): Bitmap {
         val params = getParameters(preset)
         val width = source.width
@@ -721,14 +722,20 @@ object CameraFilterProcessor {
             }
         }
 
-        val gpuAttempt = GpuCameraFilterEngine.applyFilterToBitmapOnGpu(
-            source = source,
-            preset = preset,
-            intensity = intensity
-        )
-        if (gpuAttempt != null) {
-            lastStillFilterBackend = gpuAttempt.second
-            return gpuAttempt.first
+        if (allowGpu) {
+            val gpuAttempt = runCatching {
+                GpuCameraFilterEngine.applyFilterToBitmapOnGpu(
+                    source = source,
+                    preset = preset,
+                    intensity = intensity
+                )
+            }.onFailure { err ->
+                com.example.core.camera.CrashLogManager.recordNonFatalError("ApplyFilterToBitmap-GPU", err)
+            }.getOrNull()
+            if (gpuAttempt != null) {
+                lastStillFilterBackend = gpuAttempt.second
+                return gpuAttempt.first
+            }
         }
 
         lastStillFilterBackend = "CPU-MT-LUT"
@@ -871,7 +878,8 @@ object CameraFilterProcessor {
             source = baseSample,
             preset = preset,
             intensity = 1.0f,
-            inPlaceIfMutable = false
+            inPlaceIfMutable = false,
+            allowGpu = false
         )
 
         synchronized(thumbnailCache) {

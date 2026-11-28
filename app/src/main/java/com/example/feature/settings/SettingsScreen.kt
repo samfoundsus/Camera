@@ -1062,6 +1062,12 @@ fun SettingsScreen(
         val filterVerificationSummary = remember(showHardwareDebugDialog) {
             com.example.core.camera.FilterDebugTracker.formatMultilineSummary()
         }
+        var lastCrashLog by remember(showHardwareDebugDialog) {
+            mutableStateOf(com.example.core.camera.CrashLogManager.readLastCrashLog(context))
+        }
+        val nonFatalWarnings = remember(showHardwareDebugDialog) {
+            com.example.core.camera.CrashLogManager.getNonFatalWarnings()
+        }
 
         CameraHardwareDebugDialog(
             report = debugReport,
@@ -1074,13 +1080,21 @@ fun SettingsScreen(
             recentPortraitTimings = recentPortraitTimings,
             frameTimingSnapshot = frameTimingSnapshot,
             filterVerificationSummary = filterVerificationSummary,
+            lastCrashLog = lastCrashLog,
+            nonFatalWarnings = nonFatalWarnings,
+            onClearCrashLog = {
+                com.example.core.camera.CrashLogManager.clearLastCrashLog(context)
+                lastCrashLog = null
+            },
             copied = copiedBanner,
             onCopyReport = {
-                val loaded = debugReport
-                if (loaded != null) {
-                    clipboardManager.setText(AnnotatedString(formatHardwareDebugReportText(loaded)))
-                    copiedBanner = true
-                }
+                val reportText = formatHardwareDebugReportText(
+                    report = debugReport,
+                    lastCrashLog = lastCrashLog,
+                    nonFatalWarnings = nonFatalWarnings
+                )
+                clipboardManager.setText(AnnotatedString(reportText))
+                copiedBanner = true
             },
             onDismiss = { showHardwareDebugDialog = false }
         )
@@ -1099,6 +1113,9 @@ internal fun CameraHardwareDebugDialog(
     recentPortraitTimings: List<com.example.core.camera.PortraitStageTimings> = emptyList(),
     frameTimingSnapshot: com.example.core.camera.UiFrameTimingSnapshot = com.example.core.camera.UiPerformanceMonitor.getSnapshot(),
     filterVerificationSummary: String = com.example.core.camera.FilterDebugTracker.formatMultilineSummary(),
+    lastCrashLog: String? = null,
+    nonFatalWarnings: List<String> = emptyList(),
+    onClearCrashLog: (() -> Unit)? = null,
     copied: Boolean,
     onCopyReport: () -> Unit,
     onDismiss: () -> Unit
@@ -1131,6 +1148,75 @@ internal fun CameraHardwareDebugDialog(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                Surface(
+                    color = if (!lastCrashLog.isNullOrBlank()) {
+                        MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f)
+                    } else {
+                        MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.65f)
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("hardware_debug_crash_log_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Last Recorded Crash Log",
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                color = if (!lastCrashLog.isNullOrBlank()) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                }
+                            )
+                            if (!lastCrashLog.isNullOrBlank() && onClearCrashLog != null) {
+                                TextButton(
+                                    onClick = onClearCrashLog,
+                                    modifier = Modifier.testTag("hardware_debug_clear_crash_log_button")
+                                ) {
+                                    Text("Clear")
+                                }
+                            }
+                        }
+                        if (!lastCrashLog.isNullOrBlank()) {
+                            Text(
+                                text = lastCrashLog,
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.testTag("hardware_debug_crash_log_text")
+                            )
+                        } else {
+                            Text(
+                                text = "No uncaught crashes recorded (files/${com.example.core.camera.CrashLogManager.CRASH_LOG_FILE_NAME}).",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.testTag("hardware_debug_crash_log_empty")
+                            )
+                        }
+                        if (nonFatalWarnings.isNotEmpty()) {
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                            Text(
+                                text = "Recovered Startup / GPU Fallbacks (${nonFatalWarnings.size}):",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            nonFatalWarnings.forEach { warning ->
+                                Text(
+                                    text = "• $warning",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                                )
+                            }
+                        }
+                    }
+                }
                 if (activePhotoResolvedSize != null || activeHdNativeResolvedSize != null || activeHdBinnedResolvedSize != null) {
                     Surface(
                         color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f),
@@ -1470,16 +1556,37 @@ internal fun CameraHardwareDebugDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onCopyReport, enabled = report != null) {
+            TextButton(
+                onClick = onCopyReport,
+                enabled = report != null || !lastCrashLog.isNullOrBlank() || nonFatalWarnings.isNotEmpty()
+            ) {
                 Text(if (copied) "Copied" else "Copy Report")
             }
         }
     )
 }
 
-internal fun formatHardwareDebugReportText(report: CameraHardwareDebugReport): String = buildString {
-    append(report.formatPlainText())
-    appendLine()
+internal fun formatHardwareDebugReportText(
+    report: CameraHardwareDebugReport?,
+    lastCrashLog: String? = null,
+    nonFatalWarnings: List<String> = com.example.core.camera.CrashLogManager.getNonFatalWarnings()
+): String = buildString {
+    if (!lastCrashLog.isNullOrBlank()) {
+        appendLine("=== Last Recorded Crash Log ===")
+        appendLine(lastCrashLog.trimEnd())
+        appendLine()
+    }
+    if (nonFatalWarnings.isNotEmpty()) {
+        appendLine("=== Recovered Startup / GPU Fallbacks ===")
+        nonFatalWarnings.forEach { warning ->
+            appendLine("  • $warning")
+        }
+        appendLine()
+    }
+    if (report != null) {
+        append(report.formatPlainText())
+        appendLine()
+    }
     appendLine("=== UI Frame Timing & Main-Thread Stalls (>16ms) ===")
     appendLine(com.example.core.camera.UiPerformanceMonitor.getSnapshot().formatMultilineSummary())
     appendLine()
